@@ -1,0 +1,9 @@
+# Example DOH-Proxy configuration
+# Environment variables override these values.
+
+listen_addr=0.0.0.0
+listen_port=53
+upstream_timeout_ms=2500
+doh_pool_size=64
+cache_capacity=1024
+upstream_doh_urls=https://cloudflare-dns.com/dns-query,https://dns.google/dns-query
