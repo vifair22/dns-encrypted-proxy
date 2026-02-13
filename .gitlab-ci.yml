@@ -46,8 +46,8 @@ build:
         --restart unless-stopped \
         --network bridge \
         -v /mnt/cache/appdata/doh-proxy:/app/config \
-        -p 5353:53/udp \
-        -p 5353:53/tcp \
+        -p 5053:53/udp \
+        -p 5053:53/tcp \
         "$IMAGE:$TAG"
       EOF
   only:
