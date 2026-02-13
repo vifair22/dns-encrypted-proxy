@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@ typedef struct {
 typedef struct {
     proxy_server_t *server;
     int client_fd;
+    int query_count; /* Track queries for per-connection limit */
 } tcp_client_ctx_t;
 
 static int should_stop(const proxy_server_t *server) {
@@ -100,6 +102,50 @@ static int dns_rr_end_offset(const uint8_t *message, size_t message_len, size_t 
     return 0;
 }
 
+static int dns_find_query_opt(const uint8_t *query, size_t query_len, size_t *opt_start, size_t *opt_end) {
+    if (query_len < 12) {
+        return -1;
+    }
+
+    uint16_t qdcount = read_u16(query + 4);
+    uint16_t arcount = read_u16(query + 10);
+
+    size_t offset = 12;
+    for (uint16_t i = 0; i < qdcount; i++) {
+        if (dns_skip_name_wire(query, query_len, &offset) != 0) {
+            return -1;
+        }
+        if (offset + 4 > query_len) {
+            return -1;
+        }
+        offset += 4;
+    }
+
+    for (uint16_t i = 0; i < arcount; i++) {
+        size_t rr_start = offset;
+        size_t name_end = offset;
+        if (dns_skip_name_wire(query, query_len, &name_end) != 0) {
+            return -1;
+        }
+        if (name_end + 10 > query_len) {
+            return -1;
+        }
+        uint16_t rr_type = read_u16(query + name_end);
+        uint16_t rdlength = read_u16(query + name_end + 8);
+        size_t rr_end = name_end + 10 + rdlength;
+        if (rr_end > query_len) {
+            return -1;
+        }
+        if (rr_type == 41) {
+            if (opt_start) *opt_start = rr_start;
+            if (opt_end) *opt_end = rr_end;
+            return 0;
+        }
+        offset = rr_end;
+    }
+    return -1;
+}
+
 static int build_servfail_response(const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
     if (query_len < 12 || response_out == NULL || response_len_out == NULL) {
         return -1;
@@ -110,7 +156,11 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
         return -1;
     }
 
-    size_t response_len = 12 + question_len;
+    size_t opt_start = 0, opt_end = 0;
+    int has_opt = (dns_find_query_opt(query, query_len, &opt_start, &opt_end) == 0);
+    size_t opt_len = has_opt ? (opt_end - opt_start) : 0;
+
+    size_t response_len = 12 + question_len + opt_len;
     uint8_t *response = calloc(1, response_len);
     if (response == NULL) {
         return -1;
@@ -120,19 +170,110 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     response[1] = query[1];
 
     uint16_t query_flags = read_u16(query + 2);
-    uint16_t response_flags = (uint16_t)(0x8000u | (query_flags & 0x0100u) | 0x0080u | 0x0002u);
+    uint16_t response_flags = (uint16_t)(
+        0x8000u |                       /* QR=1 (response) */
+        (query_flags & 0x7800u) |       /* OPCODE preserved */
+        (query_flags & 0x0100u) |       /* RD preserved */
+        (query_flags & 0x0010u) |       /* CD preserved */
+        0x0080u |                       /* RA=1 */
+        0x0002u                         /* RCODE=SERVFAIL */
+    );
     write_u16(response + 2, response_flags);
 
     uint16_t qdcount = read_u16(query + 4);
     write_u16(response + 4, qdcount);
+    write_u16(response + 6, 0);
+    write_u16(response + 8, 0);
+    write_u16(response + 10, has_opt ? 1 : 0);
 
     if (question_len > 0) {
         memcpy(response + 12, query + 12, question_len);
     }
 
+    if (has_opt) {
+        memcpy(response + 12 + question_len, query + opt_start, opt_len);
+    }
+
     *response_out = response;
     *response_len_out = response_len;
     return 0;
+}
+
+#define DNS_TYPE_OPT 41
+
+static int dns_find_opt_record(
+    const uint8_t *message,
+    size_t message_len,
+    size_t *opt_start_out,
+    size_t *opt_end_out) {
+    if (message == NULL || message_len < 12) {
+        return -1;
+    }
+
+    uint16_t qdcount = read_u16(message + 4);
+    uint16_t ancount = read_u16(message + 6);
+    uint16_t nscount = read_u16(message + 8);
+    uint16_t arcount = read_u16(message + 10);
+
+    size_t offset = 12;
+
+    for (uint16_t i = 0; i < qdcount; i++) {
+        if (dns_skip_name_wire(message, message_len, &offset) != 0) {
+            return -1;
+        }
+        if (offset + 4 > message_len) {
+            return -1;
+        }
+        offset += 4;
+    }
+
+    for (uint16_t i = 0; i < ancount; i++) {
+        size_t rr_end = 0;
+        if (dns_rr_end_offset(message, message_len, offset, &rr_end) != 0) {
+            return -1;
+        }
+        offset = rr_end;
+    }
+
+    for (uint16_t i = 0; i < nscount; i++) {
+        size_t rr_end = 0;
+        if (dns_rr_end_offset(message, message_len, offset, &rr_end) != 0) {
+            return -1;
+        }
+        offset = rr_end;
+    }
+
+    for (uint16_t i = 0; i < arcount; i++) {
+        size_t rr_start = offset;
+        size_t name_end = offset;
+        if (dns_skip_name_wire(message, message_len, &name_end) != 0) {
+            return -1;
+        }
+        if (name_end + 10 > message_len) {
+            return -1;
+        }
+
+        uint16_t rr_type = read_u16(message + name_end);
+        uint16_t rdlength = read_u16(message + name_end + 8);
+        size_t rr_end = name_end + 10 + rdlength;
+        if (rr_end > message_len) {
+            return -1;
+        }
+
+        if (rr_type == DNS_TYPE_OPT) {
+            if (opt_start_out != NULL) {
+                *opt_start_out = rr_start;
+            }
+            if (opt_end_out != NULL) {
+                *opt_end_out = rr_end;
+            }
+            return 0;
+        }
+
+        offset = rr_end;
+    }
+
+    return -1;
 }
 
 static int build_truncated_udp_response(
@@ -164,6 +305,11 @@ static int build_truncated_udp_response(
     int malformed = 0;
     int is_truncated = 0;
 
+    size_t opt_start = 0;
+    size_t opt_end = 0;
+    int has_opt = (dns_find_opt_record(response, response_len, &opt_start, &opt_end) == 0);
+    size_t opt_size = has_opt ? (opt_end - opt_start) : 0;
+
     for (uint16_t i = 0; i < original_qd; i++) {
         size_t name_end = offset;
         if (dns_skip_name_wire(response, response_len, &name_end) != 0 || name_end + 4 > response_len) {
@@ -191,10 +337,16 @@ static int build_truncated_udp_response(
 
     for (int section = 0; section < 3; section++) {
         for (uint16_t i = 0; i < section_counts[section]; i++) {
+            size_t rr_start = offset;
             size_t rr_end = 0;
             if (dns_rr_end_offset(response, response_len, offset, &rr_end) != 0) {
                 malformed = 1;
                 break;
+            }
+
+            if (has_opt && rr_start == opt_start) {
+                offset = rr_end;
+                continue;
             }
 
             if (rr_end > udp_limit) {
@@ -226,14 +378,28 @@ finalize:
         include_an = 0;
         include_ns = 0;
         include_ar = 0;
+        has_opt = 0;
     }
 
-    uint8_t *truncated = malloc(include_end);
+    int include_opt = 0;
+    if (has_opt && !malformed) {
+        if (include_end + opt_size <= udp_limit) {
+            include_opt = 1;
+        }
+    }
+
+    size_t total_size = include_end + (include_opt ? opt_size : 0);
+    uint8_t *truncated = malloc(total_size);
     if (truncated == NULL) {
         return -1;
     }
 
     memcpy(truncated, response, include_end);
+
+    if (include_opt) {
+        memcpy(truncated + include_end, response + opt_start, opt_size);
+        include_ar++; /* Count the OPT record in additional section */
+    }
 
     uint16_t flags = read_u16(truncated + 2);
     flags = (uint16_t)(flags | 0x0200u); /* TC */
@@ -245,7 +411,7 @@ finalize:
     write_u16(truncated + 10, include_ar);
 
     *truncated_out = truncated;
-    *truncated_len_out = include_end;
+    *truncated_len_out = total_size;
     return 0;
 }
 
@@ -276,16 +442,15 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
             (*response_out)[1] = query[1];
         }
 
-        int ttl_ok = 0;
-        uint32_t min_ttl = dns_response_min_ttl(*response_out, *response_len_out, &ttl_ok);
-        if (key_ok && ttl_ok && min_ttl > 0) {
-            dns_cache_store(&server->cache, key, key_len, *response_out, *response_len_out, min_ttl);
+        if (key_ok && dns_response_is_cacheable(*response_out, *response_len_out)) {
+            int ttl_ok = 0;
+            uint32_t min_ttl = dns_response_min_ttl(*response_out, *response_len_out, &ttl_ok);
+            if (ttl_ok && min_ttl > 0) {
+                dns_cache_store(&server->cache, key, key_len, *response_out, *response_len_out, min_ttl);
+            }
         }
 
-        if (used_url != NULL) {
-            (void)used_url;
-        }
-
+        (void)used_url;
         return 0;
     }
 
@@ -420,9 +585,32 @@ static void *udp_loop(void *arg) {
     return NULL;
 }
 
-static int recv_all(int fd, uint8_t *buffer, size_t len) {
+static int recv_all_with_timeout(int fd, uint8_t *buffer, size_t len, int timeout_ms) {
     size_t offset = 0;
     while (offset < len) {
+        if (timeout_ms > 0) {
+            struct pollfd pfd = {0};
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+
+            int poll_rc = poll(&pfd, 1, timeout_ms);
+            if (poll_rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+            if (poll_rc == 0) {
+                return -2;
+            }
+            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                return -1;
+            }
+            if ((pfd.revents & POLLIN) == 0) {
+                continue;
+            }
+        }
+
         ssize_t n = recv(fd, buffer + offset, len - offset, 0);
         if (n == 0) {
             return 0;
@@ -457,10 +645,16 @@ static void *tcp_client_loop(void *arg) {
     tcp_client_ctx_t *ctx = (tcp_client_ctx_t *)arg;
     proxy_server_t *server = ctx->server;
     int client_fd = ctx->client_fd;
+    int idle_timeout_ms = server->config.tcp_idle_timeout_ms;
+    int max_queries = server->config.tcp_max_queries_per_conn;
 
     while (!should_stop(server)) {
+        if (max_queries > 0 && ctx->query_count >= max_queries) {
+            break;
+        }
+
         uint8_t length_prefix[2];
-        int rc = recv_all(client_fd, length_prefix, sizeof(length_prefix));
+        int rc = recv_all_with_timeout(client_fd, length_prefix, sizeof(length_prefix), idle_timeout_ms);
         if (rc <= 0) {
             break;
         }
@@ -475,7 +669,8 @@ static void *tcp_client_loop(void *arg) {
             break;
         }
 
-        rc = recv_all(client_fd, query, message_len);
+        int body_timeout_ms = idle_timeout_ms > 0 ? (idle_timeout_ms < 5000 ? idle_timeout_ms : 5000) : 0;
+        rc = recv_all_with_timeout(client_fd, query, message_len, body_timeout_ms);
         if (rc <= 0) {
             free(query);
             break;
@@ -489,6 +684,7 @@ static void *tcp_client_loop(void *arg) {
         }
 
         free(query);
+        ctx->query_count++;
 
         if (response == NULL || response_len == 0 || response_len > UINT16_MAX) {
             free(response);
@@ -507,6 +703,7 @@ static void *tcp_client_loop(void *arg) {
     }
 
     close(client_fd);
+    atomic_fetch_sub(&server->active_tcp_clients, 1);
     free(ctx);
     return NULL;
 }
@@ -515,6 +712,7 @@ static void *tcp_accept_loop(void *arg) {
     socket_loop_ctx_t *ctx = (socket_loop_ctx_t *)arg;
     proxy_server_t *server = ctx->server;
     int fd = ctx->fd;
+    int max_clients = server->config.tcp_max_clients;
 
     while (!should_stop(server)) {
         struct pollfd pfd = {0};
@@ -538,6 +736,16 @@ static void *tcp_accept_loop(void *arg) {
             continue;
         }
 
+        int current_clients = atomic_load(&server->active_tcp_clients);
+        if (current_clients >= max_clients) {
+            /* At capacity - accept and immediately close to signal client to retry */
+            int client_fd = accept(fd, NULL, NULL);
+            if (client_fd >= 0) {
+                close(client_fd);
+            }
+            continue;
+        }
+
         int client_fd = accept(fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) {
@@ -546,18 +754,23 @@ static void *tcp_accept_loop(void *arg) {
             continue;
         }
 
+        atomic_fetch_add(&server->active_tcp_clients, 1);
+
         tcp_client_ctx_t *client_ctx = calloc(1, sizeof(*client_ctx));
         if (client_ctx == NULL) {
             close(client_fd);
+            atomic_fetch_sub(&server->active_tcp_clients, 1);
             continue;
         }
 
         client_ctx->server = server;
         client_ctx->client_fd = client_fd;
+        client_ctx->query_count = 0;
 
         pthread_t thread;
         if (pthread_create(&thread, NULL, tcp_client_loop, client_ctx) != 0) {
             close(client_fd);
+            atomic_fetch_sub(&server->active_tcp_clients, 1);
             free(client_ctx);
             continue;
         }

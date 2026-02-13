@@ -4,17 +4,17 @@ Remaining items to make `DOH-Proxy` standards-compliant for production use.
 
 ## P0 (High Priority)
 
-- [ ] Preserve DNS header/flag fidelity in locally generated errors.
-- [ ] For synthetic `SERVFAIL`, preserve query `OPCODE` and relevant flags (`RD`, `CD`) and avoid setting flags that are not justified.
-- [ ] Add EDNS-aware synthetic error responses: include OPT in local responses when query included OPT and keep EDNS version/DO semantics correct.
-- [ ] Tighten cache eligibility rules: do not cache truncated responses (`TC=1`), malformed responses, and non-cacheable response classes.
-- [ ] Implement RFC 2308 negative caching correctly (derive TTL from SOA negative caching rules, not generic minimum TTL across all RRs).
+- [x] Preserve DNS header/flag fidelity in locally generated errors.
+- [x] For synthetic `SERVFAIL`, preserve query `OPCODE` and relevant flags (`RD`, `CD`) and avoid setting flags that are not justified.
+- [x] Add EDNS-aware synthetic error responses: include OPT in local responses when query included OPT and keep EDNS version/DO semantics correct.
+- [x] Tighten cache eligibility rules: do not cache truncated responses (`TC=1`), malformed responses, and non-cacheable response classes.
+- [x] Implement RFC 2308 negative caching correctly (derive TTL from SOA negative caching rules, not generic minimum TTL across all RRs).
 
 ## P1 (Important)
 
-- [ ] Preserve OPT record in truncated UDP responses when it fits; if omitted, ensure behavior remains RFC-consistent.
-- [ ] Improve DoH response validation: verify DNS response ID handling and stricter checks for inconsistent section/header combinations.
-- [ ] Add per-connection TCP limits/timeouts aligned with RFC 7766 operational guidance (idle timeout, max concurrent clients, max outstanding per connection).
+- [x] Preserve OPT record in truncated UDP responses when it fits; if omitted, ensure behavior remains RFC-consistent.
+- [x] Improve DoH response validation: verify DNS response ID handling and stricter checks for inconsistent section/header combinations.
+- [x] Add per-connection TCP limits/timeouts aligned with RFC 7766 operational guidance (idle timeout, max concurrent clients, max outstanding per connection).
 - [ ] Add IPv6 listener support (`AF_INET6`) with dual-stack behavior controls.
 
 ## P2 (Hardening)

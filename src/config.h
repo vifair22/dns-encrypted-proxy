@@ -15,6 +15,9 @@ typedef struct {
     char upstream_urls[MAX_UPSTREAMS][MAX_URL_LEN];
     int upstream_count;
     char config_path[256];
+    int tcp_idle_timeout_ms;
+    int tcp_max_clients;
+    int tcp_max_queries_per_conn;
 } proxy_config_t;
 
 int config_load(proxy_config_t *config, const char *explicit_path);

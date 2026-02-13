@@ -94,6 +94,30 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
 
     if (strcmp(key, "upstream_doh_urls") == 0) {
         split_upstreams(config, value);
+        return;
+    }
+
+    if (strcmp(key, "tcp_idle_timeout_ms") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->tcp_idle_timeout_ms = parsed;
+        }
+        return;
+    }
+
+    if (strcmp(key, "tcp_max_clients") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->tcp_max_clients = parsed;
+        }
+        return;
+    }
+
+    if (strcmp(key, "tcp_max_queries_per_conn") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->tcp_max_queries_per_conn = parsed;
+        }
     }
 }
 
@@ -140,6 +164,30 @@ static void apply_env_overrides(proxy_config_t *config) {
     if (value != NULL && *value != '\0') {
         split_upstreams(config, value);
     }
+
+    value = getenv("TCP_IDLE_TIMEOUT_MS");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->tcp_idle_timeout_ms = parsed;
+        }
+    }
+
+    value = getenv("TCP_MAX_CLIENTS");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->tcp_max_clients = parsed;
+        }
+    }
+
+    value = getenv("TCP_MAX_QUERIES_PER_CONN");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->tcp_max_queries_per_conn = parsed;
+        }
+    }
 }
 
 static void set_defaults(proxy_config_t *config) {
@@ -155,6 +203,10 @@ static void set_defaults(proxy_config_t *config) {
     config->upstream_count = 2;
 
     strncpy(config->config_path, "doh-proxy.conf", sizeof(config->config_path) - 1);
+
+    config->tcp_idle_timeout_ms = 10000;
+    config->tcp_max_clients = 256;
+    config->tcp_max_queries_per_conn = 0;
 }
 
 static void load_config_file(proxy_config_t *config, const char *path) {
@@ -248,6 +300,9 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  upstream_timeout_ms=%d\n", config->upstream_timeout_ms);
     fprintf(out, "  doh_pool_size=%d\n", config->doh_pool_size);
     fprintf(out, "  cache_capacity=%d\n", config->cache_capacity);
+    fprintf(out, "  tcp_idle_timeout_ms=%d\n", config->tcp_idle_timeout_ms);
+    fprintf(out, "  tcp_max_clients=%d\n", config->tcp_max_clients);
+    fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);
     fprintf(out, "  upstream_doh_urls=");
     for (int i = 0; i < config->upstream_count; i++) {
         fprintf(out, "%s%s", config->upstream_urls[i], (i + 1 == config->upstream_count) ? "" : ",");

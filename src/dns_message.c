@@ -537,9 +537,111 @@ static int dns_iterate_rrs(const uint8_t *message, size_t message_len, uint16_t 
     return 0;
 }
 
+#define DNS_TYPE_SOA 6
+
+static int dns_is_negative_response(const uint8_t *message, size_t message_len) {
+    if (message_len < DNS_HEADER_SIZE) {
+        return 0;
+    }
+    uint16_t flags = read_u16(message + 2);
+    uint16_t rcode = flags & 0x000Fu;
+    uint16_t ancount = read_u16(message + 6);
+
+    if (rcode == 3) {
+        return 1;
+    }
+    if (rcode == 0 && ancount == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t dns_extract_soa_minimum(const uint8_t *message, size_t message_len) {
+    if (message_len < DNS_HEADER_SIZE) {
+        return UINT32_MAX;
+    }
+
+    uint16_t qdcount = read_u16(message + 4);
+    uint16_t ancount = read_u16(message + 6);
+    uint16_t nscount = read_u16(message + 8);
+
+    size_t offset = DNS_HEADER_SIZE;
+
+    for (uint16_t i = 0; i < qdcount; i++) {
+        if (dns_skip_name(message, message_len, &offset) != 0) {
+            return UINT32_MAX;
+        }
+        if (offset + 4 > message_len) {
+            return UINT32_MAX;
+        }
+        offset += 4;
+    }
+
+    for (uint16_t i = 0; i < ancount; i++) {
+        if (dns_skip_name(message, message_len, &offset) != 0) {
+            return UINT32_MAX;
+        }
+        if (offset + 10 > message_len) {
+            return UINT32_MAX;
+        }
+        uint16_t rdlength = read_u16(message + offset + 8);
+        offset += 10 + rdlength;
+        if (offset > message_len) {
+            return UINT32_MAX;
+        }
+    }
+
+    for (uint16_t i = 0; i < nscount; i++) {
+        if (dns_skip_name(message, message_len, &offset) != 0) {
+            return UINT32_MAX;
+        }
+        if (offset + 10 > message_len) {
+            return UINT32_MAX;
+        }
+
+        uint16_t rr_type = read_u16(message + offset);
+        uint32_t rr_ttl = read_u32(message + offset + 4);
+        uint16_t rdlength = read_u16(message + offset + 8);
+        size_t rdata_start = offset + 10;
+
+        if (rdata_start + rdlength > message_len) {
+            return UINT32_MAX;
+        }
+
+        if (rr_type == DNS_TYPE_SOA && rdlength >= 20) {
+            size_t rdata_offset = rdata_start;
+            if (dns_skip_name(message, message_len, &rdata_offset) != 0) {
+                return UINT32_MAX;
+            }
+            if (dns_skip_name(message, message_len, &rdata_offset) != 0) {
+                return UINT32_MAX;
+            }
+            if (rdata_offset + 20 > rdata_start + rdlength) {
+                return UINT32_MAX;
+            }
+            uint32_t soa_minimum = read_u32(message + rdata_offset + 16);
+            return (soa_minimum < rr_ttl) ? soa_minimum : rr_ttl;
+        }
+
+        offset = rdata_start + rdlength;
+    }
+
+    return UINT32_MAX;
+}
+
 uint32_t dns_response_min_ttl(const uint8_t *message, size_t message_len, int *ok_out) {
     if (ok_out != NULL) {
         *ok_out = 0;
+    }
+
+    if (dns_is_negative_response(message, message_len)) {
+        uint32_t neg_ttl = dns_extract_soa_minimum(message, message_len);
+        if (neg_ttl != UINT32_MAX) {
+            if (ok_out != NULL) {
+                *ok_out = 1;
+            }
+            return neg_ttl;
+        }
     }
 
     uint16_t rr_total = 0;
@@ -626,6 +728,76 @@ int dns_adjust_response_ttls(uint8_t *message, size_t message_len, uint32_t age_
     return 0;
 }
 
+static int dns_validate_section_counts(const uint8_t *message, size_t message_len) {
+    if (message == NULL || message_len < DNS_HEADER_SIZE) {
+        return -1;
+    }
+
+    uint16_t qdcount = read_u16(message + 4);
+    uint16_t ancount = read_u16(message + 6);
+    uint16_t nscount = read_u16(message + 8);
+    uint16_t arcount = read_u16(message + 10);
+
+    size_t offset = DNS_HEADER_SIZE;
+
+    for (uint16_t i = 0; i < qdcount; i++) {
+        if (dns_skip_name(message, message_len, &offset) != 0) {
+            return -1;
+        }
+        if (offset + 4 > message_len) {
+            return -1;
+        }
+        offset += 4;
+    }
+
+    uint16_t section_counts[3] = {ancount, nscount, arcount};
+    for (int section = 0; section < 3; section++) {
+        for (uint16_t i = 0; i < section_counts[section]; i++) {
+            if (dns_skip_name(message, message_len, &offset) != 0) {
+                return -1;
+            }
+            if (offset + 10 > message_len) {
+                return -1;
+            }
+            uint16_t rdlength = read_u16(message + offset + 8);
+            offset += 10;
+            if (offset + rdlength > message_len) {
+                return -1;
+            }
+            offset += rdlength;
+        }
+    }
+
+    if (offset != message_len) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int dns_response_is_cacheable(const uint8_t *response, size_t response_len) {
+    if (response == NULL || response_len < DNS_HEADER_SIZE) {
+        return 0;
+    }
+
+    uint16_t flags = read_u16(response + 2);
+
+    if (flags & 0x0200u) {
+        return 0;
+    }
+
+    uint16_t rcode = flags & 0x000Fu;
+    if (rcode != 0 && rcode != 3) {
+        return 0;
+    }
+
+    if (dns_validate_section_counts(response, response_len) != 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
 int dns_validate_response_for_query(const uint8_t *query, size_t query_len, const uint8_t *response, size_t response_len) {
     if (query == NULL || response == NULL || query_len < DNS_HEADER_SIZE || response_len < DNS_HEADER_SIZE) {
         return -1;
@@ -648,6 +820,10 @@ int dns_validate_response_for_query(const uint8_t *query, size_t query_len, cons
     }
 
     if ((response_flags & 0x7800u) != (query_flags & 0x7800u)) {
+        return -1;
+    }
+
+    if (dns_validate_section_counts(response, response_len) != 0) {
         return -1;
     }
 

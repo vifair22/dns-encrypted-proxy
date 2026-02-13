@@ -9,6 +9,7 @@ int dns_question_section_length(const uint8_t *message, size_t message_len, size
 size_t dns_udp_payload_limit_for_query(const uint8_t *query, size_t query_len);
 uint32_t dns_response_min_ttl(const uint8_t *message, size_t message_len, int *ok_out);
 int dns_adjust_response_ttls(uint8_t *message, size_t message_len, uint32_t age_seconds);
+int dns_response_is_cacheable(const uint8_t *response, size_t response_len);
 int dns_validate_response_for_query(const uint8_t *query, size_t query_len, const uint8_t *response, size_t response_len);
 
 #endif
