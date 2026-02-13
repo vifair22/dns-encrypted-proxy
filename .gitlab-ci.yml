@@ -58,4 +58,4 @@ deploy:
   parallel:
     matrix:
       - UNRAID_HOST: "172.20.0.50"
-      - UNRAID_HOST: "192.168.1.2"
+      - UNRAID_HOST: "192.168.1.50"
