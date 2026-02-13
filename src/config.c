@@ -227,7 +227,7 @@ static void set_defaults(proxy_config_t *config) {
     strncpy(config->listen_addr, "0.0.0.0", sizeof(config->listen_addr) - 1);
     config->listen_port = 53;
     config->upstream_timeout_ms = 2500;
-    config->doh_pool_size = 64;
+    config->doh_pool_size = 6;
     config->cache_capacity = 1024;
 
     strncpy(config->upstream_urls[0], "https://cloudflare-dns.com/dns-query", MAX_URL_LEN - 1);

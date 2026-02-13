@@ -49,10 +49,15 @@ static int doh_post_with_handle(
     size_t *response_len_out) {
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/dns-message");
-    headers = curl_slist_append(headers, "Accept: application/dns-message");
     if (headers == NULL) {
         return -1;
     }
+    struct curl_slist *temp = curl_slist_append(headers, "Accept: application/dns-message");
+    if (temp == NULL) {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    headers = temp;
 
     buffer_t response = {0};
 
