@@ -1,15 +1,13 @@
 # syntax=docker/dockerfile:1
 
-FROM debian:bookworm-slim AS build
+FROM alpine:3.19 AS build
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        pkg-config \
-        libcurl4-openssl-dev \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    build-base \
+    cmake \
+    pkgconfig \
+    curl-dev \
+    ca-certificates
 
 WORKDIR /src
 
@@ -20,13 +18,11 @@ COPY doh-proxy.conf.example ./
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j
 
-FROM debian:bookworm-slim AS runtime
+FROM alpine:3.19 AS runtime
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        libcurl4 \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    libcurl \
+    ca-certificates
 
 WORKDIR /app
 
