@@ -1,0 +1,60 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE: "$CI_REGISTRY_IMAGE"
+  TAG: "$CI_COMMIT_SHORT_SHA"
+  SERVICE_NAME: "doh-proxy"
+
+build:
+  stage: build
+  image: docker:stable
+  tags:
+    - docker
+    - unraid
+  script:
+    - docker info
+    - docker login -u gitlab-ci-token -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
+    - docker build --pull -t "$IMAGE:$TAG" .
+    - docker push "$IMAGE:$TAG"
+
+.deploy_template: &deploy_template
+  stage: deploy
+  image: alpine
+  tags:
+    - docker
+    - unraid
+  variables:
+    UNRAID_SSH_KEY: $UNRAID_SSH_KEY
+  before_script:
+    - apk add --no-cache openssh-client
+    - mkdir -p ~/.ssh
+    - echo "$UNRAID_SSH_KEY" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan "$UNRAID_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh root@"$UNRAID_HOST" <<EOF
+      echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin "$CI_REGISTRY"
+      docker pull "$IMAGE:$TAG"
+      docker stop $SERVICE_NAME || true
+      docker rm $SERVICE_NAME || true
+      docker run -d \
+        --name $SERVICE_NAME \
+        -l net.unraid.docker.managed=dockerman \
+        --restart unless-stopped \
+        --network bridge \
+        -v /mnt/cache/appdata/doh-proxy:/app/config \
+        -p 5353:53/udp \
+        -p 5353:53/tcp \
+        "$IMAGE:$TAG"
+      EOF
+  only:
+    - master
+
+deploy:
+  <<: *deploy_template
+  parallel:
+    matrix:
+      - UNRAID_HOST: "172.20.0.50"
