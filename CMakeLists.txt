@@ -16,6 +16,7 @@ add_executable(
     src/dns_message.c
     src/doh_client.c
     src/dns_server.c
+    src/metrics.c
 )
 
 target_compile_options(DOH-Proxy PRIVATE -Wall -Wextra -Wpedantic)

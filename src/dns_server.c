@@ -26,7 +26,7 @@ typedef struct {
 typedef struct {
     proxy_server_t *server;
     int client_fd;
-    int query_count; /* Track queries for per-connection limit */
+    int query_count;
 } tcp_client_ctx_t;
 
 static int should_stop(const proxy_server_t *server) {
@@ -170,14 +170,8 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     response[1] = query[1];
 
     uint16_t query_flags = read_u16(query + 2);
-    uint16_t response_flags = (uint16_t)(
-        0x8000u |                       /* QR=1 (response) */
-        (query_flags & 0x7800u) |       /* OPCODE preserved */
-        (query_flags & 0x0100u) |       /* RD preserved */
-        (query_flags & 0x0010u) |       /* CD preserved */
-        0x0080u |                       /* RA=1 */
-        0x0002u                         /* RCODE=SERVFAIL */
-    );
+    uint16_t response_flags = (uint16_t)(0x8000u | (query_flags & 0x7800u) | (query_flags & 0x0100u) | (query_flags & 0x0010u) |
+                                         0x0080u | 0x0002u);
     write_u16(response + 2, response_flags);
 
     uint16_t qdcount = read_u16(query + 4);
@@ -431,12 +425,15 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     if (key_ok) {
         if (dns_cache_lookup(&server->cache, key, key_len, request_id, response_out, response_len_out)) {
+            atomic_fetch_add(&server->metrics.cache_hits, 1);
             return 0;
         }
+        atomic_fetch_add(&server->metrics.cache_misses, 1);
     }
 
     const char *used_url = NULL;
     if (doh_client_resolve(&server->doh_client, query, query_len, response_out, response_len_out, &used_url) == 0) {
+        atomic_fetch_add(&server->metrics.upstream_success, 1);
         if (*response_len_out >= 2) {
             (*response_out)[0] = query[0];
             (*response_out)[1] = query[1];
@@ -453,6 +450,9 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
         (void)used_url;
         return 0;
     }
+
+    atomic_fetch_add(&server->metrics.upstream_failures, 1);
+    atomic_fetch_add(&server->metrics.servfail_sent, 1);
 
     return build_servfail_response(query, query_len, response_out, response_len_out);
 }
@@ -551,6 +551,7 @@ static void *udp_loop(void *arg) {
         if (n <= 0) {
             continue;
         }
+        atomic_fetch_add(&server->metrics.queries_udp, 1);
 
         uint8_t *response = NULL;
         size_t response_len = 0;
@@ -567,6 +568,7 @@ static void *udp_loop(void *arg) {
                     free(response);
                     response = truncated;
                     response_len = truncated_len;
+                    atomic_fetch_add(&server->metrics.truncated_sent, 1);
                 } else {
                     free(response);
                     response = NULL;
@@ -574,6 +576,7 @@ static void *udp_loop(void *arg) {
                     if (build_servfail_response(buffer, (size_t)n, &response, &response_len) != 0) {
                         continue;
                     }
+                    atomic_fetch_add(&server->metrics.servfail_sent, 1);
                 }
             }
 
@@ -663,6 +666,7 @@ static void *tcp_client_loop(void *arg) {
         if (message_len == 0) {
             continue;
         }
+        atomic_fetch_add(&server->metrics.queries_tcp, 1);
 
         uint8_t *query = malloc(message_len);
         if (query == NULL) {
@@ -704,6 +708,7 @@ static void *tcp_client_loop(void *arg) {
 
     close(client_fd);
     atomic_fetch_sub(&server->active_tcp_clients, 1);
+    atomic_fetch_sub(&server->metrics.tcp_connections_active, 1);
     free(ctx);
     return NULL;
 }
@@ -738,11 +743,11 @@ static void *tcp_accept_loop(void *arg) {
 
         int current_clients = atomic_load(&server->active_tcp_clients);
         if (current_clients >= max_clients) {
-            /* At capacity - accept and immediately close to signal client to retry */
             int client_fd = accept(fd, NULL, NULL);
             if (client_fd >= 0) {
                 close(client_fd);
             }
+            atomic_fetch_add(&server->metrics.tcp_connections_rejected, 1);
             continue;
         }
 
@@ -755,11 +760,14 @@ static void *tcp_accept_loop(void *arg) {
         }
 
         atomic_fetch_add(&server->active_tcp_clients, 1);
+        atomic_fetch_add(&server->metrics.tcp_connections_total, 1);
+        atomic_fetch_add(&server->metrics.tcp_connections_active, 1);
 
         tcp_client_ctx_t *client_ctx = calloc(1, sizeof(*client_ctx));
         if (client_ctx == NULL) {
             close(client_fd);
             atomic_fetch_sub(&server->active_tcp_clients, 1);
+            atomic_fetch_sub(&server->metrics.tcp_connections_active, 1);
             continue;
         }
 
@@ -771,6 +779,7 @@ static void *tcp_accept_loop(void *arg) {
         if (pthread_create(&thread, NULL, tcp_client_loop, client_ctx) != 0) {
             close(client_fd);
             atomic_fetch_sub(&server->active_tcp_clients, 1);
+            atomic_fetch_sub(&server->metrics.tcp_connections_active, 1);
             free(client_ctx);
             continue;
         }

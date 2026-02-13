@@ -118,6 +118,22 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         if (parse_int(value, &parsed) == 0 && parsed >= 0) {
             config->tcp_max_queries_per_conn = parsed;
         }
+        return;
+    }
+
+    if (strcmp(key, "metrics_port") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->metrics_port = parsed;
+        }
+        return;
+    }
+
+    if (strcmp(key, "metrics_enabled") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0) {
+            config->metrics_enabled = parsed ? 1 : 0;
+        }
     }
 }
 
@@ -188,6 +204,22 @@ static void apply_env_overrides(proxy_config_t *config) {
             config->tcp_max_queries_per_conn = parsed;
         }
     }
+
+    value = getenv("METRICS_PORT");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->metrics_port = parsed;
+        }
+    }
+
+    value = getenv("METRICS_ENABLED");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0) {
+            config->metrics_enabled = parsed ? 1 : 0;
+        }
+    }
 }
 
 static void set_defaults(proxy_config_t *config) {
@@ -207,6 +239,8 @@ static void set_defaults(proxy_config_t *config) {
     config->tcp_idle_timeout_ms = 10000;
     config->tcp_max_clients = 256;
     config->tcp_max_queries_per_conn = 0;
+    config->metrics_enabled = 1;
+    config->metrics_port = 9090;
 }
 
 static void load_config_file(proxy_config_t *config, const char *path) {
@@ -286,6 +320,14 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
         return -1;
     }
 
+    if (config->metrics_port <= 0 || config->metrics_port > 65535) {
+        return -1;
+    }
+
+    if (config->metrics_enabled != 0 && config->metrics_enabled != 1) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -303,6 +345,8 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  tcp_idle_timeout_ms=%d\n", config->tcp_idle_timeout_ms);
     fprintf(out, "  tcp_max_clients=%d\n", config->tcp_max_clients);
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);
+    fprintf(out, "  metrics_enabled=%d\n", config->metrics_enabled);
+    fprintf(out, "  metrics_port=%d\n", config->metrics_port);
     fprintf(out, "  upstream_doh_urls=");
     for (int i = 0; i < config->upstream_count; i++) {
         fprintf(out, "%s%s", config->upstream_urls[i], (i + 1 == config->upstream_count) ? "" : ",");

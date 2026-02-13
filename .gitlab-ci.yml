@@ -48,6 +48,7 @@ build:
         -v /mnt/cache/appdata/doh-proxy:/app/config \
         -p 5053:53/udp \
         -p 5053:53/tcp \
+        -p 9090:9090/tcp \
         "$IMAGE:$TAG"
       EOF
   only:

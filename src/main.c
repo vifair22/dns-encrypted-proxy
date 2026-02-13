@@ -4,6 +4,7 @@
 #include "config.h"
 #include "dns_server.h"
 #include "doh_client.h"
+#include "metrics.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -57,8 +58,22 @@ int main(int argc, char **argv) {
     server.cache = cache;
     server.doh_client = doh_client;
     server.stop_flag = &g_stop;
+    metrics_init(&server.metrics);
+
+    if (server.config.metrics_enabled && server.config.metrics_port > 0) {
+        if (metrics_server_start(&server.metrics, server.config.metrics_port) != 0) {
+            fprintf(stderr, "Failed to start metrics server on port %d\n", server.config.metrics_port);
+            doh_client_destroy(&server.doh_client);
+            dns_cache_destroy(&server.cache);
+            return 1;
+        }
+        fprintf(stdout, "Metrics endpoint listening on 0.0.0.0:%d/metrics\n", server.config.metrics_port);
+        fflush(stdout);
+    }
 
     int rc = proxy_server_run(&server);
+
+    metrics_server_stop();
 
     doh_client_destroy(&server.doh_client);
     dns_cache_destroy(&server.cache);

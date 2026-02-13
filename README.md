@@ -81,6 +81,11 @@ Supported config keys:
 - `upstream_timeout_ms`
 - `doh_pool_size`
 - `cache_capacity`
+- `tcp_idle_timeout_ms`
+- `tcp_max_clients`
+- `tcp_max_queries_per_conn`
+- `metrics_enabled` (`1` enable, `0` disable)
+- `metrics_port`
 - `upstream_doh_urls` (comma-separated)
 
 Environment variable overrides:
@@ -91,7 +96,18 @@ Environment variable overrides:
 - `UPSTREAM_TIMEOUT_MS`
 - `DOH_POOL_SIZE`
 - `CACHE_CAPACITY`
+- `TCP_IDLE_TIMEOUT_MS`
+- `TCP_MAX_CLIENTS`
+- `TCP_MAX_QUERIES_PER_CONN`
+- `METRICS_ENABLED`
+- `METRICS_PORT`
 - `UPSTREAM_DOH_URLS`
+
+Prometheus metrics endpoint:
+
+- Route: `GET /metrics`
+- Bind: `0.0.0.0:<metrics_port>`
+- Content type: `text/plain; version=0.0.4`
 
 ## Notes
 

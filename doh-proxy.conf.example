@@ -6,4 +6,6 @@ listen_port=53
 upstream_timeout_ms=2500
 doh_pool_size=64
 cache_capacity=1024
+metrics_enabled=1
+metrics_port=9090
 upstream_doh_urls=https://cloudflare-dns.com/dns-query,https://dns.google/dns-query

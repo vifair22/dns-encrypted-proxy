@@ -18,6 +18,8 @@ typedef struct {
     int tcp_idle_timeout_ms;
     int tcp_max_clients;
     int tcp_max_queries_per_conn;
+    int metrics_enabled;
+    int metrics_port;
 } proxy_config_t;
 
 int config_load(proxy_config_t *config, const char *explicit_path);
