@@ -14,11 +14,11 @@ test:
   tags:
     - docker
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev cmocka-dev
+    - apk add --no-cache cmake make gcc musl-dev curl-dev cmocka-dev python3
   script:
     - mkdir -p build
     - cd build
-    - cmake -DBUILD_TESTS=ON ..
+    - cmake -DBUILD_TESTS=ON -DWARNINGS_AS_ERRORS=ON ..
     - make
     - ctest --output-on-failure
   artifacts:

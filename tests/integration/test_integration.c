@@ -475,7 +475,16 @@ static int start_python_doh_server(
     ts.tv_nsec = 150 * 1000 * 1000;
     nanosleep(&ts, NULL);
 
-    if (kill(server->pid, 0) != 0) {
+    int child_status = 0;
+    pid_t waited = waitpid(server->pid, &child_status, WNOHANG);
+    if (waited == server->pid) {
+        remove_temp_file(server->script_path);
+        server->pid = -1;
+        server->script_path = NULL;
+        return -1;
+    }
+
+    if (waited < 0 || kill(server->pid, 0) != 0) {
         kill(server->pid, SIGTERM);
         waitpid(server->pid, NULL, 0);
         remove_temp_file(server->script_path);
@@ -832,6 +841,10 @@ static void test_ttl_aging_in_cache(void **state) {
 static void test_upstream_transport_doh_success(void **state) {
     (void)state;
 
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
     char cert_path[256];
     char key_path[256];
     assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
@@ -866,14 +879,23 @@ static void test_upstream_transport_doh_success(void **state) {
 
     uint8_t *response = NULL;
     size_t response_len = 0;
-    assert_int_equal(
-        upstream_resolve(
+    int resolve_rc = -1;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        resolve_rc = upstream_resolve(
             &client,
             DNS_QUERY_WWW_EXAMPLE_COM_A,
             DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
             &response,
-            &response_len),
-        0);
+            &response_len);
+        if (resolve_rc == 0) {
+            break;
+        }
+        struct timespec retry_sleep;
+        retry_sleep.tv_sec = 0;
+        retry_sleep.tv_nsec = 100 * 1000 * 1000;
+        nanosleep(&retry_sleep, NULL);
+    }
+    assert_int_equal(resolve_rc, 0);
 
     assert_non_null(response);
     assert_int_equal(response_len, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN);

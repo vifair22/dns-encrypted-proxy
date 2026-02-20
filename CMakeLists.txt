@@ -5,6 +5,13 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
+
+set(PROJECT_WARNING_FLAGS -Wall -Wextra -Wpedantic)
+if(WARNINGS_AS_ERRORS)
+    list(APPEND PROJECT_WARNING_FLAGS -Werror)
+endif()
+
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -21,12 +28,12 @@ add_library(doh_proxy_lib STATIC
     src/metrics.c
 )
 target_include_directories(doh_proxy_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_options(doh_proxy_lib PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(doh_proxy_lib PRIVATE ${PROJECT_WARNING_FLAGS})
 target_link_libraries(doh_proxy_lib PUBLIC CURL::libcurl Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 # Main executable
 add_executable(DOH-Proxy src/main.c)
-target_compile_options(DOH-Proxy PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(DOH-Proxy PRIVATE ${PROJECT_WARNING_FLAGS})
 target_link_libraries(DOH-Proxy PRIVATE doh_proxy_lib)
 
 # Testing support
@@ -54,30 +61,35 @@ if(BUILD_TESTS)
         
         # Unit test: config
         add_executable(test_config tests/unit/test_config.c)
+        target_compile_options(test_config PRIVATE ${PROJECT_WARNING_FLAGS})
         target_link_libraries(test_config doh_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_config PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         add_test(NAME test_config COMMAND test_config)
         
         # Unit test: cache
         add_executable(test_cache tests/unit/test_cache.c)
+        target_compile_options(test_cache PRIVATE ${PROJECT_WARNING_FLAGS})
         target_link_libraries(test_cache doh_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_cache PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         add_test(NAME test_cache COMMAND test_cache)
         
         # Unit test: dns_message
         add_executable(test_dns_message tests/unit/test_dns_message.c)
+        target_compile_options(test_dns_message PRIVATE ${PROJECT_WARNING_FLAGS})
         target_link_libraries(test_dns_message doh_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_dns_message PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         add_test(NAME test_dns_message COMMAND test_dns_message)
 
         # Unit test: upstream
         add_executable(test_upstream tests/unit/test_upstream.c)
+        target_compile_options(test_upstream PRIVATE ${PROJECT_WARNING_FLAGS})
         target_link_libraries(test_upstream doh_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_upstream PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         add_test(NAME test_upstream COMMAND test_upstream)
         
         # Integration tests
         add_executable(test_integration tests/integration/test_integration.c)
+        target_compile_options(test_integration PRIVATE ${PROJECT_WARNING_FLAGS})
         target_link_libraries(test_integration doh_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_integration PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         add_test(NAME test_integration COMMAND test_integration)

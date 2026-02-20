@@ -425,7 +425,7 @@ int upstream_dot_resolve(
     }
     
     uint16_t response_len = read_u16(response_length);
-    if (response_len == 0 || response_len > DOT_MAX_MESSAGE_SIZE) {
+    if (response_len == 0) {
         close_connection(conn);
         pool_release(client, slot);
         return -1;
