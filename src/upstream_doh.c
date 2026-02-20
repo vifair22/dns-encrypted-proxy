@@ -1,16 +1,32 @@
-#include "doh_client.h"
+#include "upstream.h"
 #include "dns_message.h"
 
 #include <curl/curl.h>
-
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * DoH client implementation
+ * 
+ * Uses libcurl with HTTP/2 for DNS-over-HTTPS queries.
+ * Maintains a connection pool for reuse.
+ */
 
 typedef struct {
     uint8_t *data;
     size_t len;
     size_t cap;
 } buffer_t;
+
+struct upstream_doh_client {
+    CURL **pool_handles;
+    int *pool_in_use;
+    int pool_size;
+    pthread_mutex_t pool_mutex;
+    pthread_cond_t pool_cond;
+    int initialized;
+};
 
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     buffer_t *buffer = (buffer_t *)userdata;
@@ -39,59 +55,7 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     return chunk;
 }
 
-static int doh_post_with_handle(
-    CURL *curl,
-    const char *url,
-    int timeout_ms,
-    const uint8_t *query,
-    size_t query_len,
-    uint8_t **response_out,
-    size_t *response_len_out) {
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/dns-message");
-    if (headers == NULL) {
-        return -1;
-    }
-    struct curl_slist *temp = curl_slist_append(headers, "Accept: application/dns-message");
-    if (temp == NULL) {
-        curl_slist_free_all(headers);
-        return -1;
-    }
-    headers = temp;
-
-    buffer_t response = {0};
-
-    curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)query_len);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "DOH-Proxy/0.1");
-
-    CURLcode rc = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-
-    curl_slist_free_all(headers);
-
-    if (rc != CURLE_OK || status != 200 || response.len == 0) {
-        free(response.data);
-        return -1;
-    }
-
-    *response_out = response.data;
-    *response_len_out = response.len;
-    return 0;
-}
-
-static int pool_acquire(doh_client_t *client, CURL **handle_out, int *slot_out) {
+static int pool_acquire(upstream_doh_client_t *client, CURL **handle_out, int *slot_out) {
     pthread_mutex_lock(&client->pool_mutex);
 
     for (;;) {
@@ -109,47 +73,105 @@ static int pool_acquire(doh_client_t *client, CURL **handle_out, int *slot_out) 
     }
 }
 
-static void pool_release(doh_client_t *client, int slot) {
+static void pool_release(upstream_doh_client_t *client, int slot) {
     pthread_mutex_lock(&client->pool_mutex);
     client->pool_in_use[slot] = 0;
     pthread_cond_signal(&client->pool_cond);
     pthread_mutex_unlock(&client->pool_mutex);
 }
 
-int doh_client_init(doh_client_t *client, const proxy_config_t *config) {
-    if (client == NULL || config == NULL || config->upstream_count <= 0 || config->doh_pool_size <= 0) {
+static int doh_post_with_handle(
+    CURL *curl,
+    const char *url,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/dns-message");
+    if (headers == NULL) {
+        return -1;
+    }
+    struct curl_slist *temp = curl_slist_append(headers, "Accept: application/dns-message");
+    if (temp == NULL) {
+        curl_slist_free_all(headers);
+        return -1;
+    }
+    headers = temp;
+
+    buffer_t response = {0};
+
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    const char *force_http1 = getenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    if (force_http1 != NULL && *force_http1 != '\0') {
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    }
+
+    const char *insecure_tls = getenv("DOH_PROXY_TEST_INSECURE_TLS");
+    if (insecure_tls != NULL && *insecure_tls != '\0') {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)query_len);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "DOH-Proxy/0.2");
+
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+    curl_slist_free_all(headers);
+
+    if (rc != CURLE_OK || status != 200 || response.len == 0) {
+        free(response.data);
         return -1;
     }
 
-    memset(client, 0, sizeof(*client));
-    client->url_count = config->upstream_count;
-    client->timeout_ms = config->upstream_timeout_ms;
-    client->pool_size = config->doh_pool_size;
+    *response_out = response.data;
+    *response_len_out = response.len;
+    return 0;
+}
 
-    for (int i = 0; i < config->upstream_count; i++) {
-        strncpy(client->urls[i], config->upstream_urls[i], MAX_URL_LEN - 1);
-        client->urls[i][MAX_URL_LEN - 1] = '\0';
+int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config) {
+    if (client_out == NULL || config == NULL) {
+        return -1;
     }
-
+    
+    upstream_doh_client_t *client = calloc(1, sizeof(*client));
+    if (client == NULL) {
+        return -1;
+    }
+    
+    client->pool_size = config->pool_size > 0 ? config->pool_size : 6;
+    
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-        return -1;
-    }
-
-    if (pthread_mutex_init(&client->rr_mutex, NULL) != 0) {
-        curl_global_cleanup();
+        free(client);
         return -1;
     }
 
     if (pthread_mutex_init(&client->pool_mutex, NULL) != 0) {
-        pthread_mutex_destroy(&client->rr_mutex);
         curl_global_cleanup();
+        free(client);
         return -1;
     }
 
     if (pthread_cond_init(&client->pool_cond, NULL) != 0) {
         pthread_mutex_destroy(&client->pool_mutex);
-        pthread_mutex_destroy(&client->rr_mutex);
         curl_global_cleanup();
+        free(client);
         return -1;
     }
 
@@ -160,8 +182,8 @@ int doh_client_init(doh_client_t *client, const proxy_config_t *config) {
         free(client->pool_in_use);
         pthread_cond_destroy(&client->pool_cond);
         pthread_mutex_destroy(&client->pool_mutex);
-        pthread_mutex_destroy(&client->rr_mutex);
         curl_global_cleanup();
+        free(client);
         return -1;
     }
 
@@ -175,16 +197,18 @@ int doh_client_init(doh_client_t *client, const proxy_config_t *config) {
             free(client->pool_in_use);
             pthread_cond_destroy(&client->pool_cond);
             pthread_mutex_destroy(&client->pool_mutex);
-            pthread_mutex_destroy(&client->rr_mutex);
             curl_global_cleanup();
+            free(client);
             return -1;
         }
     }
 
+    client->initialized = 1;
+    *client_out = client;
     return 0;
 }
 
-void doh_client_destroy(doh_client_t *client) {
+void upstream_doh_client_destroy(upstream_doh_client_t *client) {
     if (client == NULL) {
         return;
     }
@@ -200,60 +224,63 @@ void doh_client_destroy(doh_client_t *client) {
     free(client->pool_handles);
     free(client->pool_in_use);
 
-    pthread_cond_destroy(&client->pool_cond);
-    pthread_mutex_destroy(&client->pool_mutex);
-    pthread_mutex_destroy(&client->rr_mutex);
-
-    curl_global_cleanup();
-    memset(client, 0, sizeof(*client));
+    if (client->initialized) {
+        pthread_cond_destroy(&client->pool_cond);
+        pthread_mutex_destroy(&client->pool_mutex);
+        curl_global_cleanup();
+    }
+    
+    free(client);
 }
 
-int doh_client_resolve(
-    doh_client_t *client,
+int upstream_doh_resolve(
+    upstream_doh_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
-    size_t *response_len_out,
-    const char **used_url_out) {
-    if (client == NULL || query == NULL || query_len == 0 || response_out == NULL || response_len_out == NULL) {
+    size_t *response_len_out) {
+    
+    if (client == NULL || server == NULL || query == NULL || query_len == 0 ||
+        response_out == NULL || response_len_out == NULL) {
         return -1;
     }
-
+    
+    if (server->type != UPSTREAM_TYPE_DOH) {
+        return -1;
+    }
+    
     *response_out = NULL;
     *response_len_out = 0;
-
-    pthread_mutex_lock(&client->rr_mutex);
-    uint64_t start = client->next_index;
-    client->next_index++;
-    pthread_mutex_unlock(&client->rr_mutex);
-
+    
     CURL *curl = NULL;
     int slot = -1;
     if (pool_acquire(client, &curl, &slot) != 0) {
         return -1;
     }
-
-    for (int attempt = 0; attempt < client->url_count; attempt++) {
-        int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->url_count);
-
-        uint8_t *response = NULL;
-        size_t response_len = 0;
-        if (doh_post_with_handle(curl, client->urls[idx], client->timeout_ms, query, query_len, &response, &response_len) == 0) {
-            if (dns_validate_response_for_query(query, query_len, response, response_len) != 0) {
-                free(response);
-                continue;
-            }
-
-            *response_out = response;
-            *response_len_out = response_len;
-            if (used_url_out != NULL) {
-                *used_url_out = client->urls[idx];
-            }
-            pool_release(client, slot);
-            return 0;
-        }
-    }
-
+    
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    
+    int result = doh_post_with_handle(
+        curl, server->url, timeout_ms,
+        query, query_len,
+        &response, &response_len);
+    
     pool_release(client, slot);
-    return -1;
+    
+    if (result != 0) {
+        return -1;
+    }
+    
+    /* Validate response matches query */
+    if (dns_validate_response_for_query(query, query_len, response, response_len) != 0) {
+        free(response);
+        return -1;
+    }
+    
+    *response_out = response;
+    *response_len_out = response_len;
+    return 0;
 }

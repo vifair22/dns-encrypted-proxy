@@ -7,6 +7,7 @@ RUN apk add --no-cache \
     cmake \
     pkgconfig \
     curl-dev \
+    openssl-dev \
     ca-certificates
 
 WORKDIR /src
@@ -22,6 +23,7 @@ FROM alpine:3.19 AS runtime
 
 RUN apk add --no-cache \
     libcurl \
+    openssl \
     ca-certificates
 
 WORKDIR /app

@@ -431,8 +431,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
         atomic_fetch_add(&server->metrics.cache_misses, 1);
     }
 
-    const char *used_url = NULL;
-    if (doh_client_resolve(&server->doh_client, query, query_len, response_out, response_len_out, &used_url) == 0) {
+    if (upstream_resolve(&server->upstream, query, query_len, response_out, response_len_out) == 0) {
         atomic_fetch_add(&server->metrics.upstream_success, 1);
         if (*response_len_out >= 2) {
             (*response_out)[0] = query[0];
@@ -447,7 +446,6 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
             }
         }
 
-        (void)used_url;
         return 0;
     }
 
@@ -787,6 +785,54 @@ static void *tcp_accept_loop(void *arg) {
     }
 
     return NULL;
+}
+
+int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, volatile sig_atomic_t *stop_flag) {
+    if (server == NULL || config == NULL) {
+        return -1;
+    }
+    
+    memset(server, 0, sizeof(*server));
+    server->config = *config;
+    server->stop_flag = stop_flag;
+    
+    /* Initialize cache */
+    if (dns_cache_init(&server->cache, (size_t)config->cache_capacity) != 0) {
+        return -1;
+    }
+    
+    /* Initialize upstream client */
+    const char *urls[MAX_UPSTREAMS];
+    for (int i = 0; i < config->upstream_count; i++) {
+        urls[i] = config->upstream_urls[i];
+    }
+    
+    upstream_config_t upstream_cfg = {
+        .timeout_ms = config->upstream_timeout_ms,
+        .pool_size = config->upstream_pool_size,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 10000
+    };
+    
+    if (upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg) != 0) {
+        dns_cache_destroy(&server->cache);
+        return -1;
+    }
+    
+    /* Initialize metrics */
+    metrics_init(&server->metrics);
+    
+    return 0;
+}
+
+void proxy_server_destroy(proxy_server_t *server) {
+    if (server == NULL) {
+        return;
+    }
+    
+    upstream_client_destroy(&server->upstream);
+    dns_cache_destroy(&server->cache);
+    memset(server, 0, sizeof(*server));
 }
 
 int proxy_server_run(proxy_server_t *server) {

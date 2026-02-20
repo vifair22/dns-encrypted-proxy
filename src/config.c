@@ -76,10 +76,10 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
-    if (strcmp(key, "doh_pool_size") == 0) {
+    if (strcmp(key, "upstream_pool_size") == 0) {
         int parsed = 0;
         if (parse_int(value, &parsed) == 0 && parsed > 0) {
-            config->doh_pool_size = parsed;
+            config->upstream_pool_size = parsed;
         }
         return;
     }
@@ -92,7 +92,7 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
-    if (strcmp(key, "upstream_doh_urls") == 0) {
+    if (strcmp(key, "upstreams") == 0) {
         split_upstreams(config, value);
         return;
     }
@@ -160,11 +160,11 @@ static void apply_env_overrides(proxy_config_t *config) {
         }
     }
 
-    value = getenv("DOH_POOL_SIZE");
+    value = getenv("UPSTREAM_POOL_SIZE");
     if (value != NULL && *value != '\0') {
         int parsed = 0;
         if (parse_int(value, &parsed) == 0 && parsed > 0) {
-            config->doh_pool_size = parsed;
+            config->upstream_pool_size = parsed;
         }
     }
 
@@ -176,7 +176,7 @@ static void apply_env_overrides(proxy_config_t *config) {
         }
     }
 
-    value = getenv("UPSTREAM_DOH_URLS");
+    value = getenv("UPSTREAMS");
     if (value != NULL && *value != '\0') {
         split_upstreams(config, value);
     }
@@ -227,7 +227,7 @@ static void set_defaults(proxy_config_t *config) {
     strncpy(config->listen_addr, "0.0.0.0", sizeof(config->listen_addr) - 1);
     config->listen_port = 53;
     config->upstream_timeout_ms = 2500;
-    config->doh_pool_size = 6;
+    config->upstream_pool_size = 6;
     config->cache_capacity = 1024;
 
     strncpy(config->upstream_urls[0], "https://cloudflare-dns.com/dns-query", MAX_URL_LEN - 1);
@@ -312,7 +312,7 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
         return -1;
     }
 
-    if (config->doh_pool_size <= 0) {
+    if (config->upstream_pool_size <= 0) {
         return -1;
     }
 
@@ -340,14 +340,14 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  listen_addr=%s\n", config->listen_addr);
     fprintf(out, "  listen_port=%d\n", config->listen_port);
     fprintf(out, "  upstream_timeout_ms=%d\n", config->upstream_timeout_ms);
-    fprintf(out, "  doh_pool_size=%d\n", config->doh_pool_size);
+    fprintf(out, "  upstream_pool_size=%d\n", config->upstream_pool_size);
     fprintf(out, "  cache_capacity=%d\n", config->cache_capacity);
     fprintf(out, "  tcp_idle_timeout_ms=%d\n", config->tcp_idle_timeout_ms);
     fprintf(out, "  tcp_max_clients=%d\n", config->tcp_max_clients);
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);
     fprintf(out, "  metrics_enabled=%d\n", config->metrics_enabled);
     fprintf(out, "  metrics_port=%d\n", config->metrics_port);
-    fprintf(out, "  upstream_doh_urls=");
+    fprintf(out, "  upstreams=");
     for (int i = 0; i < config->upstream_count; i++) {
         fprintf(out, "%s%s", config->upstream_urls[i], (i + 1 == config->upstream_count) ? "" : ",");
     }

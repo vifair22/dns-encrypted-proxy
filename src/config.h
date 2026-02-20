@@ -10,7 +10,7 @@ typedef struct {
     char listen_addr[64];
     int listen_port;
     int upstream_timeout_ms;
-    int doh_pool_size;
+    int upstream_pool_size;
     int cache_capacity;
     char upstream_urls[MAX_UPSTREAMS][MAX_URL_LEN];
     int upstream_count;
