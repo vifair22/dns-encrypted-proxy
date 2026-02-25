@@ -75,6 +75,7 @@ build:
         -p 5053:53/udp \
         -p 5053:53/tcp \
         -p 9090:9090/tcp \
+        -e CACHE_CAPACITY=8192 \
         "$IMAGE:$TAG"
       EOF
   only:
