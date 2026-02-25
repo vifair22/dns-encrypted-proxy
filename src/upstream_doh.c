@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 
 /*
@@ -26,7 +27,48 @@ struct upstream_doh_client {
     pthread_mutex_t pool_mutex;
     pthread_cond_t pool_cond;
     int initialized;
+    atomic_uint_fast64_t http2_responses_total;
+    atomic_uint_fast64_t http1_responses_total;
+    atomic_uint_fast64_t http_other_responses_total;
 };
+
+static int curl_http_version_is_h2(long http_version) {
+#ifdef CURL_HTTP_VERSION_2_0
+    if (http_version == CURL_HTTP_VERSION_2_0) {
+        return 1;
+    }
+#endif
+#ifdef CURL_HTTP_VERSION_2
+    if (http_version == CURL_HTTP_VERSION_2) {
+        return 1;
+    }
+#endif
+#ifdef CURL_HTTP_VERSION_2TLS
+    if (http_version == CURL_HTTP_VERSION_2TLS) {
+        return 1;
+    }
+#endif
+#ifdef CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE
+    if (http_version == CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+static int curl_http_version_is_h1(long http_version) {
+#ifdef CURL_HTTP_VERSION_1_0
+    if (http_version == CURL_HTTP_VERSION_1_0) {
+        return 1;
+    }
+#endif
+#ifdef CURL_HTTP_VERSION_1_1
+    if (http_version == CURL_HTTP_VERSION_1_1) {
+        return 1;
+    }
+#endif
+    return 0;
+}
 
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     buffer_t *buffer = (buffer_t *)userdata;
@@ -81,6 +123,7 @@ static void pool_release(upstream_doh_client_t *client, int slot) {
 }
 
 static int doh_post_with_handle(
+    upstream_doh_client_t *client,
     CURL *curl,
     const char *url,
     int timeout_ms,
@@ -132,6 +175,18 @@ static int doh_post_with_handle(
     CURLcode rc = curl_easy_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    long http_version = 0;
+    (void)curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
+
+    if (client != NULL) {
+        if (curl_http_version_is_h2(http_version)) {
+            atomic_fetch_add(&client->http2_responses_total, 1);
+        } else if (curl_http_version_is_h1(http_version)) {
+            atomic_fetch_add(&client->http1_responses_total, 1);
+        } else {
+            atomic_fetch_add(&client->http_other_responses_total, 1);
+        }
+    }
 
     curl_slist_free_all(headers);
 
@@ -264,6 +319,7 @@ int upstream_doh_resolve(
     size_t response_len = 0;
     
     int result = doh_post_with_handle(
+        client,
         curl, server->url, timeout_ms,
         query, query_len,
         &response, &response_len);
@@ -282,5 +338,60 @@ int upstream_doh_resolve(
     
     *response_out = response;
     *response_len_out = response_len;
+    return 0;
+}
+
+int upstream_doh_client_get_pool_stats(
+    upstream_doh_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    uint64_t *http2_total_out,
+    uint64_t *http1_total_out,
+    uint64_t *http_other_total_out) {
+    if (capacity_out != NULL) {
+        *capacity_out = 0;
+    }
+    if (in_use_out != NULL) {
+        *in_use_out = 0;
+    }
+    if (http2_total_out != NULL) {
+        *http2_total_out = 0;
+    }
+    if (http1_total_out != NULL) {
+        *http1_total_out = 0;
+    }
+    if (http_other_total_out != NULL) {
+        *http_other_total_out = 0;
+    }
+
+    if (client == NULL) {
+        return -1;
+    }
+
+    int in_use = 0;
+    pthread_mutex_lock(&client->pool_mutex);
+    for (int i = 0; i < client->pool_size; i++) {
+        if (client->pool_in_use[i]) {
+            in_use++;
+        }
+    }
+    pthread_mutex_unlock(&client->pool_mutex);
+
+    if (capacity_out != NULL) {
+        *capacity_out = client->pool_size;
+    }
+    if (in_use_out != NULL) {
+        *in_use_out = in_use;
+    }
+    if (http2_total_out != NULL) {
+        *http2_total_out = (uint64_t)atomic_load(&client->http2_responses_total);
+    }
+    if (http1_total_out != NULL) {
+        *http1_total_out = (uint64_t)atomic_load(&client->http1_responses_total);
+    }
+    if (http_other_total_out != NULL) {
+        *http_other_total_out = (uint64_t)atomic_load(&client->http_other_responses_total);
+    }
+
     return 0;
 }

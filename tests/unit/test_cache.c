@@ -28,12 +28,16 @@ static void test_cache_init_destroy(void **state) {
     
     int result = dns_cache_init(&cache, 100);
     assert_int_equal(result, 0);
-    assert_non_null(cache.entries);
-    assert_int_equal(cache.capacity, 100);
+    size_t capacity = 0;
+    size_t entries = 0;
+    dns_cache_get_stats(&cache, &capacity, &entries);
+    assert_int_equal(capacity, 100);
+    assert_int_equal(entries, 0);
     
     dns_cache_destroy(&cache);
-    assert_null(cache.entries);
-    assert_int_equal(cache.capacity, 0);
+    dns_cache_get_stats(&cache, &capacity, &entries);
+    assert_int_equal(capacity, 0);
+    assert_int_equal(entries, 0);
 }
 
 /*
@@ -410,6 +414,49 @@ static void test_cache_thread_safety(void **state) {
     dns_cache_destroy(&cache);
 }
 
+/*
+ * Test: cache counters for evictions/expirations/bytes
+ */
+static void test_cache_counters(void **state) {
+    (void)state;
+
+    dns_cache_t cache;
+    dns_cache_init(&cache, 2);
+
+    uint8_t key1[] = {0x01};
+    uint8_t key2[] = {0x02};
+    uint8_t key3[] = {0x03};
+    uint8_t resp[] = {0x12, 0x34, 0x81, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    dns_cache_store(&cache, key1, sizeof(key1), resp, sizeof(resp), 300);
+    dns_cache_store(&cache, key2, sizeof(key2), resp, sizeof(resp), 300);
+    dns_cache_store(&cache, key3, sizeof(key3), resp, sizeof(resp), 300);
+
+    uint64_t evictions = 0;
+    uint64_t expirations = 0;
+    size_t bytes_in_use = 0;
+    dns_cache_get_counters(&cache, &evictions, &expirations, &bytes_in_use);
+
+    assert_int_equal(evictions, 1);
+    assert_int_equal(expirations, 0);
+    assert_true(bytes_in_use > 0);
+
+    uint8_t short_key[] = {0x0A};
+    dns_cache_store(&cache, short_key, sizeof(short_key), resp, sizeof(resp), 1);
+    sleep(2);
+
+    uint8_t req_id[2] = {0x00, 0x00};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    int hit = dns_cache_lookup(&cache, short_key, sizeof(short_key), req_id, &out, &out_len);
+    assert_int_equal(hit, 0);
+
+    dns_cache_get_counters(&cache, &evictions, &expirations, &bytes_in_use);
+    assert_true(expirations >= 1);
+
+    dns_cache_destroy(&cache);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_cache_init_destroy),
@@ -423,6 +470,7 @@ int main(void) {
         cmocka_unit_test(test_cache_lookup_invalid_params),
         cmocka_unit_test(test_cache_store_invalid_params),
         cmocka_unit_test(test_cache_thread_safety),
+        cmocka_unit_test(test_cache_counters),
     };
     
     return cmocka_run_group_tests(tests, NULL, NULL);

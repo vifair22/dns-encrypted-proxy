@@ -4,6 +4,7 @@ FROM alpine:3.19 AS build
 
 RUN apk add --no-cache \
     build-base \
+    binutils \
     cmake \
     pkgconfig \
     curl-dev \
@@ -16,8 +17,15 @@ COPY CMakeLists.txt ./
 COPY src ./src
 COPY doh-proxy.conf.example ./
 
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build -j
+RUN cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTS=OFF \
+    -DBUILD_BENCHMARKS=OFF \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+    -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -ffunction-sections -fdata-sections" \
+    -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-Wl,--gc-sections" \
+    && cmake --build build --target DOH-Proxy -j \
+    && strip /src/build/DOH-Proxy
 
 FROM alpine:3.19 AS runtime
 

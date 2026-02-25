@@ -18,6 +18,13 @@ int upstream_doh_resolve(
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out);
+int upstream_doh_client_get_pool_stats(
+    upstream_doh_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    uint64_t *http2_total_out,
+    uint64_t *http1_total_out,
+    uint64_t *http_other_total_out);
 
 int upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config);
 void upstream_dot_client_destroy(upstream_dot_client_t *client);
@@ -29,6 +36,11 @@ int upstream_dot_resolve(
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out);
+int upstream_dot_client_get_pool_stats(
+    upstream_dot_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out);
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -345,4 +357,35 @@ int upstream_resolve(
     }
     
     return -1;
+}
+
+int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats_t *stats_out) {
+    if (stats_out == NULL) {
+        return -1;
+    }
+
+    memset(stats_out, 0, sizeof(*stats_out));
+    if (client == NULL) {
+        return -1;
+    }
+
+    if (client->doh_client != NULL) {
+        (void)upstream_doh_client_get_pool_stats(
+            client->doh_client,
+            &stats_out->doh_pool_capacity,
+            &stats_out->doh_pool_in_use,
+            &stats_out->doh_http2_responses_total,
+            &stats_out->doh_http1_responses_total,
+            &stats_out->doh_http_other_responses_total);
+    }
+
+    if (client->dot_client != NULL) {
+        (void)upstream_dot_client_get_pool_stats(
+            client->dot_client,
+            &stats_out->dot_pool_capacity,
+            &stats_out->dot_pool_in_use,
+            &stats_out->dot_connections_alive);
+    }
+
+    return 0;
 }

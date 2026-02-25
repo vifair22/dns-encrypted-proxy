@@ -458,3 +458,49 @@ int upstream_dot_resolve(
     *response_len_out = response_len;
     return 0;
 }
+
+int upstream_dot_client_get_pool_stats(
+    upstream_dot_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out) {
+    if (capacity_out != NULL) {
+        *capacity_out = 0;
+    }
+    if (in_use_out != NULL) {
+        *in_use_out = 0;
+    }
+    if (alive_out != NULL) {
+        *alive_out = 0;
+    }
+
+    if (client == NULL) {
+        return -1;
+    }
+
+    int in_use = 0;
+    int alive = 0;
+
+    pthread_mutex_lock(&client->pool_mutex);
+    for (int i = 0; i < client->pool_size; i++) {
+        if (client->pool[i].in_use) {
+            in_use++;
+        }
+        if (client->pool[i].fd >= 0 && client->pool[i].ssl != NULL) {
+            alive++;
+        }
+    }
+    pthread_mutex_unlock(&client->pool_mutex);
+
+    if (capacity_out != NULL) {
+        *capacity_out = client->pool_size;
+    }
+    if (in_use_out != NULL) {
+        *in_use_out = in_use;
+    }
+    if (alive_out != NULL) {
+        *alive_out = alive;
+    }
+
+    return 0;
+}

@@ -33,7 +33,9 @@
 
 #include "cache.h"
 #include "config.h"
+#include "dns_server.h"
 #include "dns_message.h"
+#include "metrics.h"
 #include "upstream.h"
 #include "test_helpers.h"
 #include "test_fixtures.h"
@@ -357,6 +359,288 @@ static int reserve_unused_port(void) {
     int port = ntohs(addr.sin_port);
     close(fd);
     return port;
+}
+
+static int http_get_local(int port, const char *path, char *buf, size_t buf_size) {
+    if (path == NULL || buf == NULL || buf_size == 0) {
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    char req[256];
+    int req_len = snprintf(
+        req,
+        sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: 127.0.0.1\r\n"
+        "Connection: close\r\n\r\n",
+        path);
+    if (req_len <= 0 || (size_t)req_len >= sizeof(req)) {
+        close(fd);
+        return -1;
+    }
+
+    if (send(fd, req, (size_t)req_len, 0) != req_len) {
+        close(fd);
+        return -1;
+    }
+
+    size_t off = 0;
+    while (off + 1 < buf_size) {
+        ssize_t n = recv(fd, buf + off, buf_size - off - 1, 0);
+        if (n <= 0) {
+            break;
+        }
+        off += (size_t)n;
+    }
+
+    buf[off] = '\0';
+    close(fd);
+    return (off > 0) ? 0 : -1;
+}
+
+typedef struct {
+    proxy_server_t *server;
+    int rc;
+} proxy_thread_ctx_t;
+
+static void *proxy_server_thread_main(void *arg) {
+    proxy_thread_ctx_t *ctx = (proxy_thread_ctx_t *)arg;
+    if (ctx == NULL || ctx->server == NULL) {
+        return NULL;
+    }
+    ctx->rc = proxy_server_run(ctx->server);
+    return NULL;
+}
+
+static int send_udp_query_and_recv(int port, const uint8_t *query, size_t query_len, uint8_t *resp_out, size_t *resp_len_out) {
+    if (query == NULL || query_len == 0 || resp_out == NULL || resp_len_out == NULL) {
+        return -1;
+    }
+
+    *resp_len_out = 0;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+
+    if (sendto(fd, query, query_len, 0, (struct sockaddr *)&addr, sizeof(addr)) != (ssize_t)query_len) {
+        close(fd);
+        return -1;
+    }
+
+    ssize_t n = recvfrom(fd, resp_out, 1500, 0, NULL, NULL);
+    close(fd);
+    if (n <= 0) {
+        return -1;
+    }
+
+    *resp_len_out = (size_t)n;
+    return 0;
+}
+
+static int open_tcp_connection_local(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)port);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int send_tcp_query_and_recv(int port, const uint8_t *query, size_t query_len, uint8_t *resp_out, size_t *resp_len_out) {
+    if (query == NULL || query_len == 0 || query_len > UINT16_MAX || resp_out == NULL || resp_len_out == NULL) {
+        return -1;
+    }
+
+    *resp_len_out = 0;
+    int fd = open_tcp_connection_local(port);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t len_prefix[2];
+    len_prefix[0] = (uint8_t)((query_len >> 8) & 0xFFu);
+    len_prefix[1] = (uint8_t)(query_len & 0xFFu);
+
+    if (send(fd, len_prefix, sizeof(len_prefix), 0) != (ssize_t)sizeof(len_prefix) ||
+        send(fd, query, query_len, 0) != (ssize_t)query_len) {
+        close(fd);
+        return -1;
+    }
+
+    uint8_t out_len[2];
+    ssize_t n = recv(fd, out_len, sizeof(out_len), MSG_WAITALL);
+    if (n != (ssize_t)sizeof(out_len)) {
+        close(fd);
+        return -1;
+    }
+
+    size_t resp_len = (size_t)(((uint16_t)out_len[0] << 8) | (uint16_t)out_len[1]);
+    if (resp_len == 0 || resp_len > 1500) {
+        close(fd);
+        return -1;
+    }
+
+    n = recv(fd, resp_out, resp_len, MSG_WAITALL);
+    close(fd);
+    if (n != (ssize_t)resp_len) {
+        return -1;
+    }
+
+    *resp_len_out = resp_len;
+    return 0;
+}
+
+static int send_tcp_query_on_fd(int fd, const uint8_t *query, size_t query_len, uint8_t *resp_out, size_t *resp_len_out) {
+    if (fd < 0 || query == NULL || query_len == 0 || query_len > UINT16_MAX || resp_out == NULL || resp_len_out == NULL) {
+        return -1;
+    }
+
+    *resp_len_out = 0;
+
+    uint8_t len_prefix[2];
+    len_prefix[0] = (uint8_t)((query_len >> 8) & 0xFFu);
+    len_prefix[1] = (uint8_t)(query_len & 0xFFu);
+
+    if (send(fd, len_prefix, sizeof(len_prefix), 0) != (ssize_t)sizeof(len_prefix) ||
+        send(fd, query, query_len, 0) != (ssize_t)query_len) {
+        return -1;
+    }
+
+    uint8_t out_len[2];
+    ssize_t n = recv(fd, out_len, sizeof(out_len), MSG_WAITALL);
+    if (n != (ssize_t)sizeof(out_len)) {
+        return -1;
+    }
+
+    size_t resp_len = (size_t)(((uint16_t)out_len[0] << 8) | (uint16_t)out_len[1]);
+    if (resp_len == 0 || resp_len > 1500) {
+        return -1;
+    }
+
+    n = recv(fd, resp_out, resp_len, MSG_WAITALL);
+    if (n != (ssize_t)resp_len) {
+        return -1;
+    }
+
+    *resp_len_out = resp_len;
+    return 0;
+}
+
+static const char *resolve_doh_proxy_binary_path(void) {
+    if (access("./DOH-Proxy", X_OK) == 0) {
+        return "./DOH-Proxy";
+    }
+    if (access("../DOH-Proxy", X_OK) == 0) {
+        return "../DOH-Proxy";
+    }
+    return NULL;
+}
+
+static int waitpid_with_timeout(pid_t pid, int *status_out, int timeout_ms) {
+    if (pid <= 0 || timeout_ms <= 0) {
+        return -1;
+    }
+
+    int waited_ms = 0;
+    while (waited_ms < timeout_ms) {
+        int status = 0;
+        pid_t rc = waitpid(pid, &status, WNOHANG);
+        if (rc == pid) {
+            if (status_out != NULL) {
+                *status_out = status;
+            }
+            return 0;
+        }
+        if (rc < 0) {
+            return -1;
+        }
+
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+        waited_ms += 50;
+    }
+
+    return -1;
+}
+
+static pid_t spawn_main_with_config(const char *config_path) {
+    const char *bin = resolve_doh_proxy_binary_path();
+    if (bin == NULL || config_path == NULL) {
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execl(bin, "DOH-Proxy", config_path, (char *)NULL);
+        _exit(127);
+    }
+
+    return pid;
+}
+
+static pid_t spawn_main_without_args(void) {
+    const char *bin = resolve_doh_proxy_binary_path();
+    if (bin == NULL) {
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        execl(bin, "DOH-Proxy", (char *)NULL);
+        _exit(127);
+    }
+
+    return pid;
 }
 
 typedef struct {
@@ -1004,6 +1288,107 @@ static void test_upstream_transport_dot(void **state) {
 }
 
 /*
+ * Test: DoT transport path fails cleanly when endpoint is unreachable
+ */
+static void test_upstream_transport_dot_unreachable(void **state) {
+    (void)state;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+
+    char url[256];
+    snprintf(url, sizeof(url), "tls://127.0.0.1:%d", dead_port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 250,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+    assert_true(client.servers[0].health.total_failures >= 1);
+
+    upstream_client_destroy(&client);
+}
+
+/*
+ * Test: DoH runtime stats record HTTP/1 responses when forced via test env
+ */
+static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
+    (void)state;
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    python_doh_server_t server;
+    assert_int_equal(
+        start_python_doh_server(
+            &server,
+            cert_path,
+            key_path,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN),
+        0);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://localhost:%d/dns-query", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 1000,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        0);
+    free(response);
+
+    upstream_runtime_stats_t stats;
+    assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+    assert_true(stats.doh_http1_responses_total >= 1);
+
+    upstream_client_destroy(&client);
+    stop_python_doh_server(&server);
+    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+
+/*
  * Test: Failover from failed DoH upstream to healthy DoT upstream
  */
 static void test_upstream_transport_failover_doh_to_dot(void **state) {
@@ -1065,9 +1450,901 @@ static void test_upstream_transport_failover_doh_to_dot(void **state) {
     unsetenv("SSL_CERT_FILE");
 }
 
+/*
+ * Test: Metrics endpoint serves prometheus text and 404 for non-metrics routes
+ */
+static void test_metrics_endpoint_http_paths(void **state) {
+    (void)state;
+
+    proxy_metrics_t metrics;
+    metrics_init(&metrics);
+    atomic_fetch_add(&metrics.queries_udp, 3);
+
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 32), 0);
+
+    int port = reserve_unused_port();
+    assert_true(port > 0);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, port), 0);
+
+    char body[32768];
+    assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
+    assert_non_null(strstr(body, "HTTP/1.1 200 OK"));
+    assert_non_null(strstr(body, "# HELP doh_proxy_queries_udp_total"));
+    assert_non_null(strstr(body, "doh_proxy_queries_udp_total 3"));
+    assert_non_null(strstr(body, "doh_proxy_uptime_seconds"));
+
+    char not_found[2048];
+    assert_int_equal(http_get_local(port, "/not-found", not_found, sizeof(not_found)), 0);
+    assert_non_null(strstr(not_found, "HTTP/1.1 404 Not Found"));
+
+    assert_true((uint64_t)atomic_load(&metrics.metrics_http_requests_total) >= 2);
+    assert_true((uint64_t)atomic_load(&metrics.metrics_http_responses_2xx_total) >= 1);
+    assert_true((uint64_t)atomic_load(&metrics.metrics_http_responses_4xx_total) >= 1);
+    assert_int_equal((int)atomic_load(&metrics.metrics_http_in_flight), 0);
+
+    metrics_server_stop();
+    dns_cache_destroy(&cache);
+}
+
+/*
+ * Test: Metrics endpoint renders per-upstream labeled series when upstream client is provided
+ */
+static void test_metrics_endpoint_with_upstream_labels(void **state) {
+    (void)state;
+
+    proxy_metrics_t metrics;
+    metrics_init(&metrics);
+
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 16), 0);
+
+    const char *urls[] = {
+        "https://cloudflare-dns.com/dns-query",
+        "tls://1.1.1.1:853"
+    };
+    upstream_client_t upstream;
+    upstream_config_t cfg = {
+        .timeout_ms = 250,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&upstream, urls, 2, &cfg), 0);
+
+    int port = reserve_unused_port();
+    assert_true(port > 0);
+    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, port), 0);
+
+    char body[32768];
+    assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
+    assert_non_null(strstr(body, "doh_proxy_upstream_server_requests_total{upstream=\"https://cloudflare-dns.com/dns-query\",protocol=\"doh\"}"));
+    assert_non_null(strstr(body, "doh_proxy_upstream_server_healthy{upstream=\"tls://1.1.1.1:853\",protocol=\"dot\"}"));
+
+    metrics_server_stop();
+    upstream_client_destroy(&upstream);
+    dns_cache_destroy(&cache);
+}
+
+/*
+ * Test: DNS server returns SERVFAIL when upstream is unreachable and updates counters
+ */
+static void test_dns_server_udp_servfail_path(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.upstream_timeout_ms = 150;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    assert_int_equal(
+        send_udp_query_and_recv(
+            config.listen_port,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            resp,
+            &resp_len),
+        0);
+    assert_true(resp_len >= 12);
+
+    uint16_t flags = (uint16_t)(((uint16_t)resp[2] << 8) | (uint16_t)resp[3]);
+    uint16_t rcode = (uint16_t)(flags & 0x000Fu);
+    assert_int_equal(rcode, 2);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.queries_udp) >= 1);
+    assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
+    assert_true((uint64_t)atomic_load(&server.metrics.responses_total) >= 1);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: DNS server rejects TCP connections at configured max client limit
+ */
+static void test_dns_server_tcp_connection_rejection(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.tcp_max_clients = 0;
+    config.upstream_timeout_ms = 100;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    int fd = open_tcp_connection_local(config.listen_port);
+    assert_true(fd >= 0);
+
+    uint8_t byte = 0;
+    ssize_t n = recv(fd, &byte, 1, 0);
+    assert_int_equal(n, 0);
+    close(fd);
+
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.tcp_connections_rejected) >= 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.tcp_connections_total), 0);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: DNS server handles TCP query path and returns SERVFAIL on upstream failure
+ */
+static void test_dns_server_tcp_servfail_path(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.tcp_max_clients = 4;
+    config.tcp_max_queries_per_conn = 1;
+    config.upstream_timeout_ms = 150;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    assert_int_equal(
+        send_tcp_query_and_recv(
+            config.listen_port,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            resp,
+            &resp_len),
+        0);
+    assert_true(resp_len >= 12);
+
+    uint16_t flags = (uint16_t)(((uint16_t)resp[2] << 8) | (uint16_t)resp[3]);
+    uint16_t rcode = (uint16_t)(flags & 0x000Fu);
+    assert_int_equal(rcode, 2);
+
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 100 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.queries_tcp) >= 1);
+    assert_true((uint64_t)atomic_load(&server.metrics.tcp_connections_total) >= 1);
+    assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: main exits with non-zero when configuration validation fails
+ */
+static void test_main_invalid_config_exits_nonzero(void **state) {
+    (void)state;
+
+    const char *cfg_text =
+        "listen_addr=127.0.0.1\n"
+        "listen_port=0\n"
+        "upstream_timeout_ms=500\n"
+        "upstream_pool_size=2\n"
+        "cache_capacity=128\n"
+        "upstream_url=https://cloudflare-dns.com/dns-query\n"
+        "metrics_enabled=1\n"
+        "metrics_port=9090\n";
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_not_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: main starts server and exits cleanly on SIGTERM
+ */
+static void test_main_start_and_signal_shutdown(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    int metrics_port = reserve_unused_port();
+    int dead_upstream = reserve_unused_port();
+    assert_true(listen_port > 0);
+    assert_true(metrics_port > 0);
+    assert_true(dead_upstream > 0);
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        "metrics_enabled=1\n"
+        "metrics_port=%d\n",
+        listen_port,
+        dead_upstream,
+        metrics_port);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 250 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: main exits non-zero when metrics port bind fails
+ */
+static void test_main_metrics_bind_failure_exits_nonzero(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    int dead_upstream = reserve_unused_port();
+    int metrics_port = reserve_unused_port();
+    assert_true(listen_port > 0);
+    assert_true(dead_upstream > 0);
+    assert_true(metrics_port > 0);
+
+    int hold_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(hold_fd >= 0);
+    int opt = 1;
+    setsockopt(hold_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in hold_addr;
+    memset(&hold_addr, 0, sizeof(hold_addr));
+    hold_addr.sin_family = AF_INET;
+    hold_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    hold_addr.sin_port = htons((uint16_t)metrics_port);
+    assert_int_equal(bind(hold_fd, (struct sockaddr *)&hold_addr, sizeof(hold_addr)), 0);
+    assert_int_equal(listen(hold_fd, 1), 0);
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        "metrics_enabled=1\n"
+        "metrics_port=%d\n",
+        listen_port,
+        dead_upstream,
+        metrics_port);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_not_equal(WEXITSTATUS(status), 0);
+
+    close(hold_fd);
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: main exits non-zero when server initialization fails after config load
+ */
+static void test_main_server_init_failure_exits_nonzero(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    assert_true(listen_port > 0);
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstreams=invalid://not-supported\n"
+        "metrics_enabled=0\n"
+        "metrics_port=9090\n",
+        listen_port);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_not_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: main exits non-zero when runtime socket bind fails in proxy_server_run
+ */
+static void test_main_runtime_bind_failure_exits_nonzero(void **state) {
+    (void)state;
+
+    int dead_upstream = reserve_unused_port();
+    assert_true(dead_upstream > 0);
+
+    const char *cfg_text =
+        "listen_addr=bad.address.example\n"
+        "listen_port=5300\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstream_url=https://127.0.0.1:6553/dns-query\n"
+        "metrics_enabled=0\n"
+        "metrics_port=9090\n";
+    (void)dead_upstream;
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_not_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: main starts with metrics disabled and exits cleanly on SIGTERM
+ */
+static void test_main_start_metrics_disabled_and_signal_shutdown(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    int dead_upstream = reserve_unused_port();
+    assert_true(listen_port > 0);
+    assert_true(dead_upstream > 0);
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstreams=https://127.0.0.1:%d/dns-query\n"
+        "metrics_enabled=0\n"
+        "metrics_port=9090\n",
+        listen_port,
+        dead_upstream);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 250 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: main follows argc==1 path by loading config from DOH_PROXY_CONFIG
+ */
+static void test_main_no_arg_uses_env_config_and_signal_shutdown(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    int dead_upstream = reserve_unused_port();
+    assert_true(listen_port > 0);
+    assert_true(dead_upstream > 0);
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstreams=https://127.0.0.1:%d/dns-query\n"
+        "metrics_enabled=0\n"
+        "metrics_port=9090\n",
+        listen_port,
+        dead_upstream);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+    setenv("DOH_PROXY_CONFIG", cfg_path, 1);
+
+    pid_t pid = spawn_main_without_args();
+    assert_true(pid > 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 250 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+
+    unsetenv("DOH_PROXY_CONFIG");
+    remove_temp_file(cfg_path);
+}
+
+/*
+ * Test: TCP connection enforces max queries per connection and closes socket
+ */
+static void test_dns_server_tcp_max_queries_per_connection(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.tcp_max_clients = 2;
+    config.tcp_max_queries_per_conn = 1;
+    config.upstream_timeout_ms = 150;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    int fd = open_tcp_connection_local(config.listen_port);
+    assert_true(fd >= 0);
+
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    assert_int_equal(send_tcp_query_on_fd(fd, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, resp, &resp_len), 0);
+    assert_true(resp_len >= 12);
+
+    size_t resp_len_2 = 0;
+    assert_int_equal(send_tcp_query_on_fd(fd, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, resp, &resp_len_2), -1);
+
+    uint8_t b = 0;
+    ssize_t n = recv(fd, &b, 1, 0);
+    assert_int_equal(n, 0);
+    close(fd);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: Proxy and metrics API argument validation guards
+ */
+static void test_runtime_api_invalid_arguments(void **state) {
+    (void)state;
+
+    assert_int_equal(proxy_server_init(NULL, NULL, NULL), -1);
+    assert_int_equal(proxy_server_run(NULL), -1);
+
+    proxy_metrics_t metrics;
+    metrics_init(&metrics);
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 8), 0);
+
+    assert_int_equal(metrics_server_start(NULL, &cache, NULL, 9090), -1);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, 0), -1);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, 70000), -1);
+
+    int busy_fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(busy_fd >= 0);
+    int opt = 1;
+    setsockopt(busy_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    int busy_port = reserve_unused_port();
+    assert_true(busy_port > 0);
+
+    struct sockaddr_in busy_addr;
+    memset(&busy_addr, 0, sizeof(busy_addr));
+    busy_addr.sin_family = AF_INET;
+    busy_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    busy_addr.sin_port = htons((uint16_t)busy_port);
+    assert_int_equal(bind(busy_fd, (struct sockaddr *)&busy_addr, sizeof(busy_addr)), 0);
+    assert_int_equal(listen(busy_fd, 1), 0);
+
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, busy_port), -1);
+    close(busy_fd);
+
+    metrics_server_stop();
+
+    dns_cache_destroy(&cache);
+}
+
+/*
+ * Test: TCP zero-length frame is ignored and connection remains usable
+ */
+static void test_dns_server_tcp_zero_length_frame_ignored(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.tcp_max_clients = 2;
+    config.tcp_max_queries_per_conn = 2;
+    config.upstream_timeout_ms = 150;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    int fd = open_tcp_connection_local(config.listen_port);
+    assert_true(fd >= 0);
+
+    uint8_t zero_len[2] = {0x00, 0x00};
+    assert_int_equal(send(fd, zero_len, sizeof(zero_len), 0), (ssize_t)sizeof(zero_len));
+
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    assert_int_equal(send_tcp_query_on_fd(fd, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, resp, &resp_len), 0);
+    assert_true(resp_len >= 12);
+
+    close(fd);
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.queries_tcp) >= 1);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: TCP partial length frame close is handled without crashing server loop
+ */
+static void test_dns_server_tcp_partial_frame_close(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.tcp_max_clients = 4;
+    config.tcp_max_queries_per_conn = 0;
+    config.upstream_timeout_ms = 150;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    int fd = open_tcp_connection_local(config.listen_port);
+    assert_true(fd >= 0);
+    uint8_t half_len = 0x00;
+    assert_int_equal(send(fd, &half_len, 1, 0), 1);
+    close(fd);
+
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+
+    uint8_t udp_resp[1500];
+    size_t udp_resp_len = 0;
+    assert_int_equal(
+        send_udp_query_and_recv(
+            config.listen_port,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            udp_resp,
+            &udp_resp_len),
+        0);
+    assert_true(udp_resp_len >= 12);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.tcp_connections_total) >= 1);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: UDP path truncates oversized upstream response for non-EDNS query
+ */
+static void test_dns_server_udp_truncation_path(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    const size_t answer_count = 40;
+    const size_t question_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN - 12;
+    const size_t answer_len = 16;
+    size_t large_len = 12 + question_len + (answer_count * answer_len);
+    uint8_t *large_response = calloc(1, large_len);
+    assert_non_null(large_response);
+
+    large_response[0] = 0x12;
+    large_response[1] = 0x34;
+    large_response[2] = 0x81;
+    large_response[3] = 0x80;
+    large_response[4] = 0x00;
+    large_response[5] = 0x01;
+    large_response[6] = (uint8_t)((answer_count >> 8) & 0xFFu);
+    large_response[7] = (uint8_t)(answer_count & 0xFFu);
+    large_response[8] = 0x00;
+    large_response[9] = 0x00;
+    large_response[10] = 0x00;
+    large_response[11] = 0x00;
+
+    memcpy(large_response + 12, DNS_QUERY_WWW_EXAMPLE_COM_A + 12, question_len);
+    size_t off = 12 + question_len;
+    for (size_t i = 0; i < answer_count; i++) {
+        large_response[off + 0] = 0xC0;
+        large_response[off + 1] = 0x0C;
+        large_response[off + 2] = 0x00;
+        large_response[off + 3] = 0x01;
+        large_response[off + 4] = 0x00;
+        large_response[off + 5] = 0x01;
+        large_response[off + 6] = 0x00;
+        large_response[off + 7] = 0x00;
+        large_response[off + 8] = 0x01;
+        large_response[off + 9] = 0x2C;
+        large_response[off + 10] = 0x00;
+        large_response[off + 11] = 0x04;
+        large_response[off + 12] = 0x5D;
+        large_response[off + 13] = 0xB8;
+        large_response[off + 14] = 0xD8;
+        large_response[off + 15] = (uint8_t)(0x22u + (i & 0x0Fu));
+        off += answer_len;
+    }
+
+    python_doh_server_t doh_server;
+    assert_int_equal(
+        start_python_doh_server(
+            &doh_server,
+            cert_path,
+            key_path,
+            large_response,
+            large_len),
+        0);
+    free(large_response);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.upstream_timeout_ms = 1000;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://localhost:%d/dns-query", doh_server.port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    assert_int_equal(
+        send_udp_query_and_recv(
+            config.listen_port,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            resp,
+            &resp_len),
+        0);
+
+    assert_true(resp_len <= 512);
+    uint16_t flags = (uint16_t)(((uint16_t)resp[2] << 8) | (uint16_t)resp[3]);
+    assert_true((flags & 0x0200u) != 0);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.truncated_sent) >= 1);
+
+    proxy_server_destroy(&server);
+    stop_python_doh_server(&doh_server);
+    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
+#if defined(INTEGRATION_GROUP_CORE)
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_cache_flow_end_to_end),
         cmocka_unit_test(test_cache_case_insensitive),
@@ -1079,11 +2356,39 @@ int main(void) {
         cmocka_unit_test(test_edns_cache_key_differentiation),
         cmocka_unit_test(test_cache_concurrent_same_domain),
         cmocka_unit_test(test_ttl_aging_in_cache),
+    };
+#elif defined(INTEGRATION_GROUP_TRANSPORT)
+    const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_upstream_transport_doh_success),
         cmocka_unit_test(test_upstream_transport_doh_unreachable),
+        cmocka_unit_test(test_upstream_transport_doh_http1_runtime_stats),
         cmocka_unit_test(test_upstream_transport_dot),
+        cmocka_unit_test(test_upstream_transport_dot_unreachable),
         cmocka_unit_test(test_upstream_transport_failover_doh_to_dot),
+        cmocka_unit_test(test_metrics_endpoint_with_upstream_labels),
     };
+#elif defined(INTEGRATION_GROUP_RUNTIME)
+    const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_metrics_endpoint_http_paths),
+        cmocka_unit_test(test_dns_server_udp_servfail_path),
+        cmocka_unit_test(test_dns_server_tcp_connection_rejection),
+        cmocka_unit_test(test_dns_server_tcp_servfail_path),
+        cmocka_unit_test(test_main_invalid_config_exits_nonzero),
+        cmocka_unit_test(test_main_start_and_signal_shutdown),
+        cmocka_unit_test(test_main_metrics_bind_failure_exits_nonzero),
+        cmocka_unit_test(test_main_server_init_failure_exits_nonzero),
+        cmocka_unit_test(test_main_runtime_bind_failure_exits_nonzero),
+        cmocka_unit_test(test_main_start_metrics_disabled_and_signal_shutdown),
+        cmocka_unit_test(test_main_no_arg_uses_env_config_and_signal_shutdown),
+        cmocka_unit_test(test_dns_server_tcp_max_queries_per_connection),
+        cmocka_unit_test(test_runtime_api_invalid_arguments),
+        cmocka_unit_test(test_dns_server_tcp_zero_length_frame_ignored),
+        cmocka_unit_test(test_dns_server_tcp_partial_frame_close),
+        cmocka_unit_test(test_dns_server_udp_truncation_path),
+    };
+#else
+#error "Define one integration group macro"
+#endif
     
     return cmocka_run_group_tests(tests, NULL, NULL);
 }

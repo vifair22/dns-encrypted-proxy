@@ -42,6 +42,20 @@ static void write_u16(uint8_t *ptr, uint16_t value) {
     ptr[1] = (uint8_t)(value & 0xFFu);
 }
 
+static void metrics_record_response(proxy_server_t *server, const uint8_t *response, size_t response_len) {
+    if (server == NULL || response == NULL || response_len < 4) {
+        return;
+    }
+
+    uint16_t flags = read_u16(response + 2);
+    uint16_t rcode = (uint16_t)(flags & 0x000Fu);
+
+    atomic_fetch_add(&server->metrics.responses_total, 1);
+    if (rcode < 16) {
+        atomic_fetch_add(&server->metrics.responses_rcode[rcode], 1);
+    }
+}
+
 static int dns_skip_name_wire(const uint8_t *message, size_t message_len, size_t *offset) {
     size_t pos = *offset;
     int steps = 0;
@@ -578,7 +592,10 @@ static void *udp_loop(void *arg) {
                 }
             }
 
-            sendto(fd, response, response_len, 0, (struct sockaddr *)&client_addr, client_len);
+            ssize_t sent = sendto(fd, response, response_len, 0, (struct sockaddr *)&client_addr, client_len);
+            if (sent == (ssize_t)response_len) {
+                metrics_record_response(server, response, response_len);
+            }
             free(response);
         }
     }
@@ -700,6 +717,8 @@ static void *tcp_client_loop(void *arg) {
             free(response);
             break;
         }
+
+        metrics_record_response(server, response, response_len);
 
         free(response);
     }

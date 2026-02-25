@@ -43,8 +43,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (config.metrics_enabled && config.metrics_port > 0) {
-        if (metrics_server_start(&server.metrics, config.metrics_port) != 0) {
+    if (config.metrics_enabled) {
+        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, config.metrics_port) != 0) {
             fprintf(stderr, "Failed to start metrics server on port %d\n", config.metrics_port);
             proxy_server_destroy(&server);
             return 1;

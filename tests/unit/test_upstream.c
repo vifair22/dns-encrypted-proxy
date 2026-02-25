@@ -77,6 +77,17 @@ static void test_parse_invalid_parameters(void **state) {
     assert_int_equal(upstream_parse_url("https://dns.google/dns-query", NULL), -1);
 }
 
+static void test_parse_invalid_host_or_port(void **state) {
+    (void)state;
+
+    upstream_server_t server;
+    assert_int_equal(upstream_parse_url("https:///dns-query", &server), -1);
+    assert_int_equal(upstream_parse_url("https://dns.google:0/dns-query", &server), -1);
+    assert_int_equal(upstream_parse_url("https://dns.google:70000/dns-query", &server), -1);
+    assert_int_equal(upstream_parse_url("tls://:853", &server), -1);
+    assert_int_equal(upstream_parse_url("tls://1.1.1.1:0", &server), -1);
+}
+
 static void test_client_init_mixed_urls(void **state) {
     (void)state;
 
@@ -100,6 +111,43 @@ static void test_client_init_mixed_urls(void **state) {
     assert_int_equal(client.servers[0].type, UPSTREAM_TYPE_DOH);
     assert_int_equal(client.servers[1].type, UPSTREAM_TYPE_DOT);
 
+    upstream_client_destroy(&client);
+}
+
+static void test_client_init_all_invalid_urls_fails(void **state) {
+    (void)state;
+
+    const char *urls[] = {
+        "bad://invalid",
+        "udp://8.8.8.8:53",
+        "https:///dns-query"
+    };
+    upstream_config_t config = {
+        .timeout_ms = 2000,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_client_t client;
+
+    assert_int_equal(upstream_client_init(&client, urls, 3, &config), -1);
+}
+
+static void test_client_init_applies_default_policy_values(void **state) {
+    (void)state;
+
+    const char *urls[] = {"https://dns.google/dns-query"};
+    upstream_config_t config = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 0,
+        .unhealthy_backoff_ms = 0,
+    };
+    upstream_client_t client;
+
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), 0);
+    assert_int_equal(client.config.max_failures_before_unhealthy, 3);
+    assert_int_equal(client.config.unhealthy_backoff_ms, 10000);
     upstream_client_destroy(&client);
 }
 
@@ -165,6 +213,44 @@ static void test_record_success_resets_failures(void **state) {
     assert_int_equal(server.health.total_queries, 11);
 }
 
+static void test_should_skip_null_inputs(void **state) {
+    (void)state;
+
+    upstream_server_t server;
+    upstream_config_t config;
+    memset(&server, 0, sizeof(server));
+    memset(&config, 0, sizeof(config));
+
+    assert_int_equal(upstream_server_should_skip(NULL, &config), 1);
+    assert_int_equal(upstream_server_should_skip(&server, NULL), 1);
+}
+
+static void test_runtime_stats_api_guards_and_basics(void **state) {
+    (void)state;
+
+    upstream_runtime_stats_t stats;
+    assert_int_equal(upstream_get_runtime_stats(NULL, NULL), -1);
+    assert_int_equal(upstream_get_runtime_stats(NULL, &stats), -1);
+
+    const char *urls[] = {"https://dns.google/dns-query"};
+    upstream_config_t config = {
+        .timeout_ms = 1000,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), 0);
+
+    assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+    assert_int_equal(stats.doh_pool_capacity, 0);
+    assert_int_equal(stats.doh_pool_in_use, 0);
+    assert_int_equal(stats.dot_pool_capacity, 0);
+    assert_int_equal(stats.dot_pool_in_use, 0);
+
+    upstream_client_destroy(&client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_parse_https_default_port),
@@ -173,10 +259,15 @@ int main(void) {
         cmocka_unit_test(test_parse_tls_custom_port),
         cmocka_unit_test(test_parse_invalid_scheme),
         cmocka_unit_test(test_parse_invalid_parameters),
+        cmocka_unit_test(test_parse_invalid_host_or_port),
         cmocka_unit_test(test_client_init_mixed_urls),
+        cmocka_unit_test(test_client_init_all_invalid_urls_fails),
+        cmocka_unit_test(test_client_init_applies_default_policy_values),
         cmocka_unit_test(test_record_failure_marks_unhealthy),
         cmocka_unit_test(test_backoff_elapsed_allows_retry),
         cmocka_unit_test(test_record_success_resets_failures),
+        cmocka_unit_test(test_should_skip_null_inputs),
+        cmocka_unit_test(test_runtime_stats_api_guards_and_basics),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

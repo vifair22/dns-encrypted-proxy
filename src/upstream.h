@@ -73,6 +73,18 @@ typedef struct {
     uint64_t next_index;
 } upstream_client_t;
 
+typedef struct {
+    int doh_pool_capacity;
+    int doh_pool_in_use;
+    uint64_t doh_http2_responses_total;
+    uint64_t doh_http1_responses_total;
+    uint64_t doh_http_other_responses_total;
+
+    int dot_pool_capacity;
+    int dot_pool_in_use;
+    int dot_connections_alive;
+} upstream_runtime_stats_t;
+
 /*
  * Initialize upstream client with parsed server list
  * 
@@ -140,5 +152,7 @@ void upstream_server_record_success(upstream_server_t *server);
  * Record a failed query to a server
  */
 void upstream_server_record_failure(upstream_server_t *server, const upstream_config_t *config);
+
+int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats_t *stats_out);
 
 #endif /* UPSTREAM_H */

@@ -40,6 +40,29 @@ Individual test suites can be run directly:
 ./build/test_integration  # Integration tests
 ```
 
+### Coverage (gcov/gcovr)
+
+Use a dedicated build directory for coverage instrumentation.
+
+```bash
+cmake -S . -B build-coverage -DBUILD_TESTS=ON -DENABLE_COVERAGE=ON
+cmake --build build-coverage -j
+ctest --test-dir build-coverage --output-on-failure
+```
+
+If `gcovr` is installed, generate reports:
+
+```bash
+gcovr -r . build-coverage --exclude "tests/|tools/" --print-summary
+gcovr -r . build-coverage --exclude "tests/|tools/" --html-details -o build-coverage/coverage.html
+```
+
+If CMake finds `gcovr`, a convenience target is also available:
+
+```bash
+cmake --build build-coverage --target coverage
+```
+
 | Suite | Tests | Description |
 |-------|-------|-------------|
 | test_config | 10 | Config file parsing, env overrides, defaults |
@@ -69,8 +92,8 @@ Run on a non-privileged port for local development:
 
 ```bash
 docker run --rm \
-  -p 53:5353/udp \
-  -p 53:5353/tcp \
+  -p 5353:53/udp \
+  -p 5353:53/tcp \
   doh-proxy-c:dev
 ```
 
@@ -139,6 +162,65 @@ Prometheus metrics endpoint:
 - Route: `GET /metrics`
 - Bind: `0.0.0.0:<metrics_port>`
 - Content type: `text/plain; version=0.0.4`
+
+## Cache Architecture
+
+The cache uses a hash-indexed in-memory store with LRU eviction and TTL expiration.
+
+- **Sharded design:** keys are partitioned across fixed shards; each shard has its own mutex, hash buckets, and LRU list.
+- **Lookup path:** 64-bit hash + bucket chain for O(1)-average key lookup within a shard.
+- **Recency policy:** successful lookups move entries to the shard-local LRU head.
+- **Capacity bound:** each shard enforces a bounded entry budget and evicts least-recently-used entries when full.
+- **Admission control:** a lightweight shard-local doorkeeper filters one-off inserts under pressure to reduce churn.
+- **TTL behavior:** entries store absolute expiry timestamps; stale entries are removed lazily on access and via bounded periodic shard sweeps.
+- **Memory accounting:** tracks live key/value payload bytes across all shards.
+
+Cache observability metrics include:
+
+- `doh_proxy_cache_entries`
+- `doh_proxy_cache_capacity`
+- `doh_proxy_cache_evictions_total`
+- `doh_proxy_cache_expirations_total`
+- `doh_proxy_cache_bytes_in_use`
+
+Sizing guidance:
+
+- Start with `cache_capacity` in the low thousands for local/small deployments.
+- Increase capacity when `doh_proxy_cache_evictions_total` grows quickly and hit rate remains low.
+- Use `doh_proxy_cache_bytes_in_use` to verify memory footprint before increasing capacity significantly.
+
+## Cache Benchmark
+
+The repository includes a cache benchmark utility that runs mixed lookup/store workloads across capacities `1024`, `4096`, and `16384`.
+
+For each capacity, it also reports average lookup latency at multiple cache depths (10%, 25%, 50%, 75%, 100%) with separate hit and miss timings.
+
+Build:
+
+```bash
+cmake -S . -B build -DBUILD_BENCHMARKS=ON
+cmake --build build
+```
+
+Run with default workload (`200000` operations per capacity):
+
+```bash
+./build/cache_bench
+```
+
+Run with a custom operation count:
+
+```bash
+./build/cache_bench 500000
+```
+
+Run with custom operation count and threaded scaling limit:
+
+```bash
+./build/cache_bench 500000 8
+```
+
+The second argument is the maximum thread count for the threaded throughput sweep (runs at 1,2,4,...,max).
 
 ## Notes
 

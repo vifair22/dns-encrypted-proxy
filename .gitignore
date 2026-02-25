@@ -4,3 +4,4 @@ build/
 *.exe
 cmake-build-debug/
 .idea
+build-coverage
