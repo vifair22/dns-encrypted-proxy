@@ -17,6 +17,28 @@
 
 #include <openssl/ssl.h>
 
+/*
+ * OpenSSL 3.x exposes several legacy SSL APIs as macros. This test remaps
+ * those symbols to local stubs before including upstream_dot.c, so undefine
+ * the OpenSSL macro aliases first to avoid macro redefinition warnings/errors
+ * when builds enable -Werror.
+ */
+#ifdef SSL_library_init
+#undef SSL_library_init
+#endif
+#ifdef SSL_load_error_strings
+#undef SSL_load_error_strings
+#endif
+#ifdef OpenSSL_add_all_algorithms
+#undef OpenSSL_add_all_algorithms
+#endif
+#ifdef SSL_CTX_set_min_proto_version
+#undef SSL_CTX_set_min_proto_version
+#endif
+#ifdef SSL_set_tlsext_host_name
+#undef SSL_set_tlsext_host_name
+#endif
+
 #include "upstream.h"
 
 static int g_getaddrinfo_rc = 0;
