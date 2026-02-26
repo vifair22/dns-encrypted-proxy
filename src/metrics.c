@@ -73,6 +73,10 @@ static void escape_label_value(const char *src, char *dst, size_t dst_size) {
     }
 
     size_t out = 0;
+    /*
+     * Keep label escaping local and bounded to avoid malformed exposition or
+     * accidental metric-cardinality explosions from raw upstream strings.
+     */
     for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
         char c = src[i];
         if (c == '\\' || c == '"') {
@@ -113,6 +117,7 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
         return 0;
     }
 
+    /* Emit one series per configured upstream; cardinality is config-bounded. */
     for (int i = 0; i < g_upstream->server_count; i++) {
         const upstream_server_t *server = &g_upstream->servers[i];
         char escaped_url[2048];

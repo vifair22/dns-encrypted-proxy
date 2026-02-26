@@ -138,6 +138,10 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
 }
 
 static void apply_env_overrides(proxy_config_t *config) {
+    /*
+     * Environment overrides are applied after file parsing so container/orchestration
+     * deploys can override immutable config files without rewriting them.
+     */
     const char *value = getenv("LISTEN_ADDR");
     if (value != NULL && *value != '\0') {
         strncpy(config->listen_addr, value, sizeof(config->listen_addr) - 1);

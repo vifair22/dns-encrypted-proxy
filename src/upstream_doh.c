@@ -74,6 +74,10 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     buffer_t *buffer = (buffer_t *)userdata;
     size_t chunk = size * nmemb;
 
+    /*
+     * Geometric growth keeps amortized append cost low and reduces realloc
+     * churn under variable upstream response sizes.
+     */
     if (buffer->len + chunk > buffer->cap) {
         size_t new_cap = buffer->cap == 0 ? 2048 : buffer->cap;
         while (new_cap < buffer->len + chunk) {
@@ -98,6 +102,11 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
 }
 
 static int pool_acquire(upstream_doh_client_t *client, CURL **handle_out, int *slot_out) {
+    /*
+     * Blocking acquire gives simple backpressure: callers wait instead of
+     * creating unbounded transient handles, preserving connection reuse and
+     * predictable memory/socket usage under load.
+     */
     pthread_mutex_lock(&client->pool_mutex);
 
     for (;;) {
@@ -149,6 +158,7 @@ static int doh_post_with_handle(
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    /* Test hooks are opt-in and only alter transport selection/verification. */
     const char *force_http1 = getenv("DOH_PROXY_TEST_FORCE_HTTP1");
     if (force_http1 != NULL && *force_http1 != '\0') {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
@@ -190,6 +200,7 @@ static int doh_post_with_handle(
 
     curl_slist_free_all(headers);
 
+    /* Empty body is treated as transport failure for resolver semantics. */
     if (rc != CURLE_OK || status != 200 || response.len == 0) {
         free(response.data);
         return -1;

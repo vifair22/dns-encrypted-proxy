@@ -17,6 +17,48 @@ static uint64_t now_seconds(void) {
     return (uint64_t)time(NULL);
 }
 
+static int env_flag_enabled(const char *name) {
+    /*
+     * Keep runtime toggles intentionally permissive for ops/debug use.
+     * Any non-empty value except explicit false markers enables the flag,
+     * so users can export "1", "yes", etc. without strict parsing rules.
+     */
+    const char *v = getenv(name);
+    if (v == NULL || *v == '\0') {
+        return 0;
+    }
+    if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "FALSE") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static void shard_lock(dns_cache_t *cache, cache_shard_t *shard) {
+    if (cache != NULL && cache->single_thread_mode) {
+        return;
+    }
+    pthread_mutex_lock(&shard->mutex);
+}
+
+static void shard_unlock(dns_cache_t *cache, cache_shard_t *shard) {
+    if (cache != NULL && cache->single_thread_mode) {
+        return;
+    }
+    pthread_mutex_unlock(&shard->mutex);
+}
+
+static size_t fast_index(uint64_t hash, size_t count, size_t mask) {
+    /*
+     * Hot-path index helper:
+     * - power-of-two table sizes use hash & mask (faster than modulo)
+     * - fallback keeps correctness if a non-power-of-two count appears
+     */
+    if ((count & (count - 1)) == 0) {
+        return (size_t)(hash & (uint64_t)mask);
+    }
+    return (size_t)(hash % (uint64_t)count);
+}
+
 static uint64_t hash_key(const uint8_t *key, size_t key_len) {
     uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < key_len; i++) {
@@ -117,7 +159,7 @@ static void evict_lru_tail(cache_shard_t *shard) {
     }
 
     cache_entry_t *victim = shard->lru_tail;
-    size_t bucket_idx = (size_t)(victim->hash % (uint64_t)shard->bucket_count);
+    size_t bucket_idx = fast_index(victim->hash, shard->bucket_count, shard->bucket_mask);
     cache_entry_t *iter = shard->buckets[bucket_idx];
     cache_entry_t *prev = NULL;
     while (iter != NULL && iter != victim) {
@@ -206,6 +248,7 @@ static int shard_rehash(cache_shard_t *shard, size_t new_bucket_count) {
     free(shard->buckets);
     shard->buckets = new_buckets;
     shard->bucket_count = new_bucket_count;
+    shard->bucket_mask = new_bucket_count - 1;
     return 0;
 }
 
@@ -242,6 +285,7 @@ static int shard_init(cache_shard_t *shard, size_t max_entries) {
     if (shard->bucket_count == 0) {
         return -1;
     }
+    shard->bucket_mask = shard->bucket_count - 1;
 
     shard->buckets = calloc(shard->bucket_count, sizeof(*shard->buckets));
     if (shard->buckets == NULL) {
@@ -308,8 +352,16 @@ int dns_cache_init(dns_cache_t *cache, size_t capacity) {
     }
 
     memset(cache, 0, sizeof(*cache));
+    /*
+     * Single-thread mode is an explicit perf mode for local/single-worker
+     * deployments where lock and shard fan-out overhead outweigh contention.
+     */
+    cache->single_thread_mode = env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD");
 
     size_t shard_count = CACHE_DEFAULT_SHARDS;
+    if (cache->single_thread_mode) {
+        shard_count = 1;
+    }
     if (capacity < shard_count) {
         shard_count = capacity;
     }
@@ -323,6 +375,7 @@ int dns_cache_init(dns_cache_t *cache, size_t capacity) {
     }
 
     cache->shard_count = shard_count;
+    cache->shard_mask = shard_count > 0 ? (shard_count - 1) : 0;
     cache->max_entries = capacity;
 
     size_t base = capacity / shard_count;
@@ -380,16 +433,16 @@ int dns_cache_lookup(
     uint64_t hash = hash_key(key, key_len);
     uint64_t now = now_seconds();
 
-    size_t shard_idx = (size_t)(hash % (uint64_t)cache->shard_count);
+    size_t shard_idx = fast_index(hash, cache->shard_count, cache->shard_mask);
     cache_shard_t *shard = &cache->shards[shard_idx];
 
-    pthread_mutex_lock(&shard->mutex);
+    shard_lock(cache, shard);
 
     if (now >= shard->last_sweep_at + CACHE_SWEEP_INTERVAL_SEC) {
         shard_sweep_expired(shard, now, CACHE_SWEEP_BUCKET_BUDGET);
     }
 
-    size_t bucket_idx = (size_t)(hash % (uint64_t)shard->bucket_count);
+    size_t bucket_idx = fast_index(hash, shard->bucket_count, shard->bucket_mask);
     cache_entry_t *entry = shard->buckets[bucket_idx];
     cache_entry_t *prev = NULL;
     while (entry != NULL) {
@@ -401,20 +454,31 @@ int dns_cache_lookup(
     }
 
     if (entry == NULL) {
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
         return 0;
+    }
+
+    /*
+     * Move-to-front inside the bucket chain reduces pointer chasing for hot
+     * keys that repeatedly hash into the same bucket. LRU already handles
+     * global recency; this is purely a bucket-local cache locality win.
+     */
+    if (prev != NULL) {
+        prev->bucket_next = entry->bucket_next;
+        entry->bucket_next = shard->buckets[bucket_idx];
+        shard->buckets[bucket_idx] = entry;
     }
 
     if (entry->expires_at <= now) {
         remove_bucket_entry(shard, bucket_idx, entry, prev);
         shard->expirations++;
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
         return 0;
     }
 
     uint8_t *copy = malloc(entry->response_len);
     if (copy == NULL) {
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
         return 0;
     }
 
@@ -432,7 +496,7 @@ int dns_cache_lookup(
     lru_remove(shard, entry);
     lru_push_front(shard, entry);
 
-    pthread_mutex_unlock(&shard->mutex);
+    shard_unlock(cache, shard);
 
     if (response_len >= 2) {
         copy[0] = request_id[0];
@@ -457,43 +521,51 @@ void dns_cache_store(
         return;
     }
 
-    uint8_t *key_copy = malloc(key_len);
-    uint8_t *response_copy = malloc(response_len);
-    if (key_copy == NULL || response_copy == NULL) {
-        free(key_copy);
-        free(response_copy);
-        return;
-    }
-
-    memcpy(key_copy, key, key_len);
-    memcpy(response_copy, response, response_len);
-
     uint64_t hash = hash_key(key, key_len);
     uint64_t now = now_seconds();
     uint64_t expires_at = now + (uint64_t)ttl_seconds;
 
-    size_t shard_idx = (size_t)(hash % (uint64_t)cache->shard_count);
+    size_t shard_idx = fast_index(hash, cache->shard_count, cache->shard_mask);
     cache_shard_t *shard = &cache->shards[shard_idx];
 
-    pthread_mutex_lock(&shard->mutex);
+    shard_lock(cache, shard);
 
     if (now >= shard->last_sweep_at + CACHE_SWEEP_INTERVAL_SEC) {
         shard_sweep_expired(shard, now, CACHE_SWEEP_BUCKET_BUDGET);
     }
 
-    size_t bucket_idx = (size_t)(hash % (uint64_t)shard->bucket_count);
+    size_t bucket_idx = fast_index(hash, shard->bucket_count, shard->bucket_mask);
     cache_entry_t *entry = shard->buckets[bucket_idx];
+    cache_entry_t *prev = NULL;
     while (entry != NULL) {
         if (key_equals(entry, hash, key, key_len)) {
             break;
         }
+        prev = entry;
         entry = entry->bucket_next;
     }
 
     if (entry != NULL) {
-        size_t old_bytes = entry_bytes(entry);
+        /*
+         * Update path: allocate only the new response payload.
+         * We intentionally avoid pre-allocating key/response for all stores,
+         * because most real traffic updates hot keys and that extra work is
+         * wasted on the update branch.
+         */
+        if (prev != NULL) {
+            prev->bucket_next = entry->bucket_next;
+            entry->bucket_next = shard->buckets[bucket_idx];
+            shard->buckets[bucket_idx] = entry;
+        }
 
-        free(key_copy);
+        uint8_t *response_copy = malloc(response_len);
+        if (response_copy == NULL) {
+            shard_unlock(cache, shard);
+            return;
+        }
+        memcpy(response_copy, response, response_len);
+
+        size_t old_bytes = entry_bytes(entry);
         free(entry->response);
 
         entry->response = response_copy;
@@ -513,16 +585,19 @@ void dns_cache_store(
         lru_remove(shard, entry);
         lru_push_front(shard, entry);
 
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
         return;
     }
 
     if (shard->entry_count >= shard->max_entries) {
+        /*
+         * Full shard policy:
+         * 1) doorkeeper can drop one-off keys (protects hot set)
+         * 2) otherwise evict LRU tail to make room
+         */
         if (!doorkeeper_should_admit(shard, hash)) {
             shard->admissions_dropped++;
-            pthread_mutex_unlock(&shard->mutex);
-            free(key_copy);
-            free(response_copy);
+            shard_unlock(cache, shard);
             return;
         }
         evict_lru_tail(shard);
@@ -530,9 +605,21 @@ void dns_cache_store(
 
     shard_maybe_grow(shard);
 
+    /* Insert path allocates only after admission/eviction decisions. */
+    uint8_t *key_copy = malloc(key_len);
+    uint8_t *response_copy = malloc(response_len);
+    if (key_copy == NULL || response_copy == NULL) {
+        shard_unlock(cache, shard);
+        free(key_copy);
+        free(response_copy);
+        return;
+    }
+    memcpy(key_copy, key, key_len);
+    memcpy(response_copy, response, response_len);
+
     cache_entry_t *new_entry = calloc(1, sizeof(*new_entry));
     if (new_entry == NULL) {
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
         free(key_copy);
         free(response_copy);
         return;
@@ -554,7 +641,7 @@ void dns_cache_store(
     shard->entry_count++;
     shard->bytes_in_use += entry_bytes(new_entry);
 
-    pthread_mutex_unlock(&shard->mutex);
+    shard_unlock(cache, shard);
 }
 
 void dns_cache_get_stats(dns_cache_t *cache, size_t *capacity_out, size_t *entries_out) {
@@ -572,9 +659,9 @@ void dns_cache_get_stats(dns_cache_t *cache, size_t *capacity_out, size_t *entri
     size_t entries = 0;
     for (size_t i = 0; i < cache->shard_count; i++) {
         cache_shard_t *shard = &cache->shards[i];
-        pthread_mutex_lock(&shard->mutex);
+        shard_lock(cache, shard);
         entries += shard->entry_count;
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
     }
 
     if (capacity_out != NULL) {
@@ -606,11 +693,11 @@ void dns_cache_get_counters(dns_cache_t *cache, uint64_t *evictions_out, uint64_
 
     for (size_t i = 0; i < cache->shard_count; i++) {
         cache_shard_t *shard = &cache->shards[i];
-        pthread_mutex_lock(&shard->mutex);
+        shard_lock(cache, shard);
         evictions += shard->evictions;
         expirations += shard->expirations;
         bytes_in_use += shard->bytes_in_use;
-        pthread_mutex_unlock(&shard->mutex);
+        shard_unlock(cache, shard);
     }
 
     if (evictions_out != NULL) {

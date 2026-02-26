@@ -55,6 +55,11 @@ int upstream_parse_url(const char *url, upstream_server_t *server_out) {
 
     memset(server_out, 0, sizeof(*server_out));
     
+    /*
+     * URL parsing here is intentionally strict/minimal and only accepts the
+     * schemes we explicitly support. This keeps config failures obvious and
+     * avoids silently treating unknown schemes as valid upstreams.
+     */
     /* Check for https:// (DoH) */
     if (strncmp(url, "https://", 8) == 0) {
         server_out->type = UPSTREAM_TYPE_DOH;
@@ -135,6 +140,11 @@ int upstream_server_should_skip(const upstream_server_t *server, const upstream_
         return 0;
     }
     
+    /*
+     * Backoff gating prevents hot-loop retries against known-bad upstreams.
+     * Once backoff elapses we allow probes again to recover without manual
+     * intervention.
+     */
     /* Check if backoff period has elapsed */
     uint64_t now = now_ms();
     uint64_t elapsed = now - server->health.last_failure_time;
@@ -198,6 +208,10 @@ int upstream_client_init(
         client->config.unhealthy_backoff_ms = 10000;  /* 10 seconds */
     }
     
+    /*
+     * Parse all configured URLs up front so runtime resolution path only
+     * handles transport work and health policy, not config validation.
+     */
     /* Parse all URLs */
     for (int i = 0; i < url_count; i++) {
         if (upstream_parse_url(urls[i], &client->servers[client->server_count]) == 0) {
@@ -213,6 +227,10 @@ int upstream_client_init(
         return -1;
     }
     
+    /*
+     * Lazily initialize DoH/DoT clients so startup remains lightweight when a
+     * protocol is configured but never selected on the active path.
+     */
     /* Initialize protocol-specific clients lazily on first use */
     client->doh_client = NULL;
     client->dot_client = NULL;
@@ -261,6 +279,7 @@ static int resolve_with_server(
     
     int result = -1;
     
+    /* Central protocol dispatch keeps upstream selection policy transport-agnostic. */
     switch (server->type) {
         case UPSTREAM_TYPE_DOH:
             if (ensure_doh_client(client) != 0) {
@@ -305,12 +324,20 @@ int upstream_resolve(
     *response_out = NULL;
     *response_len_out = 0;
     
+    /*
+     * Take one RR snapshot per query so all retry attempts for that query use
+     * a stable ordering, while subsequent queries still rotate fairly.
+     */
     /* Get round-robin starting index */
     pthread_mutex_lock(&client->rr_mutex);
     uint64_t start = client->next_index;
     client->next_index++;
     pthread_mutex_unlock(&client->rr_mutex);
     
+    /*
+     * Pass 1: healthy/backoff-eligible servers only.
+     * We fail fast through candidates and update health on each outcome.
+     */
     /* Try each server in order, starting from round-robin index */
     for (int attempt = 0; attempt < client->server_count; attempt++) {
         int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->server_count);
@@ -334,6 +361,10 @@ int upstream_resolve(
         upstream_server_record_failure(server, &client->config);
     }
     
+    /*
+     * Pass 2 (last resort): probe unhealthy servers if healthy set failed.
+     * This helps recover from stale health state when all primaries degraded.
+     */
     /* All servers failed - try unhealthy servers as last resort */
     for (int attempt = 0; attempt < client->server_count; attempt++) {
         int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->server_count);

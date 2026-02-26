@@ -86,6 +86,7 @@ static int connect_with_timeout(const char *host, int port, int timeout_ms) {
         return -1;
     }
     
+    /* Non-blocking connect + poll keeps timeout deterministic per attempt. */
     int rc = connect(fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
     
@@ -156,7 +157,11 @@ static int establish_tls_connection(
         return -1;
     }
     
-    /* Set back to blocking for SSL */
+    /*
+     * SSL I/O below uses poll-driven helpers, so we keep SSL itself in
+     * blocking mode to simplify OpenSSL error handling and avoid WANT_READ/
+     * WANT_WRITE state machinery.
+     */
     int flags = fcntl(conn->fd, F_GETFL, 0);
     if (flags >= 0) {
         fcntl(conn->fd, F_SETFL, flags & ~O_NONBLOCK);
@@ -197,6 +202,7 @@ static int establish_tls_connection(
 }
 
 static int pool_acquire(upstream_dot_client_t *client, dot_connection_t **conn_out, int *slot_out) {
+    /* Bounded pool with wait keeps TLS connection reuse stable under bursts. */
     pthread_mutex_lock(&client->pool_mutex);
 
     for (;;) {
@@ -226,6 +232,7 @@ static int ssl_read_all(SSL *ssl, uint8_t *buffer, size_t len, int timeout_ms) {
     int fd = SSL_get_fd(ssl);
     
     while (offset < len) {
+        /* Poll before SSL_read so stalled upstreams respect our timeout SLA. */
         if (timeout_ms > 0) {
             struct pollfd pfd = {0};
             pfd.fd = fd;

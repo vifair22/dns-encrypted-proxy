@@ -183,6 +183,11 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     response[0] = query[0];
     response[1] = query[1];
 
+    /*
+     * SERVFAIL construction mirrors request identity and policy bits (opcode,
+     * RD/CD) so clients can safely correlate retries. If query carried OPT,
+     * we preserve it to keep EDNS negotiation behavior predictable.
+     */
     uint16_t query_flags = read_u16(query + 2);
     uint16_t response_flags = (uint16_t)(0x8000u | (query_flags & 0x7800u) | (query_flags & 0x0100u) | (query_flags & 0x0010u) |
                                          0x0080u | 0x0002u);
@@ -294,6 +299,7 @@ static int build_truncated_udp_response(
         return -1;
     }
 
+    /* Never emit less than DNS header size. */
     if (udp_limit < 12) {
         udp_limit = 12;
     }
@@ -318,6 +324,12 @@ static int build_truncated_udp_response(
     int has_opt = (dns_find_opt_record(response, response_len, &opt_start, &opt_end) == 0);
     size_t opt_size = has_opt ? (opt_end - opt_start) : 0;
 
+    /*
+     * We preserve as much structure as possible in order:
+     *  1) full questions first
+     *  2) then RR sections in canonical order until limit
+     *  3) optional OPT only if it still fits
+     */
     for (uint16_t i = 0; i < original_qd; i++) {
         size_t name_end = offset;
         if (dns_skip_name_wire(response, response_len, &name_end) != 0 || name_end + 4 > response_len) {
@@ -377,6 +389,7 @@ static int build_truncated_udp_response(
     }
 
 finalize:
+    /* Caller only uses this helper on oversized/problem responses. */
     if (!is_truncated && !malformed) {
         return -1;
     }
@@ -437,6 +450,10 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     const uint8_t request_id[2] = {query[0], query[1]};
 
+    /*
+     * Cache path is best-effort: malformed/unkeyable queries bypass cache and
+     * still resolve upstream; we do not fail request processing on key errors.
+     */
     if (key_ok) {
         if (dns_cache_lookup(&server->cache, key, key_len, request_id, response_out, response_len_out)) {
             atomic_fetch_add(&server->metrics.cache_hits, 1);
@@ -447,11 +464,13 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     if (upstream_resolve(&server->upstream, query, query_len, response_out, response_len_out) == 0) {
         atomic_fetch_add(&server->metrics.upstream_success, 1);
+        /* Upstream response ID is rewritten to client request ID at edge. */
         if (*response_len_out >= 2) {
             (*response_out)[0] = query[0];
             (*response_out)[1] = query[1];
         }
 
+        /* Cache only policy-approved responses with meaningful TTL. */
         if (key_ok && dns_response_is_cacheable(*response_out, *response_len_out)) {
             int ttl_ok = 0;
             uint32_t min_ttl = dns_response_min_ttl(*response_out, *response_len_out, &ttl_ok);
@@ -572,6 +591,12 @@ static void *udp_loop(void *arg) {
         }
 
         if (response != NULL && response_len > 0) {
+            /*
+             * UDP response sizing policy:
+             * - honor query-advertised payload limit (EDNS when present)
+             * - prefer TC=1 truncation so standards-compliant clients retry TCP
+             * - fall back to SERVFAIL only if truncation packet build fails
+             */
             size_t udp_limit = dns_udp_payload_limit_for_query(buffer, (size_t)n);
             if (response_len > udp_limit) {
                 uint8_t *truncated = NULL;
@@ -604,6 +629,13 @@ static void *udp_loop(void *arg) {
 }
 
 static int recv_all_with_timeout(int fd, uint8_t *buffer, size_t len, int timeout_ms) {
+    /*
+     * Return contract is tri-state for callers:
+     *  1  => full buffer read
+     *  0  => peer closed cleanly
+     * -2  => idle timeout
+     * -1  => hard I/O or poll error
+     */
     size_t offset = 0;
     while (offset < len) {
         if (timeout_ms > 0) {
@@ -688,6 +720,11 @@ static void *tcp_client_loop(void *arg) {
             break;
         }
 
+        /*
+         * Body read timeout is capped to prevent a client from sending length
+         * then dribbling payload forever, while still respecting configured
+         * idle timeout when it is lower.
+         */
         int body_timeout_ms = idle_timeout_ms > 0 ? (idle_timeout_ms < 5000 ? idle_timeout_ms : 5000) : 0;
         rc = recv_all_with_timeout(client_fd, query, message_len, body_timeout_ms);
         if (rc <= 0) {
@@ -758,6 +795,10 @@ static void *tcp_accept_loop(void *arg) {
             continue;
         }
 
+        /*
+         * Backpressure strategy: accept-and-close when saturated so kernel
+         * listen backlog does not hide overload and clients fail fast.
+         */
         int current_clients = atomic_load(&server->active_tcp_clients);
         if (current_clients >= max_clients) {
             int client_fd = accept(fd, NULL, NULL);
@@ -878,6 +919,10 @@ int proxy_server_run(proxy_server_t *server) {
     pthread_t udp_thread;
     pthread_t tcp_thread;
 
+    /*
+     * Both loops run until shared stop flag is set. We join both threads to
+     * guarantee sockets and worker lifecycle are fully drained on shutdown.
+     */
     if (pthread_create(&udp_thread, NULL, udp_loop, &udp_ctx) != 0) {
         close(udp_fd);
         close(tcp_fd);

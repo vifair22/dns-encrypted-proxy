@@ -23,6 +23,7 @@ typedef struct cache_entry {
 typedef struct {
     cache_entry_t **buckets;
     size_t bucket_count;
+    size_t bucket_mask;
     uint8_t *admit_bits;
     size_t admit_bit_count;
     size_t max_entries;
@@ -36,12 +37,14 @@ typedef struct {
     cache_entry_t *lru_head;
     cache_entry_t *lru_tail;
     pthread_mutex_t mutex;
-} cache_shard_t;
+} cache_shard_t __attribute__((aligned(64)));
 
 typedef struct {
     cache_shard_t *shards;
     size_t shard_count;
+    size_t shard_mask;
     size_t max_entries;
+    int single_thread_mode;
 } dns_cache_t;
 
 int dns_cache_init(dns_cache_t *cache, size_t capacity);

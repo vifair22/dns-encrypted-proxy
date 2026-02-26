@@ -349,6 +349,164 @@ static void test_cache_doorkeeper_drop_path(void **state) {
     dns_cache_destroy(&cache);
 }
 
+static void test_cache_new_helpers_and_single_thread_mode(void **state) {
+    (void)state;
+    reset_alloc_stubs();
+
+    unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 0);
+
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "0", 1);
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 0);
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "false", 1);
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 0);
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "FALSE", 1);
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 0);
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 1);
+
+    assert_int_equal((int)fast_index(13, 8, 7), 5);
+    assert_int_equal((int)fast_index(13, 10, 9), 3);
+
+    cache_shard_t shard;
+    memset(&shard, 0, sizeof(shard));
+    assert_int_equal(pthread_mutex_init(&shard.mutex, NULL), 0);
+    dns_cache_t fake;
+    memset(&fake, 0, sizeof(fake));
+    fake.single_thread_mode = 1;
+    shard_lock(&fake, &shard);
+    shard_unlock(&fake, &shard);
+    fake.single_thread_mode = 0;
+    shard_lock(&fake, &shard);
+    shard_unlock(&fake, &shard);
+    pthread_mutex_destroy(&shard.mutex);
+
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 64), 0);
+    assert_int_equal(cache.single_thread_mode, 1);
+    assert_int_equal(cache.shard_count, 1);
+    dns_cache_destroy(&cache);
+
+    unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
+}
+
+static void test_cache_new_branch_paths(void **state) {
+    (void)state;
+    reset_alloc_stubs();
+
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 64), 0);
+
+    const uint8_t key[] = {0x01};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(dns_cache_lookup(&cache, key, sizeof(key), NULL, &out, &out_len), 0);
+
+    size_t cap = 1;
+    size_t entries = 1;
+    dns_cache_get_stats(NULL, &cap, &entries);
+    assert_int_equal(cap, 0);
+    assert_int_equal(entries, 0);
+    uint64_t ev = 1;
+    uint64_t ex = 1;
+    size_t bytes = 1;
+    dns_cache_get_counters(NULL, &ev, &ex, &bytes);
+    assert_int_equal(ev, 0);
+    assert_int_equal(ex, 0);
+    assert_int_equal(bytes, 0);
+
+    cache_shard_t shard;
+    assert_int_equal(shard_init(&shard, 4), 0);
+    cache_entry_t *e = calloc(1, sizeof(*e));
+    assert_non_null(e);
+    e->key = (uint8_t *)strdup("x");
+    e->key_len = 1;
+    e->response = (uint8_t *)strdup("yy");
+    e->response_len = 2;
+    e->hash = hash_key(e->key, e->key_len);
+    size_t b = fast_index(e->hash, shard.bucket_count, shard.bucket_mask);
+    shard.buckets[b] = e;
+    shard.lru_head = e;
+    shard.lru_tail = e;
+    shard.entry_count = 1;
+    shard.bytes_in_use = 1;
+    remove_bucket_entry(&shard, b, e, NULL);
+    assert_int_equal(shard.bytes_in_use, 0);
+    remove_bucket_entry(NULL, 0, NULL, NULL);
+    evict_lru_tail(NULL);
+    shard_destroy(&shard);
+
+    uint8_t k1[2] = {0};
+    uint8_t k2[2] = {0};
+    int found = 0;
+    cache_shard_t *s0 = &cache.shards[0];
+    for (uint32_t i = 0; i < 65536 && !found; i++) {
+        uint8_t a[2] = {(uint8_t)(i & 0xFFu), (uint8_t)((i >> 8) & 0xFFu)};
+        uint64_t ha = hash_key(a, 2);
+        size_t ia = fast_index(ha, s0->bucket_count, s0->bucket_mask);
+        for (uint32_t j = i + 1; j < 65536; j++) {
+            uint8_t c[2] = {(uint8_t)(j & 0xFFu), (uint8_t)((j >> 8) & 0xFFu)};
+            uint64_t hb = hash_key(c, 2);
+            size_t ib = fast_index(hb, s0->bucket_count, s0->bucket_mask);
+            if (ia == ib && (a[0] != c[0] || a[1] != c[1])) {
+                memcpy(k1, a, 2);
+                memcpy(k2, c, 2);
+                found = 1;
+                break;
+            }
+        }
+    }
+    assert_int_equal(found, 1);
+
+    const uint8_t r1[2] = {0xAA, 0xBB};
+    const uint8_t r2[2] = {0xCC, 0xDD};
+    const uint8_t req_id[2] = {0x11, 0x22};
+    dns_cache_store(&cache, k1, 2, r1, sizeof(r1), 60);
+    dns_cache_store(&cache, k2, 2, r2, sizeof(r2), 60);
+
+    uint64_t h1 = hash_key(k1, 2);
+    size_t bi = fast_index(h1, s0->bucket_count, s0->bucket_mask);
+    assert_non_null(s0->buckets[bi]);
+    assert_true(s0->buckets[bi]->hash != h1);
+
+    reset_alloc_stubs();
+    g_now_time = 10;
+    g_malloc_fail_on_call = 1;
+    dns_cache_store(&cache, k1, 2, r1, sizeof(r1), 60);
+
+    reset_alloc_stubs();
+    g_now_time = 10;
+    assert_int_equal(dns_cache_lookup(&cache, k1, 2, req_id, &out, &out_len), 1);
+    free(out);
+
+    assert_non_null(s0->buckets[bi]);
+    assert_true(s0->buckets[bi]->hash == h1);
+
+    /* expired lookup removal path after move-to-front */
+    reset_alloc_stubs();
+    g_now_time = 0;
+    const uint8_t rx[2] = {0x10, 0x20};
+    dns_cache_store(&cache, k1, 2, rx, sizeof(rx), 1);
+    g_now_time = 5;
+    assert_int_equal(dns_cache_lookup(&cache, k1, 2, req_id, &out, &out_len), 0);
+
+    /* force bytes_in_use underflow guard branch during update */
+    g_now_time = 0;
+    dns_cache_store(&cache, k1, 2, r1, sizeof(r1), 60);
+    s0->bytes_in_use = 0;
+    dns_cache_store(&cache, k1, 2, r2, sizeof(r2), 60);
+
+    /* insert allocation-failure path (key/response alloc) */
+    reset_alloc_stubs();
+    g_malloc_fail_on_call = 1;
+    const uint8_t k3[2] = {0xFE, 0xED};
+    dns_cache_store(&cache, k3, 2, r1, sizeof(r1), 60);
+
+    dns_cache_destroy(&cache);
+    unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_cache_static_guard_paths),
@@ -358,6 +516,8 @@ int main(void) {
         cmocka_unit_test(test_cache_allocation_and_init_failure_paths),
         cmocka_unit_test(test_cache_lookup_and_store_failure_paths),
         cmocka_unit_test(test_cache_doorkeeper_drop_path),
+        cmocka_unit_test(test_cache_new_helpers_and_single_thread_mode),
+        cmocka_unit_test(test_cache_new_branch_paths),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

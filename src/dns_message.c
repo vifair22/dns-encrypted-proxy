@@ -85,6 +85,11 @@ static int dns_copy_name_canonical(
         return -1;
     }
 
+    /*
+     * Canonical name extraction is used for cache keys and query/response
+     * equivalence checks, so it must normalize case and follow compression
+     * pointers while preserving a stable on-the-wire representation.
+     */
     size_t pos = *offset;
     size_t consumed = pos;
     size_t out_len = 0;
@@ -92,6 +97,7 @@ static int dns_copy_name_canonical(
     int steps = 0;
 
     while (pos < message_len) {
+        /* Hard step bound prevents pointer loops from malformed packets. */
         if (++steps > 255) {
             return -1;
         }
@@ -175,6 +181,11 @@ static int dns_message_end_offset(const uint8_t *message, size_t message_len, si
         return -1;
     }
 
+    /*
+     * Walk all sections and compute exact structural end offset.
+     * Callers use this to reject packets with trailing garbage and to ensure
+     * parser views are deterministic for cache and validation decisions.
+     */
     size_t offset = DNS_HEADER_SIZE;
     for (uint16_t i = 0; i < qdcount; i++) {
         if (dns_skip_name(message, message_len, &offset) != 0) {
@@ -296,6 +307,7 @@ int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *ke
     key_len += 2;
 
     for (uint16_t i = 0; i < qdcount; i++) {
+        /* Canonicalized qname + raw qtype/qclass form the stable core key. */
         size_t name_len = 0;
         if (dns_copy_name_canonical(query, query_len, &offset, key_out + key_len, key_capacity - key_len, &name_len) != 0) {
             return -1;
@@ -310,6 +322,10 @@ int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *ke
         offset += 4;
     }
 
+    /*
+     * EDNS fields are included in key derivation because payload size,
+     * version, DO bit, and option data can change resolver behavior/results.
+     */
     uint8_t opt_present = 0;
     uint16_t opt_udp_payload = 0;
     uint8_t opt_version = 0;
@@ -317,6 +333,11 @@ int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *ke
     const uint8_t *opt_rdata = NULL;
     uint16_t opt_rdata_len = 0;
 
+    /*
+     * Additional section policy for cache keys:
+     * - only OPT is accepted (EDNS)
+     * - non-OPT additional records are rejected to avoid ambiguous cache keys
+     */
     for (uint16_t i = 0; i < arcount; i++) {
         size_t rr_name_end = offset;
         if (dns_skip_name(query, query_len, &rr_name_end) != 0) {
@@ -394,6 +415,11 @@ int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *ke
             }
 
             /* Ignore volatile client options that should not fragment cache keys. */
+            /*
+             * COOKIE/PADDING are intentionally excluded from cache keys:
+             * they are per-client/anti-amplification artifacts and do not
+             * represent semantic answer differences.
+             */
             if (code != DNS_EDNS_OPT_COOKIE && code != DNS_EDNS_OPT_PADDING) {
                 if (key_len + option_total > key_capacity || filtered_len > UINT16_MAX - option_total) {
                     return -1;
@@ -490,6 +516,11 @@ size_t dns_udp_payload_limit_for_query(const uint8_t *query, size_t query_len) {
         offset += rdlength;
     }
 
+    /*
+     * Clamp advertised EDNS size into a safe operational window:
+     * - floor at legacy 512 for malformed/small values
+     * - cap at DNS_UDP_MAX_SAFE_PAYLOAD to avoid oversized datagrams
+     */
     size_t limit = DNS_UDP_LEGACY_PAYLOAD;
     if (advertised > 0) {
         limit = advertised < DNS_UDP_LEGACY_PAYLOAD ? DNS_UDP_LEGACY_PAYLOAD : advertised;
@@ -591,6 +622,10 @@ static uint32_t dns_extract_soa_minimum(const uint8_t *message, size_t message_l
         }
     }
 
+    /*
+     * Negative caching uses SOA MINIMUM from authority section (RFC 2308),
+     * bounded by SOA RR TTL. If parsing fails, caller treats as unavailable.
+     */
     for (uint16_t i = 0; i < nscount; i++) {
         if (dns_skip_name(message, message_len, &offset) != 0) {
             return UINT32_MAX;
@@ -634,6 +669,7 @@ uint32_t dns_response_min_ttl(const uint8_t *message, size_t message_len, int *o
         *ok_out = 0;
     }
 
+    /* Negative responses prefer SOA-derived TTL over generic RR min TTL walk. */
     if (dns_is_negative_response(message, message_len)) {
         uint32_t neg_ttl = dns_extract_soa_minimum(message, message_len);
         if (neg_ttl != UINT32_MAX) {
@@ -711,6 +747,7 @@ int dns_adjust_response_ttls(uint8_t *message, size_t message_len, uint32_t age_
         }
 
         uint16_t rr_type = read_u16(message + offset);
+        /* OPT pseudo-RR has no cacheable answer TTL; leave it untouched. */
         if (rr_type != DNS_TYPE_OPT) {
             uint32_t ttl = read_u32(message + offset + 4);
             uint32_t adjusted = (age_seconds >= ttl) ? 0u : (ttl - age_seconds);
@@ -782,11 +819,13 @@ int dns_response_is_cacheable(const uint8_t *response, size_t response_len) {
 
     uint16_t flags = read_u16(response + 2);
 
+    /* TC responses are intentionally excluded; clients must retry over TCP. */
     if (flags & 0x0200u) {
         return 0;
     }
 
     uint16_t rcode = flags & 0x000Fu;
+    /* Cache only NOERROR and NXDOMAIN in this policy. */
     if (rcode != 0 && rcode != 3) {
         return 0;
     }
@@ -799,6 +838,11 @@ int dns_response_is_cacheable(const uint8_t *response, size_t response_len) {
 }
 
 int dns_validate_response_for_query(const uint8_t *query, size_t query_len, const uint8_t *response, size_t response_len) {
+    /*
+     * Validation is intentionally strict: we reject structurally odd packets
+     * even if some resolvers might accept them, because cache correctness and
+     * spoof resistance are more important than permissive interoperability.
+     */
     if (query == NULL || response == NULL || query_len < DNS_HEADER_SIZE || response_len < DNS_HEADER_SIZE) {
         return -1;
     }

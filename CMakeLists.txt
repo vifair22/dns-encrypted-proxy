@@ -67,6 +67,10 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(cache_bench PRIVATE doh_proxy_lib)
     target_include_directories(cache_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     apply_target_defaults(cache_bench)
+
+    add_executable(e2e_proxy_bench tools/e2e_proxy_bench.c)
+    target_link_libraries(e2e_proxy_bench PRIVATE Threads::Threads)
+    apply_target_defaults(e2e_proxy_bench)
 endif()
 
 # Testing support
