@@ -6,7 +6,7 @@ stages:
 variables:
   IMAGE: "$CI_REGISTRY_IMAGE"
   TAG: "$CI_COMMIT_SHORT_SHA"
-  SERVICE_NAME: "doh-proxy"
+  SERVICE_NAME: "dns-encrypted-proxy"
 
 test:
   stage: test
@@ -37,10 +37,10 @@ build:
     - docker info
     - docker login -u gitlab-ci-token -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
     - docker build --pull -t "$IMAGE:$TAG" .
-    - docker run -d --rm --name doh-proxy-smoke "$IMAGE:$TAG" /app/DOH-Proxy /app/doh-proxy.conf.example
+    - docker run -d --rm --name dns-encrypted-proxy-smoke "$IMAGE:$TAG" /app/dns-encrypted-proxy /app/dns-encrypted-proxy.conf.example
     - sleep 2
-    - test -n "$(docker ps --filter name=doh-proxy-smoke -q)"
-    - docker stop doh-proxy-smoke
+    - test -n "$(docker ps --filter name=dns-encrypted-proxy-smoke -q)"
+    - docker stop dns-encrypted-proxy-smoke
     - docker push "$IMAGE:$TAG"
   needs:
     - test
@@ -71,7 +71,7 @@ build:
         -l net.unraid.docker.managed=dockerman \
         --restart unless-stopped \
         --network bridge \
-        -v /mnt/cache/appdata/doh-proxy:/app/config \
+        -v /mnt/cache/appdata/dns-encrypted-proxy:/app/config \
         -p 5053:53/udp \
         -p 5053:53/tcp \
         -p 9090:9090/tcp \

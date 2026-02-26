@@ -1,5 +1,5 @@
 /*
- * Integration tests for DOH-Proxy
+ * Integration tests for dns-encrypted-proxy
  * 
  * These tests verify end-to-end behavior including:
  * - Cache flow (store from upstream, serve from cache)
@@ -589,12 +589,12 @@ static int send_tcp_query_on_fd(int fd, const uint8_t *query, size_t query_len, 
     return 0;
 }
 
-static const char *resolve_doh_proxy_binary_path(void) {
-    if (access("./DOH-Proxy", X_OK) == 0) {
-        return "./DOH-Proxy";
+static const char *resolve_proxy_binary_path(void) {
+    if (access("./dns-encrypted-proxy", X_OK) == 0) {
+        return "./dns-encrypted-proxy";
     }
-    if (access("../DOH-Proxy", X_OK) == 0) {
-        return "../DOH-Proxy";
+    if (access("../dns-encrypted-proxy", X_OK) == 0) {
+        return "../dns-encrypted-proxy";
     }
     return NULL;
 }
@@ -627,7 +627,7 @@ static int waitpid_with_timeout(pid_t pid, int *status_out, int timeout_ms) {
 }
 
 static pid_t spawn_main_with_config(const char *config_path) {
-    const char *bin = resolve_doh_proxy_binary_path();
+    const char *bin = resolve_proxy_binary_path();
     if (bin == NULL || config_path == NULL) {
         return -1;
     }
@@ -637,7 +637,7 @@ static pid_t spawn_main_with_config(const char *config_path) {
         return -1;
     }
     if (pid == 0) {
-        execl(bin, "DOH-Proxy", config_path, (char *)NULL);
+        execl(bin, "dns-encrypted-proxy", config_path, (char *)NULL);
         _exit(127);
     }
 
@@ -645,7 +645,7 @@ static pid_t spawn_main_with_config(const char *config_path) {
 }
 
 static pid_t spawn_main_without_args(void) {
-    const char *bin = resolve_doh_proxy_binary_path();
+    const char *bin = resolve_proxy_binary_path();
     if (bin == NULL) {
         return -1;
     }
@@ -655,7 +655,7 @@ static pid_t spawn_main_without_args(void) {
         return -1;
     }
     if (pid == 0) {
-        execl(bin, "DOH-Proxy", (char *)NULL);
+        execl(bin, "dns-encrypted-proxy", (char *)NULL);
         _exit(127);
     }
 
@@ -1163,8 +1163,8 @@ static void test_upstream_transport_doh_success(void **state) {
         0);
 
     setenv("CURL_CA_BUNDLE", cert_path, 1);
-    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
-    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
 
     char url[256];
     snprintf(url, sizeof(url), "https://localhost:%d/dns-query", server.port);
@@ -1207,8 +1207,8 @@ static void test_upstream_transport_doh_success(void **state) {
     free(response);
     upstream_client_destroy(&client);
     stop_python_doh_server(&server);
-    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
-    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
 
@@ -1572,8 +1572,8 @@ static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
         0);
 
     setenv("CURL_CA_BUNDLE", cert_path, 1);
-    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
-    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
 
     char url[256];
     snprintf(url, sizeof(url), "https://localhost:%d/dns-query", server.port);
@@ -1606,8 +1606,8 @@ static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
 
     upstream_client_destroy(&client);
     stop_python_doh_server(&server);
-    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
-    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
 
@@ -1693,9 +1693,9 @@ static void test_metrics_endpoint_http_paths(void **state) {
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
     assert_non_null(strstr(body, "HTTP/1.1 200 OK"));
-    assert_non_null(strstr(body, "# HELP doh_proxy_queries_udp_total"));
-    assert_non_null(strstr(body, "doh_proxy_queries_udp_total 3"));
-    assert_non_null(strstr(body, "doh_proxy_uptime_seconds"));
+    assert_non_null(strstr(body, "# HELP dns_encrypted_proxy_queries_udp_total"));
+    assert_non_null(strstr(body, "dns_encrypted_proxy_queries_udp_total 3"));
+    assert_non_null(strstr(body, "dns_encrypted_proxy_uptime_seconds"));
 
     char not_found[2048];
     assert_int_equal(http_get_local(port, "/not-found", not_found, sizeof(not_found)), 0);
@@ -1741,8 +1741,8 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
-    assert_non_null(strstr(body, "doh_proxy_upstream_server_requests_total{upstream=\"https://cloudflare-dns.com/dns-query\",protocol=\"doh\"}"));
-    assert_non_null(strstr(body, "doh_proxy_upstream_server_healthy{upstream=\"tls://1.1.1.1:853\",protocol=\"dot\"}"));
+    assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_requests_total{upstream=\"https://cloudflare-dns.com/dns-query\",protocol=\"doh\"}"));
+    assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_healthy{upstream=\"tls://1.1.1.1:853\",protocol=\"dot\"}"));
 
     metrics_server_stop();
     upstream_client_destroy(&upstream);
@@ -2179,7 +2179,7 @@ static void test_main_start_metrics_disabled_and_signal_shutdown(void **state) {
 }
 
 /*
- * Test: main follows argc==1 path by loading config from DOH_PROXY_CONFIG
+ * Test: main follows argc==1 path by loading config from DNS_ENCRYPTED_PROXY_CONFIG
  */
 static void test_main_no_arg_uses_env_config_and_signal_shutdown(void **state) {
     (void)state;
@@ -2207,7 +2207,7 @@ static void test_main_no_arg_uses_env_config_and_signal_shutdown(void **state) {
 
     char *cfg_path = create_temp_file(cfg_text);
     assert_non_null(cfg_path);
-    setenv("DOH_PROXY_CONFIG", cfg_path, 1);
+    setenv("DNS_ENCRYPTED_PROXY_CONFIG", cfg_path, 1);
 
     pid_t pid = spawn_main_without_args();
     assert_true(pid > 0);
@@ -2222,7 +2222,7 @@ static void test_main_no_arg_uses_env_config_and_signal_shutdown(void **state) {
     assert_true(WIFEXITED(status));
     assert_int_equal(WEXITSTATUS(status), 0);
 
-    unsetenv("DOH_PROXY_CONFIG");
+    unsetenv("DNS_ENCRYPTED_PROXY_CONFIG");
     remove_temp_file(cfg_path);
 }
 
@@ -2511,8 +2511,8 @@ static void test_dns_server_udp_truncation_path(void **state) {
     free(large_response);
 
     setenv("CURL_CA_BUNDLE", cert_path, 1);
-    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
-    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
 
     proxy_config_t config;
     assert_int_equal(config_load(&config, "/nonexistent"), 0);
@@ -2559,8 +2559,8 @@ static void test_dns_server_udp_truncation_path(void **state) {
 
     proxy_server_destroy(&server);
     stop_python_doh_server(&doh_server);
-    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
-    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
 
@@ -2690,8 +2690,8 @@ static void test_dns_server_udp_edns_no_truncation(void **state) {
     free(large_response);
 
     setenv("CURL_CA_BUNDLE", cert_path, 1);
-    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
-    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
 
     proxy_config_t config;
     assert_int_equal(config_load(&config, "/nonexistent"), 0);
@@ -2738,8 +2738,8 @@ static void test_dns_server_udp_edns_no_truncation(void **state) {
 
     proxy_server_destroy(&server);
     stop_python_doh_server(&doh_server);
-    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
-    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
 

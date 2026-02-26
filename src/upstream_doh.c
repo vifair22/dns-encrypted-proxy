@@ -159,14 +159,14 @@ static int doh_post_with_handle(
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     /* Test hooks are opt-in and only alter transport selection/verification. */
-    const char *force_http1 = getenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    const char *force_http1 = getenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     if (force_http1 != NULL && *force_http1 != '\0') {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     } else {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
     }
 
-    const char *insecure_tls = getenv("DOH_PROXY_TEST_INSECURE_TLS");
+    const char *insecure_tls = getenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
     if (insecure_tls != NULL && *insecure_tls != '\0') {
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -180,7 +180,7 @@ static int doh_post_with_handle(
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "DOH-Proxy/0.2");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "dns-encrypted-proxy/0.2");
 
     CURLcode rc = curl_easy_perform(curl);
     long status = 0;

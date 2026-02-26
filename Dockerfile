@@ -15,7 +15,7 @@ WORKDIR /src
 
 COPY CMakeLists.txt ./
 COPY src ./src
-COPY doh-proxy.conf.example ./
+COPY dns-encrypted-proxy.conf.example ./
 
 RUN cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
@@ -24,8 +24,8 @@ RUN cmake -S . -B build \
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -ffunction-sections -fdata-sections" \
     -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-Wl,--gc-sections" \
-    && cmake --build build --target DOH-Proxy -j \
-    && strip /src/build/DOH-Proxy
+    && cmake --build build --target dns-encrypted-proxy -j \
+    && strip /src/build/dns-encrypted-proxy
 
 FROM alpine:3.19 AS runtime
 
@@ -36,10 +36,10 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-COPY --from=build /src/build/DOH-Proxy /app/DOH-Proxy
-COPY doh-proxy.conf.example /app/doh-proxy.conf.example
+COPY --from=build /src/build/dns-encrypted-proxy /app/dns-encrypted-proxy
+COPY dns-encrypted-proxy.conf.example /app/dns-encrypted-proxy.conf.example
 
 EXPOSE 53/tcp
 EXPOSE 53/udp
 
-CMD ["/app/DOH-Proxy"]
+CMD ["/app/dns-encrypted-proxy"]

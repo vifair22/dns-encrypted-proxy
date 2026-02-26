@@ -1,6 +1,6 @@
-# DOH-Proxy
+# dns-encrypted-proxy
 
-DOH-Proxy is a small, high-performance DNS forward proxy written in C.
+dns-encrypted-proxy is a small, high-performance DNS forward proxy written in C.
 
 It listens on classic DNS (`UDP`/`TCP`) and forwards to encrypted upstreams (`DoH` and `DoT`). The goal is simple: keep the data path fast, predictable, and easy to reason about.
 
@@ -51,21 +51,21 @@ cmake --build build
 Run:
 
 ```bash
-./build/DOH-Proxy
+./build/dns-encrypted-proxy
 ```
 
 Local non-privileged port:
 
 ```bash
-LISTEN_PORT=5353 ./build/DOH-Proxy
+LISTEN_PORT=5353 ./build/dns-encrypted-proxy
 ```
 
 ## Configuration
 
-By default the proxy reads `doh-proxy.conf` if present. You can also pass an explicit config path:
+By default the proxy reads `dns-encrypted-proxy.conf` if present. You can also pass an explicit config path:
 
 ```bash
-./build/DOH-Proxy /path/to/doh-proxy.conf
+./build/dns-encrypted-proxy /path/to/dns-encrypted-proxy.conf
 ```
 
 Main config keys:
@@ -79,7 +79,7 @@ Main config keys:
 
 Environment override support includes:
 
-- `DOH_PROXY_CONFIG`, `LISTEN_ADDR`, `LISTEN_PORT`
+- `DNS_ENCRYPTED_PROXY_CONFIG`, `LISTEN_ADDR`, `LISTEN_PORT`
 - `UPSTREAMS`, `UPSTREAM_TIMEOUT_MS`, `UPSTREAM_POOL_SIZE`
 - `CACHE_CAPACITY`
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
@@ -100,13 +100,13 @@ Includes counters/gauges for query volume, upstream success/failure, cache entri
 Build local image:
 
 ```bash
-docker buildx build --load -t doh-proxy-c:dev .
+docker buildx build --load -t dns-encrypted-proxy:dev .
 ```
 
 Run:
 
 ```bash
-docker run --rm -p 53:53/udp -p 53:53/tcp doh-proxy-c:dev
+docker run --rm -p 53:53/udp -p 53:53/tcp dns-encrypted-proxy:dev
 ```
 
 ## Project Guides

@@ -238,7 +238,7 @@ static void set_defaults(proxy_config_t *config) {
     strncpy(config->upstream_urls[1], "https://dns.google/dns-query", MAX_URL_LEN - 1);
     config->upstream_count = 2;
 
-    strncpy(config->config_path, "doh-proxy.conf", sizeof(config->config_path) - 1);
+    strncpy(config->config_path, "dns-encrypted-proxy.conf", sizeof(config->config_path) - 1);
 
     config->tcp_idle_timeout_ms = 10000;
     config->tcp_max_clients = 256;
@@ -290,7 +290,7 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
 
     const char *path = explicit_path;
     if (path == NULL || *path == '\0') {
-        const char *env_path = getenv("DOH_PROXY_CONFIG");
+        const char *env_path = getenv("DNS_ENCRYPTED_PROXY_CONFIG");
         if (env_path != NULL && *env_path != '\0') {
             path = env_path;
         } else {

@@ -21,7 +21,7 @@
 
 /* Create a temporary file with given content, returns path (must be freed) */
 static inline char *create_temp_file(const char *content) {
-    char template[] = "/tmp/doh_proxy_test_XXXXXX";
+    char template[] = "/tmp/dns_encrypted_proxy_test_XXXXXX";
     int fd = mkstemp(template);
     if (fd < 0) {
         return NULL;
@@ -62,7 +62,7 @@ static inline void clear_config_env_vars(void) {
     unsetenv("TCP_MAX_QUERIES_PER_CONN");
     unsetenv("METRICS_PORT");
     unsetenv("METRICS_ENABLED");
-    unsetenv("DOH_PROXY_CONFIG");
+    unsetenv("DNS_ENCRYPTED_PROXY_CONFIG");
 }
 
 /* Assert two byte arrays are equal */

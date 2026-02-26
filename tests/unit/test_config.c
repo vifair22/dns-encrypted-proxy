@@ -239,7 +239,7 @@ static void test_config_validation_invalid_port(void **state) {
 }
 
 /*
- * Test: DOH_PROXY_CONFIG environment variable for config path
+ * Test: DNS_ENCRYPTED_PROXY_CONFIG environment variable for config path
  */
 static void test_config_env_config_path(void **state) {
     (void)state;
@@ -251,7 +251,7 @@ static void test_config_env_config_path(void **state) {
     char *temp_file = create_temp_file(config_content);
     assert_non_null(temp_file);
     
-    setenv("DOH_PROXY_CONFIG", temp_file, 1);
+    setenv("DNS_ENCRYPTED_PROXY_CONFIG", temp_file, 1);
     
     proxy_config_t config;
     int result = config_load(&config, NULL);
@@ -341,7 +341,7 @@ static void test_config_invalid_lines_and_empty_explicit_path(void **state) {
     char *temp_file = create_temp_file(config_content);
     assert_non_null(temp_file);
 
-    setenv("DOH_PROXY_CONFIG", temp_file, 1);
+    setenv("DNS_ENCRYPTED_PROXY_CONFIG", temp_file, 1);
 
     proxy_config_t config;
     int result = config_load(&config, "");

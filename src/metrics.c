@@ -102,14 +102,14 @@ static void escape_label_value(const char *src, char *dst, size_t dst_size) {
 
 static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
     if (appendf(out, out_size, offset,
-                "# HELP doh_proxy_upstream_server_requests_total Total requests attempted against each configured upstream.\n"
-                "# TYPE doh_proxy_upstream_server_requests_total counter\n"
-                "# HELP doh_proxy_upstream_server_failures_total Total failed requests against each configured upstream.\n"
-                "# TYPE doh_proxy_upstream_server_failures_total counter\n"
-                "# HELP doh_proxy_upstream_server_healthy Upstream health state (1 healthy, 0 unhealthy).\n"
-                "# TYPE doh_proxy_upstream_server_healthy gauge\n"
-                "# HELP doh_proxy_upstream_server_consecutive_failures Consecutive failure count per upstream.\n"
-                "# TYPE doh_proxy_upstream_server_consecutive_failures gauge\n") != 0) {
+                "# HELP dns_encrypted_proxy_upstream_server_requests_total Total requests attempted against each configured upstream.\n"
+                "# TYPE dns_encrypted_proxy_upstream_server_requests_total counter\n"
+                "# HELP dns_encrypted_proxy_upstream_server_failures_total Total failed requests against each configured upstream.\n"
+                "# TYPE dns_encrypted_proxy_upstream_server_failures_total counter\n"
+                "# HELP dns_encrypted_proxy_upstream_server_healthy Upstream health state (1 healthy, 0 unhealthy).\n"
+                "# TYPE dns_encrypted_proxy_upstream_server_healthy gauge\n"
+                "# HELP dns_encrypted_proxy_upstream_server_consecutive_failures Consecutive failure count per upstream.\n"
+                "# TYPE dns_encrypted_proxy_upstream_server_consecutive_failures gauge\n") != 0) {
         return -1;
     }
 
@@ -126,10 +126,10 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
         if (appendf(out,
                     out_size,
                     offset,
-                    "doh_proxy_upstream_server_requests_total{upstream=\"%s\",protocol=\"%s\"} %llu\n"
-                    "doh_proxy_upstream_server_failures_total{upstream=\"%s\",protocol=\"%s\"} %llu\n"
-                    "doh_proxy_upstream_server_healthy{upstream=\"%s\",protocol=\"%s\"} %d\n"
-                    "doh_proxy_upstream_server_consecutive_failures{upstream=\"%s\",protocol=\"%s\"} %u\n",
+                    "dns_encrypted_proxy_upstream_server_requests_total{upstream=\"%s\",protocol=\"%s\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_server_failures_total{upstream=\"%s\",protocol=\"%s\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_server_healthy{upstream=\"%s\",protocol=\"%s\"} %d\n"
+                    "dns_encrypted_proxy_upstream_server_consecutive_failures{upstream=\"%s\",protocol=\"%s\"} %u\n",
                     escaped_url,
                     upstream_protocol_label(server->type),
                     (unsigned long long)server->health.total_queries,
@@ -194,78 +194,52 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             out,
             out_size,
             &offset,
-            "# HELP doh_proxy_uptime_seconds Process uptime in seconds.\n"
-            "# TYPE doh_proxy_uptime_seconds gauge\n"
-            "doh_proxy_uptime_seconds %.3f\n"
-            "# HELP doh_proxy_queries_udp_total Total number of DNS queries received over UDP.\n"
-            "# TYPE doh_proxy_queries_udp_total counter\n"
-            "doh_proxy_queries_udp_total %llu\n"
-            "# HELP doh_proxy_queries_tcp_total Total number of DNS queries received over TCP.\n"
-            "# TYPE doh_proxy_queries_tcp_total counter\n"
-            "doh_proxy_queries_tcp_total %llu\n"
-            "# HELP doh_proxy_cache_hits_total Total number of cache hits.\n"
-            "# TYPE doh_proxy_cache_hits_total counter\n"
-            "doh_proxy_cache_hits_total %llu\n"
-            "# HELP doh_proxy_cache_misses_total Total number of cache misses.\n"
-            "# TYPE doh_proxy_cache_misses_total counter\n"
-            "doh_proxy_cache_misses_total %llu\n"
-            "# HELP doh_proxy_upstream_success_total Total number of successful upstream resolutions.\n"
-            "# TYPE doh_proxy_upstream_success_total counter\n"
-            "doh_proxy_upstream_success_total %llu\n"
-            "# HELP doh_proxy_upstream_failures_total Total number of failed upstream resolutions.\n"
-            "# TYPE doh_proxy_upstream_failures_total counter\n"
-            "doh_proxy_upstream_failures_total %llu\n"
-            "# HELP doh_proxy_servfail_sent_total Total number of SERVFAIL responses sent by the proxy.\n"
-            "# TYPE doh_proxy_servfail_sent_total counter\n"
-            "doh_proxy_servfail_sent_total %llu\n"
-            "# HELP doh_proxy_truncated_sent_total Total number of truncated UDP responses sent.\n"
-            "# TYPE doh_proxy_truncated_sent_total counter\n"
-            "doh_proxy_truncated_sent_total %llu\n"
-            "# HELP doh_proxy_tcp_connections_total Total number of accepted TCP client connections.\n"
-            "# TYPE doh_proxy_tcp_connections_total counter\n"
-            "doh_proxy_tcp_connections_total %llu\n"
-            "# HELP doh_proxy_tcp_connections_rejected_total Total number of rejected TCP client connections.\n"
-            "# TYPE doh_proxy_tcp_connections_rejected_total counter\n"
-            "doh_proxy_tcp_connections_rejected_total %llu\n"
-            "# HELP doh_proxy_tcp_connections_active Number of currently active TCP client connections.\n"
-            "# TYPE doh_proxy_tcp_connections_active gauge\n"
-            "doh_proxy_tcp_connections_active %d\n"
-            "# HELP doh_proxy_responses_total Total number of DNS responses sent by the proxy.\n"
-            "# TYPE doh_proxy_responses_total counter\n"
-            "doh_proxy_responses_total %llu\n"
-            "# HELP doh_proxy_responses_rcode_total Total number of DNS responses by RCODE.\n"
-            "# TYPE doh_proxy_responses_rcode_total counter\n"
-            "doh_proxy_responses_rcode_total{rcode=\"NOERROR\"} %llu\n"
-            "doh_proxy_responses_rcode_total{rcode=\"SERVFAIL\"} %llu\n"
-            "doh_proxy_responses_rcode_total{rcode=\"NXDOMAIN\"} %llu\n"
-            "doh_proxy_responses_rcode_total{rcode=\"REFUSED\"} %llu\n"
-            "doh_proxy_responses_rcode_total{rcode=\"OTHER\"} %llu\n"
-            "# HELP doh_proxy_cache_entries Number of cache entries currently in use.\n"
-            "# TYPE doh_proxy_cache_entries gauge\n"
-            "doh_proxy_cache_entries %llu\n"
-            "# HELP doh_proxy_cache_capacity Total configured cache entry capacity.\n"
-            "# TYPE doh_proxy_cache_capacity gauge\n"
-            "doh_proxy_cache_capacity %llu\n"
-            "# HELP doh_proxy_cache_evictions_total Total cache evictions due to capacity pressure.\n"
-            "# TYPE doh_proxy_cache_evictions_total counter\n"
-            "doh_proxy_cache_evictions_total %llu\n"
-            "# HELP doh_proxy_cache_expirations_total Total cache entries expired and removed.\n"
-            "# TYPE doh_proxy_cache_expirations_total counter\n"
-            "doh_proxy_cache_expirations_total %llu\n"
-            "# HELP doh_proxy_cache_bytes_in_use Approximate bytes currently held by cache key/value payloads.\n"
-            "# TYPE doh_proxy_cache_bytes_in_use gauge\n"
-            "doh_proxy_cache_bytes_in_use %llu\n"
-            "# HELP doh_proxy_metrics_http_requests_total Total HTTP requests received by the metrics endpoint.\n"
-            "# TYPE doh_proxy_metrics_http_requests_total counter\n"
-            "doh_proxy_metrics_http_requests_total %llu\n"
-            "# HELP doh_proxy_metrics_http_responses_total Total HTTP responses returned by status code class.\n"
-            "# TYPE doh_proxy_metrics_http_responses_total counter\n"
-            "doh_proxy_metrics_http_responses_total{code_class=\"2xx\"} %llu\n"
-            "doh_proxy_metrics_http_responses_total{code_class=\"4xx\"} %llu\n"
-            "doh_proxy_metrics_http_responses_total{code_class=\"5xx\"} %llu\n"
-            "# HELP doh_proxy_metrics_http_in_flight Number of in-flight HTTP metrics requests.\n"
-            "# TYPE doh_proxy_metrics_http_in_flight gauge\n"
-            "doh_proxy_metrics_http_in_flight %d\n",
+            "# HELP dns_encrypted_proxy_uptime_seconds Process uptime in seconds.\n"
+            "# TYPE dns_encrypted_proxy_uptime_seconds gauge\n"
+            "dns_encrypted_proxy_uptime_seconds %.3f\n"
+            "# HELP dns_encrypted_proxy_queries_udp_total Total number of DNS queries received over UDP.\n"
+            "# TYPE dns_encrypted_proxy_queries_udp_total counter\n"
+            "dns_encrypted_proxy_queries_udp_total %llu\n"
+            "# HELP dns_encrypted_proxy_queries_tcp_total Total number of DNS queries received over TCP.\n"
+            "# TYPE dns_encrypted_proxy_queries_tcp_total counter\n"
+            "dns_encrypted_proxy_queries_tcp_total %llu\n"
+            "# HELP dns_encrypted_proxy_cache_hits_total Total number of cache hits.\n"
+            "# TYPE dns_encrypted_proxy_cache_hits_total counter\n"
+            "dns_encrypted_proxy_cache_hits_total %llu\n"
+            "# HELP dns_encrypted_proxy_cache_misses_total Total number of cache misses.\n"
+            "# TYPE dns_encrypted_proxy_cache_misses_total counter\n"
+            "dns_encrypted_proxy_cache_misses_total %llu\n"
+            "# HELP dns_encrypted_proxy_upstream_success_total Total number of successful upstream resolutions.\n"
+            "# TYPE dns_encrypted_proxy_upstream_success_total counter\n"
+            "dns_encrypted_proxy_upstream_success_total %llu\n"
+            "# HELP dns_encrypted_proxy_upstream_failures_total Total number of failed upstream resolutions.\n"
+            "# TYPE dns_encrypted_proxy_upstream_failures_total counter\n"
+            "dns_encrypted_proxy_upstream_failures_total %llu\n"
+            "# HELP dns_encrypted_proxy_servfail_sent_total Total number of SERVFAIL responses sent by the proxy.\n"
+            "# TYPE dns_encrypted_proxy_servfail_sent_total counter\n"
+            "dns_encrypted_proxy_servfail_sent_total %llu\n"
+            "# HELP dns_encrypted_proxy_truncated_sent_total Total number of truncated UDP responses sent.\n"
+            "# TYPE dns_encrypted_proxy_truncated_sent_total counter\n"
+            "dns_encrypted_proxy_truncated_sent_total %llu\n"
+            "# HELP dns_encrypted_proxy_tcp_connections_total Total number of accepted TCP client connections.\n"
+            "# TYPE dns_encrypted_proxy_tcp_connections_total counter\n"
+            "dns_encrypted_proxy_tcp_connections_total %llu\n"
+            "# HELP dns_encrypted_proxy_tcp_connections_rejected_total Total number of rejected TCP client connections.\n"
+            "# TYPE dns_encrypted_proxy_tcp_connections_rejected_total counter\n"
+            "dns_encrypted_proxy_tcp_connections_rejected_total %llu\n"
+            "# HELP dns_encrypted_proxy_tcp_connections_active Number of currently active TCP client connections.\n"
+            "# TYPE dns_encrypted_proxy_tcp_connections_active gauge\n"
+            "dns_encrypted_proxy_tcp_connections_active %d\n"
+            "# HELP dns_encrypted_proxy_responses_total Total number of DNS responses sent by the proxy.\n"
+            "# TYPE dns_encrypted_proxy_responses_total counter\n"
+            "dns_encrypted_proxy_responses_total %llu\n"
+            "# HELP dns_encrypted_proxy_responses_rcode_total Total number of DNS responses by RCODE.\n"
+            "# TYPE dns_encrypted_proxy_responses_rcode_total counter\n"
+            "dns_encrypted_proxy_responses_rcode_total{rcode=\"NOERROR\"} %llu\n"
+            "dns_encrypted_proxy_responses_rcode_total{rcode=\"SERVFAIL\"} %llu\n"
+            "dns_encrypted_proxy_responses_rcode_total{rcode=\"NXDOMAIN\"} %llu\n"
+            "dns_encrypted_proxy_responses_rcode_total{rcode=\"REFUSED\"} %llu\n"
+            "dns_encrypted_proxy_responses_rcode_total{rcode=\"OTHER\"} %llu\n",
             uptime_seconds,
             (unsigned long long)atomic_load(&m->queries_udp),
             (unsigned long long)atomic_load(&m->queries_tcp),
@@ -283,7 +257,40 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)atomic_load(&m->responses_rcode[2]),
             (unsigned long long)atomic_load(&m->responses_rcode[3]),
             (unsigned long long)atomic_load(&m->responses_rcode[5]),
-            (unsigned long long)rcode_other,
+            (unsigned long long)rcode_other) != 0) {
+        return -1;
+    }
+
+    if (appendf(
+            out,
+            out_size,
+            &offset,
+            "# HELP dns_encrypted_proxy_cache_entries Number of cache entries currently in use.\n"
+            "# TYPE dns_encrypted_proxy_cache_entries gauge\n"
+            "dns_encrypted_proxy_cache_entries %llu\n"
+            "# HELP dns_encrypted_proxy_cache_capacity Total configured cache entry capacity.\n"
+            "# TYPE dns_encrypted_proxy_cache_capacity gauge\n"
+            "dns_encrypted_proxy_cache_capacity %llu\n"
+            "# HELP dns_encrypted_proxy_cache_evictions_total Total cache evictions due to capacity pressure.\n"
+            "# TYPE dns_encrypted_proxy_cache_evictions_total counter\n"
+            "dns_encrypted_proxy_cache_evictions_total %llu\n"
+            "# HELP dns_encrypted_proxy_cache_expirations_total Total cache entries expired and removed.\n"
+            "# TYPE dns_encrypted_proxy_cache_expirations_total counter\n"
+            "dns_encrypted_proxy_cache_expirations_total %llu\n"
+            "# HELP dns_encrypted_proxy_cache_bytes_in_use Approximate bytes currently held by cache key/value payloads.\n"
+            "# TYPE dns_encrypted_proxy_cache_bytes_in_use gauge\n"
+            "dns_encrypted_proxy_cache_bytes_in_use %llu\n"
+            "# HELP dns_encrypted_proxy_metrics_http_requests_total Total HTTP requests received by the metrics endpoint.\n"
+            "# TYPE dns_encrypted_proxy_metrics_http_requests_total counter\n"
+            "dns_encrypted_proxy_metrics_http_requests_total %llu\n"
+            "# HELP dns_encrypted_proxy_metrics_http_responses_total Total HTTP responses returned by status code class.\n"
+            "# TYPE dns_encrypted_proxy_metrics_http_responses_total counter\n"
+            "dns_encrypted_proxy_metrics_http_responses_total{code_class=\"2xx\"} %llu\n"
+            "dns_encrypted_proxy_metrics_http_responses_total{code_class=\"4xx\"} %llu\n"
+            "dns_encrypted_proxy_metrics_http_responses_total{code_class=\"5xx\"} %llu\n"
+            "# HELP dns_encrypted_proxy_metrics_http_in_flight Number of in-flight HTTP metrics requests.\n"
+            "# TYPE dns_encrypted_proxy_metrics_http_in_flight gauge\n"
+            "dns_encrypted_proxy_metrics_http_in_flight %d\n",
             (unsigned long long)cache_entries,
             (unsigned long long)cache_capacity,
             (unsigned long long)cache_evictions,
@@ -301,32 +308,32 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             out,
             out_size,
             &offset,
-            "# HELP doh_proxy_doh_pool_capacity Configured DoH handle pool capacity.\n"
-            "# TYPE doh_proxy_doh_pool_capacity gauge\n"
-            "doh_proxy_doh_pool_capacity %d\n"
-            "# HELP doh_proxy_doh_pool_in_use Number of DoH handles currently in use.\n"
-            "# TYPE doh_proxy_doh_pool_in_use gauge\n"
-            "doh_proxy_doh_pool_in_use %d\n"
-            "# HELP doh_proxy_doh_pool_idle Number of idle DoH handles in pool.\n"
-            "# TYPE doh_proxy_doh_pool_idle gauge\n"
-            "doh_proxy_doh_pool_idle %d\n"
-            "# HELP doh_proxy_doh_http_responses_total Total DoH responses by negotiated HTTP version.\n"
-            "# TYPE doh_proxy_doh_http_responses_total counter\n"
-            "doh_proxy_doh_http_responses_total{version=\"h2\"} %llu\n"
-            "doh_proxy_doh_http_responses_total{version=\"h1\"} %llu\n"
-            "doh_proxy_doh_http_responses_total{version=\"other\"} %llu\n"
-            "# HELP doh_proxy_dot_pool_capacity Configured DoT connection pool capacity.\n"
-            "# TYPE doh_proxy_dot_pool_capacity gauge\n"
-            "doh_proxy_dot_pool_capacity %d\n"
-            "# HELP doh_proxy_dot_pool_in_use Number of DoT connection slots currently in use.\n"
-            "# TYPE doh_proxy_dot_pool_in_use gauge\n"
-            "doh_proxy_dot_pool_in_use %d\n"
-            "# HELP doh_proxy_dot_pool_idle Number of idle DoT connection slots in pool.\n"
-            "# TYPE doh_proxy_dot_pool_idle gauge\n"
-            "doh_proxy_dot_pool_idle %d\n"
-            "# HELP doh_proxy_dot_connections_alive Number of currently established DoT TLS connections.\n"
-            "# TYPE doh_proxy_dot_connections_alive gauge\n"
-            "doh_proxy_dot_connections_alive %d\n",
+            "# HELP dns_encrypted_proxy_doh_pool_capacity Configured DoH handle pool capacity.\n"
+            "# TYPE dns_encrypted_proxy_doh_pool_capacity gauge\n"
+            "dns_encrypted_proxy_doh_pool_capacity %d\n"
+            "# HELP dns_encrypted_proxy_doh_pool_in_use Number of DoH handles currently in use.\n"
+            "# TYPE dns_encrypted_proxy_doh_pool_in_use gauge\n"
+            "dns_encrypted_proxy_doh_pool_in_use %d\n"
+            "# HELP dns_encrypted_proxy_doh_pool_idle Number of idle DoH handles in pool.\n"
+            "# TYPE dns_encrypted_proxy_doh_pool_idle gauge\n"
+            "dns_encrypted_proxy_doh_pool_idle %d\n"
+            "# HELP dns_encrypted_proxy_doh_http_responses_total Total DoH responses by negotiated HTTP version.\n"
+            "# TYPE dns_encrypted_proxy_doh_http_responses_total counter\n"
+            "dns_encrypted_proxy_doh_http_responses_total{version=\"h2\"} %llu\n"
+            "dns_encrypted_proxy_doh_http_responses_total{version=\"h1\"} %llu\n"
+            "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n"
+            "# HELP dns_encrypted_proxy_dot_pool_capacity Configured DoT connection pool capacity.\n"
+            "# TYPE dns_encrypted_proxy_dot_pool_capacity gauge\n"
+            "dns_encrypted_proxy_dot_pool_capacity %d\n"
+            "# HELP dns_encrypted_proxy_dot_pool_in_use Number of DoT connection slots currently in use.\n"
+            "# TYPE dns_encrypted_proxy_dot_pool_in_use gauge\n"
+            "dns_encrypted_proxy_dot_pool_in_use %d\n"
+            "# HELP dns_encrypted_proxy_dot_pool_idle Number of idle DoT connection slots in pool.\n"
+            "# TYPE dns_encrypted_proxy_dot_pool_idle gauge\n"
+            "dns_encrypted_proxy_dot_pool_idle %d\n"
+            "# HELP dns_encrypted_proxy_dot_connections_alive Number of currently established DoT TLS connections.\n"
+            "# TYPE dns_encrypted_proxy_dot_connections_alive gauge\n"
+            "dns_encrypted_proxy_dot_connections_alive %d\n",
             runtime_stats.doh_pool_capacity,
             runtime_stats.doh_pool_in_use,
             doh_pool_idle,

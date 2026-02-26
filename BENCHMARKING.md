@@ -34,7 +34,7 @@ Performance step log is tracked in:
 `e2e_proxy_bench` launches:
 
 1. local HTTPS mock DoH upstream (`tools/mock_doh_server.py`)
-2. compiled `DOH-Proxy`
+2. compiled `dns-encrypted-proxy`
 3. concurrent benchmark clients
 
 and reports end-to-end throughput and p50/p95/p99/max latency.
@@ -62,7 +62,7 @@ and reports end-to-end throughput and p50/p95/p99/max latency.
 - `--timeout-ms N`
 - `--upstream-delay-us N` (inject mock upstream latency)
 - `--upstream-answer-count N` (larger responses; auto-min 40 for `udp-upgrade`)
-- `--proxy-bin PATH` (default `./build/DOH-Proxy`)
+- `--proxy-bin PATH` (default `./build/dns-encrypted-proxy`)
 
 ## Notes
 

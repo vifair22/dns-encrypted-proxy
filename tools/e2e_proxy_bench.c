@@ -415,8 +415,8 @@ static pid_t spawn_proxy(const char *proxy_bin, const char *cfg_path) {
         return pid;
     }
 
-    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
-    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
     execl(proxy_bin, proxy_bin, cfg_path, (char *)NULL);
     _exit(127);
 }
@@ -502,7 +502,7 @@ static int parse_opts(int argc, char **argv, bench_opts_t *opts) {
     opts->upstream_delay_us = 0;
     opts->upstream_answer_count = 1;
     opts->protocol = PROTO_UDP;
-    opts->proxy_bin = "./build/DOH-Proxy";
+    opts->proxy_bin = "./build/dns-encrypted-proxy";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--protocol") == 0 && i + 1 < argc) {
@@ -566,7 +566,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    char cfg_path[] = "/tmp/doh_proxy_bench_cfg_XXXXXX";
+    char cfg_path[] = "/tmp/dns_encrypted_proxy_bench_cfg_XXXXXX";
     int cfg_fd = mkstemp(cfg_path);
     if (cfg_fd < 0) {
         perror("mkstemp");

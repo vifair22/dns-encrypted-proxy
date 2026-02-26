@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(DOH-Proxy C)
+project(dns-encrypted-proxy C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -41,7 +41,7 @@ find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 # Core library (everything except main.c) for linking tests
-add_library(doh_proxy_lib STATIC
+add_library(dns_encrypted_proxy_lib STATIC
     src/config.c
     src/cache.c
     src/dns_message.c
@@ -51,20 +51,20 @@ add_library(doh_proxy_lib STATIC
     src/dns_server.c
     src/metrics.c
 )
-target_include_directories(doh_proxy_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(doh_proxy_lib PUBLIC CURL::libcurl Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
-apply_target_defaults(doh_proxy_lib)
+target_include_directories(dns_encrypted_proxy_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dns_encrypted_proxy_lib PUBLIC CURL::libcurl Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+apply_target_defaults(dns_encrypted_proxy_lib)
 
 # Main executable
-add_executable(DOH-Proxy src/main.c)
-target_link_libraries(DOH-Proxy PRIVATE doh_proxy_lib)
-apply_target_defaults(DOH-Proxy)
+add_executable(dns-encrypted-proxy src/main.c)
+target_link_libraries(dns-encrypted-proxy PRIVATE dns_encrypted_proxy_lib)
+apply_target_defaults(dns-encrypted-proxy)
 
 # Benchmark utility
 option(BUILD_BENCHMARKS "Build benchmark utilities" ON)
 if(BUILD_BENCHMARKS)
     add_executable(cache_bench tools/cache_bench.c)
-    target_link_libraries(cache_bench PRIVATE doh_proxy_lib)
+    target_link_libraries(cache_bench PRIVATE dns_encrypted_proxy_lib)
     target_include_directories(cache_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     apply_target_defaults(cache_bench)
 
@@ -98,14 +98,14 @@ if(BUILD_TESTS)
         
         # Unit test: config
         add_executable(test_config tests/unit/test_config.c)
-        target_link_libraries(test_config doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_config dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_config PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_config)
         add_test(NAME test_config COMMAND test_config)
         
         # Unit test: cache
         add_executable(test_cache tests/unit/test_cache.c)
-        target_link_libraries(test_cache doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_cache dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_cache PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_cache)
         add_test(NAME test_cache COMMAND test_cache)
@@ -119,7 +119,7 @@ if(BUILD_TESTS)
         
         # Unit test: dns_message
         add_executable(test_dns_message tests/unit/test_dns_message.c)
-        target_link_libraries(test_dns_message doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_dns_message dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_dns_message PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_dns_message)
         add_test(NAME test_dns_message COMMAND test_dns_message)
@@ -133,7 +133,7 @@ if(BUILD_TESTS)
 
         # Unit test: upstream
         add_executable(test_upstream tests/unit/test_upstream.c)
-        target_link_libraries(test_upstream doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_upstream dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_upstream PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_upstream)
         add_test(NAME test_upstream COMMAND test_upstream)
@@ -177,7 +177,7 @@ if(BUILD_TESTS)
         add_executable(test_integration_core tests/integration/test_integration.c)
         target_compile_definitions(test_integration_core PRIVATE INTEGRATION_GROUP_CORE)
         target_compile_options(test_integration_core PRIVATE -Wno-unused-function)
-        target_link_libraries(test_integration_core doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_integration_core dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_integration_core PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_integration_core)
         add_test(NAME test_integration_core COMMAND test_integration_core)
@@ -185,7 +185,7 @@ if(BUILD_TESTS)
         add_executable(test_integration_transport tests/integration/test_integration.c)
         target_compile_definitions(test_integration_transport PRIVATE INTEGRATION_GROUP_TRANSPORT)
         target_compile_options(test_integration_transport PRIVATE -Wno-unused-function)
-        target_link_libraries(test_integration_transport doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_integration_transport dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_integration_transport PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_integration_transport)
         add_test(NAME test_integration_transport COMMAND test_integration_transport)
@@ -193,7 +193,7 @@ if(BUILD_TESTS)
         add_executable(test_integration_runtime tests/integration/test_integration.c)
         target_compile_definitions(test_integration_runtime PRIVATE INTEGRATION_GROUP_RUNTIME)
         target_compile_options(test_integration_runtime PRIVATE -Wno-unused-function)
-        target_link_libraries(test_integration_runtime doh_proxy_lib ${CMOCKA_LIBRARIES})
+        target_link_libraries(test_integration_runtime dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_integration_runtime PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_integration_runtime)
         add_test(NAME test_integration_runtime COMMAND test_integration_runtime)

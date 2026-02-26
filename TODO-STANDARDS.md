@@ -1,6 +1,6 @@
 # Standards Compliance TODO
 
-Remaining items to make `DOH-Proxy` standards-compliant for production use.
+Remaining items to make `dns-encrypted-proxy` standards-compliant for production use.
 
 ## P0 (High Priority)
 
