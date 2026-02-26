@@ -105,6 +105,13 @@ if(BUILD_TESTS)
         target_include_directories(test_cache PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_cache)
         add_test(NAME test_cache COMMAND test_cache)
+
+        # Unit test: cache internals
+        add_executable(test_cache_internal tests/unit/test_cache_internal.c)
+        target_link_libraries(test_cache_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_cache_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_cache_internal)
+        add_test(NAME test_cache_internal COMMAND test_cache_internal)
         
         # Unit test: dns_message
         add_executable(test_dns_message tests/unit/test_dns_message.c)
@@ -113,12 +120,54 @@ if(BUILD_TESTS)
         apply_target_defaults(test_dns_message)
         add_test(NAME test_dns_message COMMAND test_dns_message)
 
+        # Unit test: dns_message internals
+        add_executable(test_dns_message_internal tests/unit/test_dns_message_internal.c)
+        target_link_libraries(test_dns_message_internal ${CMOCKA_LIBRARIES})
+        target_include_directories(test_dns_message_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_dns_message_internal)
+        add_test(NAME test_dns_message_internal COMMAND test_dns_message_internal)
+
         # Unit test: upstream
         add_executable(test_upstream tests/unit/test_upstream.c)
         target_link_libraries(test_upstream doh_proxy_lib ${CMOCKA_LIBRARIES})
         target_include_directories(test_upstream PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_upstream)
         add_test(NAME test_upstream COMMAND test_upstream)
+
+        # Unit test: metrics internals (static helper branch coverage)
+        add_executable(test_metrics_internal tests/unit/test_metrics_internal.c)
+        target_link_libraries(test_metrics_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_metrics_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_metrics_internal)
+        add_test(NAME test_metrics_internal COMMAND test_metrics_internal)
+
+        # Unit test: dns_server internals (static helper branch coverage)
+        add_executable(test_dns_server_internal tests/unit/test_dns_server_internal.c)
+        target_link_libraries(test_dns_server_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_dns_server_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_dns_server_internal)
+        add_test(NAME test_dns_server_internal COMMAND test_dns_server_internal)
+
+        # Unit test: upstream DoH internals (static helper branch coverage)
+        add_executable(test_upstream_doh_internal tests/unit/test_upstream_doh_internal.c)
+        target_link_libraries(test_upstream_doh_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_upstream_doh_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_upstream_doh_internal)
+        add_test(NAME test_upstream_doh_internal COMMAND test_upstream_doh_internal)
+
+        # Unit test: upstream orchestrator internals (static/helper branch coverage)
+        add_executable(test_upstream_internal tests/unit/test_upstream_internal.c)
+        target_link_libraries(test_upstream_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_upstream_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_upstream_internal)
+        add_test(NAME test_upstream_internal COMMAND test_upstream_internal)
+
+        # Unit test: upstream DoT internals (static helper branch coverage)
+        add_executable(test_upstream_dot_internal tests/unit/test_upstream_dot_internal.c)
+        target_link_libraries(test_upstream_dot_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_upstream_dot_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_upstream_dot_internal)
+        add_test(NAME test_upstream_dot_internal COMMAND test_upstream_dot_internal)
         
         # Integration tests (split by functional boundary)
         add_executable(test_integration_core tests/integration/test_integration.c)
@@ -154,7 +203,7 @@ if(BUILD_TESTS)
                     COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --gcov-ignore-parse-errors negative_hits.warn_once_per_file --html-details -o ${CMAKE_BINARY_DIR}/coverage.html
                     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
                     USES_TERMINAL
-                    DEPENDS test_config test_cache test_dns_message test_upstream test_integration_core test_integration_transport test_integration_runtime
+                    DEPENDS test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_upstream_doh_internal test_upstream_internal test_upstream_dot_internal test_integration_core test_integration_transport test_integration_runtime
                     COMMENT "Run tests and generate coverage report")
                 message(STATUS "Coverage target available: cmake --build <build-dir> --target coverage")
             else()

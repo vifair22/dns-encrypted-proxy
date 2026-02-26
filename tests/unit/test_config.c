@@ -286,6 +286,105 @@ static void test_config_print(void **state) {
     }
 }
 
+static void test_config_all_env_overrides_and_empty_tokens(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    setenv("LISTEN_ADDR", "127.0.0.9", 1);
+    setenv("LISTEN_PORT", "1053", 1);
+    setenv("UPSTREAM_TIMEOUT_MS", "4200", 1);
+    setenv("UPSTREAM_POOL_SIZE", "11", 1);
+    setenv("CACHE_CAPACITY", "333", 1);
+    setenv("UPSTREAMS", " ,https://u1.example/dns, , tls://1.1.1.1:853, ", 1);
+    setenv("TCP_IDLE_TIMEOUT_MS", "0", 1);
+    setenv("TCP_MAX_CLIENTS", "9", 1);
+    setenv("TCP_MAX_QUERIES_PER_CONN", "7", 1);
+    setenv("METRICS_PORT", "9191", 1);
+    setenv("METRICS_ENABLED", "0", 1);
+
+    proxy_config_t config;
+    int result = config_load(&config, "/nonexistent/path/config.conf");
+
+    assert_int_equal(result, 0);
+    assert_string_equal(config.listen_addr, "127.0.0.9");
+    assert_int_equal(config.listen_port, 1053);
+    assert_int_equal(config.upstream_timeout_ms, 4200);
+    assert_int_equal(config.upstream_pool_size, 11);
+    assert_int_equal(config.cache_capacity, 333);
+    assert_int_equal(config.upstream_count, 2);
+    assert_string_equal(config.upstream_urls[0], "https://u1.example/dns");
+    assert_string_equal(config.upstream_urls[1], "tls://1.1.1.1:853");
+    assert_int_equal(config.tcp_idle_timeout_ms, 0);
+    assert_int_equal(config.tcp_max_clients, 9);
+    assert_int_equal(config.tcp_max_queries_per_conn, 7);
+    assert_int_equal(config.metrics_port, 9191);
+    assert_int_equal(config.metrics_enabled, 0);
+
+    clear_config_env_vars();
+}
+
+static void test_config_invalid_lines_and_empty_explicit_path(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    const char *config_content =
+        "# missing equals ignored\n"
+        "just_text\n"
+        "=missing_key\n"
+        "missing_value=\n"
+        "unknown_key=123\n"
+        "listen_port = 5301\n"
+        "metrics_enabled = 1\n";
+
+    char *temp_file = create_temp_file(config_content);
+    assert_non_null(temp_file);
+
+    setenv("DOH_PROXY_CONFIG", temp_file, 1);
+
+    proxy_config_t config;
+    int result = config_load(&config, "");
+
+    assert_int_equal(result, 0);
+    assert_string_equal(config.config_path, temp_file);
+    assert_int_equal(config.listen_port, 5301);
+    assert_int_equal(config.metrics_enabled, 1);
+
+    remove_temp_file(temp_file);
+    clear_config_env_vars();
+}
+
+static void test_config_validation_failures_from_env(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    proxy_config_t config;
+
+    setenv("UPSTREAMS", "  ,   , ", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), -1);
+    clear_config_env_vars();
+
+    setenv("UPSTREAM_TIMEOUT_MS", "0", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), -1);
+    clear_config_env_vars();
+
+    setenv("UPSTREAM_POOL_SIZE", "0", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), 0);
+    assert_int_equal(config.upstream_pool_size, 6);
+    clear_config_env_vars();
+
+    setenv("CACHE_CAPACITY", "0", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), 0);
+    assert_int_equal(config.cache_capacity, 1024);
+    clear_config_env_vars();
+
+    setenv("METRICS_PORT", "0", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), -1);
+    clear_config_env_vars();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_config_defaults),
@@ -298,6 +397,9 @@ int main(void) {
         cmocka_unit_test(test_config_validation_invalid_port),
         cmocka_unit_test(test_config_env_config_path),
         cmocka_unit_test(test_config_print),
+        cmocka_unit_test(test_config_all_env_overrides_and_empty_tokens),
+        cmocka_unit_test(test_config_invalid_lines_and_empty_explicit_path),
+        cmocka_unit_test(test_config_validation_failures_from_env),
     };
     
     return cmocka_run_group_tests(tests, NULL, NULL);

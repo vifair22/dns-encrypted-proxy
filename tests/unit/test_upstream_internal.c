@@ -1,0 +1,349 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <setjmp.h>
+#include <cmocka.h>
+
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <pthread.h>
+
+#include "upstream.h"
+
+static int g_mutex_init_fail = 0;
+static uint64_t g_now_ms = 0;
+
+static int g_doh_init_rc = 0;
+static int g_dot_init_rc = 0;
+static int g_doh_resolve_rc = -1;
+static int g_dot_resolve_rc = -1;
+static uint8_t g_resp_buf[16];
+static size_t g_resp_len = 0;
+static int g_doh_destroy_calls = 0;
+static int g_dot_destroy_calls = 0;
+
+static void reset_stubs(void) {
+    g_mutex_init_fail = 0;
+    g_now_ms = 0;
+    g_doh_init_rc = 0;
+    g_dot_init_rc = 0;
+    g_doh_resolve_rc = -1;
+    g_dot_resolve_rc = -1;
+    g_resp_len = 0;
+    g_doh_destroy_calls = 0;
+    g_dot_destroy_calls = 0;
+}
+
+static int upstream_wrap_pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) {
+    (void)mutex;
+    (void)attr;
+    if (g_mutex_init_fail) {
+        return -1;
+    }
+    return 0;
+}
+
+static int upstream_wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
+    (void)mutex;
+    return 0;
+}
+
+static int upstream_wrap_pthread_mutex_unlock(pthread_mutex_t *mutex) {
+    (void)mutex;
+    return 0;
+}
+
+static int upstream_wrap_pthread_mutex_destroy(pthread_mutex_t *mutex) {
+    (void)mutex;
+    return 0;
+}
+
+static int upstream_wrap_clock_gettime(clockid_t clk, struct timespec *ts) {
+    (void)clk;
+    if (ts != NULL) {
+        ts->tv_sec = (time_t)(g_now_ms / 1000);
+        ts->tv_nsec = (long)((g_now_ms % 1000) * 1000000);
+    }
+    return 0;
+}
+
+int upstream_doh_client_init(upstream_doh_client_t **client, const upstream_config_t *config) {
+    (void)config;
+    if (g_doh_init_rc != 0) {
+        return -1;
+    }
+    *client = (upstream_doh_client_t *)(uintptr_t)0x1111;
+    return 0;
+}
+
+void upstream_doh_client_destroy(upstream_doh_client_t *client) {
+    (void)client;
+    g_doh_destroy_calls++;
+}
+
+int upstream_doh_resolve(
+    upstream_doh_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    (void)client;
+    (void)server;
+    (void)timeout_ms;
+    (void)query;
+    (void)query_len;
+    if (g_doh_resolve_rc != 0 || g_resp_len == 0) {
+        return -1;
+    }
+    *response_out = malloc(g_resp_len);
+    assert_non_null(*response_out);
+    memcpy(*response_out, g_resp_buf, g_resp_len);
+    *response_len_out = g_resp_len;
+    return 0;
+}
+
+int upstream_doh_client_get_pool_stats(
+    upstream_doh_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    uint64_t *http2_total_out,
+    uint64_t *http1_total_out,
+    uint64_t *http_other_total_out) {
+    (void)client;
+    if (capacity_out) *capacity_out = 3;
+    if (in_use_out) *in_use_out = 1;
+    if (http2_total_out) *http2_total_out = 7;
+    if (http1_total_out) *http1_total_out = 5;
+    if (http_other_total_out) *http_other_total_out = 2;
+    return 0;
+}
+
+int upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config) {
+    (void)config;
+    if (g_dot_init_rc != 0) {
+        return -1;
+    }
+    *client = (upstream_dot_client_t *)(uintptr_t)0x2222;
+    return 0;
+}
+
+void upstream_dot_client_destroy(upstream_dot_client_t *client) {
+    (void)client;
+    g_dot_destroy_calls++;
+}
+
+int upstream_dot_resolve(
+    upstream_dot_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    (void)client;
+    (void)server;
+    (void)timeout_ms;
+    (void)query;
+    (void)query_len;
+    if (g_dot_resolve_rc != 0 || g_resp_len == 0) {
+        return -1;
+    }
+    *response_out = malloc(g_resp_len);
+    assert_non_null(*response_out);
+    memcpy(*response_out, g_resp_buf, g_resp_len);
+    *response_len_out = g_resp_len;
+    return 0;
+}
+
+int upstream_dot_client_get_pool_stats(
+    upstream_dot_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out) {
+    (void)client;
+    if (capacity_out) *capacity_out = 4;
+    if (in_use_out) *in_use_out = 2;
+    if (alive_out) *alive_out = 1;
+    return 0;
+}
+
+#define pthread_mutex_init upstream_wrap_pthread_mutex_init
+#define pthread_mutex_lock upstream_wrap_pthread_mutex_lock
+#define pthread_mutex_unlock upstream_wrap_pthread_mutex_unlock
+#define pthread_mutex_destroy upstream_wrap_pthread_mutex_destroy
+#define clock_gettime upstream_wrap_clock_gettime
+
+#include "../../src/upstream.c"
+
+#undef clock_gettime
+#undef pthread_mutex_destroy
+#undef pthread_mutex_unlock
+#undef pthread_mutex_lock
+#undef pthread_mutex_init
+
+static void test_upstream_resolve_last_resort_unhealthy(void **state) {
+    (void)state;
+    reset_stubs();
+
+    const char *urls[] = {"https://dns.google/dns-query", "tls://1.1.1.1:853"};
+    upstream_config_t config = {
+        .timeout_ms = 50,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 2, &config), 0);
+
+    g_now_ms = 2000;
+    client.servers[0].health.healthy = 0;
+    client.servers[0].health.last_failure_time = 1500;
+    client.servers[1].health.healthy = 1;
+
+    g_doh_resolve_rc = 0;
+    g_resp_len = 4;
+    g_resp_buf[0] = 1;
+    g_resp_buf[1] = 2;
+    g_resp_buf[2] = 3;
+    g_resp_buf[3] = 4;
+    g_dot_resolve_rc = -1;
+
+    uint8_t q[] = {0xAA};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, &out_len), 0);
+    assert_non_null(out);
+    assert_int_equal((int)out_len, 4);
+    free(out);
+
+    upstream_client_destroy(&client);
+}
+
+static void test_upstream_internal_init_and_switch_edges(void **state) {
+    (void)state;
+    reset_stubs();
+
+    const char *urls[] = {"https://dns.google/dns-query"};
+    upstream_config_t config = {
+        .timeout_ms = 50,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+
+    upstream_client_t client;
+    g_mutex_init_fail = 1;
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), -1);
+
+    reset_stubs();
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), 0);
+
+    upstream_server_t bad_server;
+    memset(&bad_server, 0, sizeof(bad_server));
+    bad_server.type = (upstream_type_t)99;
+
+    uint8_t q[] = {0x01};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+
+    bad_server.type = UPSTREAM_TYPE_DOH;
+    g_doh_init_rc = -1;
+    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+
+    bad_server.type = UPSTREAM_TYPE_DOT;
+    g_dot_init_rc = -1;
+    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+
+    upstream_client_destroy(&client);
+}
+
+static void test_upstream_parse_and_stats_edges(void **state) {
+    (void)state;
+    reset_stubs();
+
+    char long_url[400];
+    memset(long_url, 'a', sizeof(long_url));
+    long_url[0] = '\0';
+    strcat(long_url, "https://");
+    for (int i = 0; i < 300; i++) {
+        strcat(long_url, "a");
+    }
+    strcat(long_url, "/dns-query");
+
+    upstream_server_t server;
+    assert_int_equal(upstream_parse_url(long_url, &server), -1);
+    assert_int_equal(upstream_parse_url("tls://", &server), -1);
+
+    upstream_runtime_stats_t stats;
+    assert_int_equal(upstream_get_runtime_stats(NULL, NULL), -1);
+
+    upstream_client_t client;
+    memset(&client, 0, sizeof(client));
+    client.doh_client = (upstream_doh_client_t *)(uintptr_t)0x1111;
+    client.dot_client = (upstream_dot_client_t *)(uintptr_t)0x2222;
+    assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+    assert_int_equal(stats.doh_pool_capacity, 3);
+    assert_int_equal(stats.dot_pool_capacity, 4);
+}
+
+static void test_upstream_guard_and_limit_edges(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t cfg = {
+        .timeout_ms = 50,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+
+    upstream_server_record_success(NULL);
+
+    upstream_server_t s;
+    memset(&s, 0, sizeof(s));
+    upstream_server_record_failure(NULL, &cfg);
+    upstream_server_record_failure(&s, NULL);
+
+    const char *one[] = {"https://dns.google/dns-query"};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(NULL, one, 1, &cfg), -1);
+    assert_int_equal(upstream_client_init(&client, NULL, 1, &cfg), -1);
+    assert_int_equal(upstream_client_init(&client, one, 0, &cfg), -1);
+    assert_int_equal(upstream_client_init(&client, one, 1, NULL), -1);
+
+    const char *many[UPSTREAM_MAX_SERVERS + 4];
+    for (size_t i = 0; i < sizeof(many) / sizeof(many[0]); i++) {
+        many[i] = "https://dns.google/dns-query";
+    }
+    assert_int_equal(upstream_client_init(&client, many, (int)(sizeof(many) / sizeof(many[0])), &cfg), 0);
+    assert_int_equal(client.server_count, UPSTREAM_MAX_SERVERS);
+
+    uint8_t q[] = {0x01};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(upstream_resolve(NULL, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(upstream_resolve(&client, NULL, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(upstream_resolve(&client, q, 0, &out, &out_len), -1);
+    assert_int_equal(upstream_resolve(&client, q, sizeof(q), NULL, &out_len), -1);
+    assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, NULL), -1);
+
+    upstream_client_destroy(NULL);
+    upstream_client_destroy(&client);
+}
+
+int main(void) {
+    const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_upstream_resolve_last_resort_unhealthy),
+        cmocka_unit_test(test_upstream_internal_init_and_switch_edges),
+        cmocka_unit_test(test_upstream_parse_and_stats_edges),
+        cmocka_unit_test(test_upstream_guard_and_limit_edges),
+    };
+
+    return cmocka_run_group_tests(tests, NULL, NULL);
+}

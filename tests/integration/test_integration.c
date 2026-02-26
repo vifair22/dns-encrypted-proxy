@@ -61,6 +61,9 @@ typedef struct {
     int done;
     int port;
     int result;
+
+    int dot_close_before_length;
+    size_t dot_partial_response_bytes;
 } mock_tls_server_t;
 
 static int ssl_write_all(SSL *ssl, const uint8_t *data, size_t len) {
@@ -143,6 +146,11 @@ static int mock_handle_dot(SSL *ssl, const mock_tls_server_t *server) {
         goto done;
     }
 
+    if (server->dot_close_before_length) {
+        result = 0;
+        goto done;
+    }
+
     if (server->response_len > 65535) {
         result = -1;
         goto done;
@@ -152,8 +160,19 @@ static int mock_handle_dot(SSL *ssl, const mock_tls_server_t *server) {
     resp_len[0] = (uint8_t)((server->response_len >> 8) & 0xFFu);
     resp_len[1] = (uint8_t)(server->response_len & 0xFFu);
 
-    if (ssl_write_all(ssl, resp_len, sizeof(resp_len)) != 0 ||
-        ssl_write_all(ssl, server->response, server->response_len) != 0) {
+    if (ssl_write_all(ssl, resp_len, sizeof(resp_len)) != 0) {
+        result = -1;
+        goto done;
+    }
+
+    if (server->dot_partial_response_bytes > 0 && server->dot_partial_response_bytes < server->response_len) {
+        if (ssl_write_all(ssl, server->response, server->dot_partial_response_bytes) != 0) {
+            result = -1;
+        }
+        goto done;
+    }
+
+    if (ssl_write_all(ssl, server->response, server->response_len) != 0) {
         result = -1;
     }
 
@@ -1329,6 +1348,210 @@ static void test_upstream_transport_dot_unreachable(void **state) {
 }
 
 /*
+ * Test: DoT transport rejects zero-length framed responses
+ */
+static void test_upstream_transport_dot_zero_length_response(void **state) {
+    (void)state;
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    uint8_t dummy = 0;
+    mock_tls_server_t server;
+    assert_int_equal(mock_tls_server_start(&server, MOCK_TLS_MODE_DOT, cert_path, key_path), 0);
+    server.expected_query = DNS_QUERY_WWW_EXAMPLE_COM_A;
+    server.expected_query_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    server.response = &dummy;
+    server.response_len = 0;
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "tls://127.0.0.1:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    mock_tls_server_join_and_destroy(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoT transport rejects malformed response content after read
+ */
+static void test_upstream_transport_dot_malformed_response(void **state) {
+    (void)state;
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    static const uint8_t malformed[] = {0x12, 0x34, 0x56};
+    mock_tls_server_t server;
+    assert_int_equal(mock_tls_server_start(&server, MOCK_TLS_MODE_DOT, cert_path, key_path), 0);
+    server.expected_query = DNS_QUERY_WWW_EXAMPLE_COM_A;
+    server.expected_query_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    server.response = malformed;
+    server.response_len = sizeof(malformed);
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "tls://127.0.0.1:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    mock_tls_server_join_and_destroy(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoT transport fails when server closes before sending response length
+ */
+static void test_upstream_transport_dot_close_before_length(void **state) {
+    (void)state;
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    mock_tls_server_t server;
+    assert_int_equal(mock_tls_server_start(&server, MOCK_TLS_MODE_DOT, cert_path, key_path), 0);
+    server.expected_query = DNS_QUERY_WWW_EXAMPLE_COM_A;
+    server.expected_query_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    server.dot_close_before_length = 1;
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "tls://127.0.0.1:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    mock_tls_server_join_and_destroy(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoT transport fails when response body is shorter than announced length
+ */
+static void test_upstream_transport_dot_partial_body(void **state) {
+    (void)state;
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    mock_tls_server_t server;
+    assert_int_equal(mock_tls_server_start(&server, MOCK_TLS_MODE_DOT, cert_path, key_path), 0);
+    server.expected_query = DNS_QUERY_WWW_EXAMPLE_COM_A;
+    server.expected_query_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    server.response = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    server.response_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    server.dot_partial_response_bytes = 4;
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "tls://127.0.0.1:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    mock_tls_server_join_and_destroy(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
  * Test: DoH runtime stats record HTTP/1 responses when forced via test env
  */
 static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
@@ -2341,6 +2564,185 @@ static void test_dns_server_udp_truncation_path(void **state) {
     unsetenv("CURL_CA_BUNDLE");
 }
 
+/*
+ * Test: TCP idle timeout closes silent client connection
+ */
+static void test_dns_server_tcp_idle_timeout_close(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.tcp_max_clients = 2;
+    config.tcp_idle_timeout_ms = 120;
+    config.tcp_max_queries_per_conn = 0;
+    config.upstream_timeout_ms = 150;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    int fd = open_tcp_connection_local(config.listen_port);
+    assert_true(fd >= 0);
+
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct timespec idle_wait = {.tv_sec = 0, .tv_nsec = 300 * 1000 * 1000};
+    nanosleep(&idle_wait, NULL);
+
+    uint8_t b = 0;
+    ssize_t n = recv(fd, &b, 1, 0);
+    assert_int_equal(n, 0);
+    close(fd);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.tcp_connections_total) >= 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.tcp_connections_active), 0);
+
+    proxy_server_destroy(&server);
+}
+
+/*
+ * Test: EDNS query keeps oversized UDP response untruncated (no TC)
+ */
+static void test_dns_server_udp_edns_no_truncation(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    const size_t answer_count = 40;
+    const size_t question_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN - 12;
+    const size_t answer_len = 16;
+    size_t large_len = 12 + question_len + (answer_count * answer_len);
+    uint8_t *large_response = calloc(1, large_len);
+    assert_non_null(large_response);
+
+    large_response[0] = 0x12;
+    large_response[1] = 0x34;
+    large_response[2] = 0x81;
+    large_response[3] = 0x80;
+    large_response[4] = 0x00;
+    large_response[5] = 0x01;
+    large_response[6] = (uint8_t)((answer_count >> 8) & 0xFFu);
+    large_response[7] = (uint8_t)(answer_count & 0xFFu);
+    large_response[8] = 0x00;
+    large_response[9] = 0x00;
+    large_response[10] = 0x00;
+    large_response[11] = 0x00;
+
+    memcpy(large_response + 12, DNS_QUERY_WWW_EXAMPLE_COM_A + 12, question_len);
+    size_t off = 12 + question_len;
+    for (size_t i = 0; i < answer_count; i++) {
+        large_response[off + 0] = 0xC0;
+        large_response[off + 1] = 0x0C;
+        large_response[off + 2] = 0x00;
+        large_response[off + 3] = 0x01;
+        large_response[off + 4] = 0x00;
+        large_response[off + 5] = 0x01;
+        large_response[off + 6] = 0x00;
+        large_response[off + 7] = 0x00;
+        large_response[off + 8] = 0x01;
+        large_response[off + 9] = 0x2C;
+        large_response[off + 10] = 0x00;
+        large_response[off + 11] = 0x04;
+        large_response[off + 12] = 0x5D;
+        large_response[off + 13] = 0xB8;
+        large_response[off + 14] = 0xD8;
+        large_response[off + 15] = (uint8_t)(0x22u + (i & 0x0Fu));
+        off += answer_len;
+    }
+
+    python_doh_server_t doh_server;
+    assert_int_equal(
+        start_python_doh_server(
+            &doh_server,
+            cert_path,
+            key_path,
+            large_response,
+            large_len),
+        0);
+    free(large_response);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DOH_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DOH_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.upstream_timeout_ms = 1000;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://localhost:%d/dns-query", doh_server.port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    uint8_t resp[4096];
+    size_t resp_len = 0;
+    assert_int_equal(
+        send_udp_query_and_recv(
+            config.listen_port,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            resp,
+            &resp_len),
+        0);
+
+    assert_true(resp_len > 512);
+    uint16_t flags = (uint16_t)(((uint16_t)resp[2] << 8) | (uint16_t)resp[3]);
+    assert_true((flags & 0x0200u) == 0);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.truncated_sent), 0);
+
+    proxy_server_destroy(&server);
+    stop_python_doh_server(&doh_server);
+    unsetenv("DOH_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DOH_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -2364,6 +2766,10 @@ int main(void) {
         cmocka_unit_test(test_upstream_transport_doh_http1_runtime_stats),
         cmocka_unit_test(test_upstream_transport_dot),
         cmocka_unit_test(test_upstream_transport_dot_unreachable),
+        cmocka_unit_test(test_upstream_transport_dot_zero_length_response),
+        cmocka_unit_test(test_upstream_transport_dot_malformed_response),
+        cmocka_unit_test(test_upstream_transport_dot_close_before_length),
+        cmocka_unit_test(test_upstream_transport_dot_partial_body),
         cmocka_unit_test(test_upstream_transport_failover_doh_to_dot),
         cmocka_unit_test(test_metrics_endpoint_with_upstream_labels),
     };
@@ -2385,6 +2791,8 @@ int main(void) {
         cmocka_unit_test(test_dns_server_tcp_zero_length_frame_ignored),
         cmocka_unit_test(test_dns_server_tcp_partial_frame_close),
         cmocka_unit_test(test_dns_server_udp_truncation_path),
+        cmocka_unit_test(test_dns_server_tcp_idle_timeout_close),
+        cmocka_unit_test(test_dns_server_udp_edns_no_truncation),
     };
 #else
 #error "Define one integration group macro"

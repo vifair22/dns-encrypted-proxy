@@ -7,8 +7,44 @@
 #include <cmocka.h>
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "upstream.h"
+
+/* Protocol-specific functions under test (implemented in upstream_doh.c/upstream_dot.c) */
+int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
+void upstream_doh_client_destroy(upstream_doh_client_t *client);
+int upstream_doh_resolve(
+    upstream_doh_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out);
+int upstream_doh_client_get_pool_stats(
+    upstream_doh_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    uint64_t *http2_total_out,
+    uint64_t *http1_total_out,
+    uint64_t *http_other_total_out);
+
+int upstream_dot_client_init(upstream_dot_client_t **client_out, const upstream_config_t *config);
+void upstream_dot_client_destroy(upstream_dot_client_t *client);
+int upstream_dot_resolve(
+    upstream_dot_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out);
+int upstream_dot_client_get_pool_stats(
+    upstream_dot_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out);
 
 static void test_parse_https_default_port(void **state) {
     (void)state;
@@ -251,6 +287,142 @@ static void test_runtime_stats_api_guards_and_basics(void **state) {
     upstream_client_destroy(&client);
 }
 
+static void test_doh_protocol_guard_paths(void **state) {
+    (void)state;
+
+    upstream_config_t config = {
+        .timeout_ms = 100,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), 0);
+    assert_non_null(client);
+
+    upstream_server_t server;
+    memset(&server, 0, sizeof(server));
+    server.type = UPSTREAM_TYPE_DOT;
+    strcpy(server.url, "tls://1.1.1.1:853");
+
+    uint8_t query[] = {0x00};
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+
+    assert_int_equal(upstream_doh_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+
+    int cap = 1;
+    int in_use = 1;
+    uint64_t h2 = 1, h1 = 1, other = 1;
+    assert_int_equal(upstream_doh_client_get_pool_stats(NULL, &cap, &in_use, &h2, &h1, &other), -1);
+    assert_int_equal(cap, 0);
+    assert_int_equal(in_use, 0);
+    assert_int_equal(h2, 0);
+    assert_int_equal(h1, 0);
+    assert_int_equal(other, 0);
+
+    upstream_doh_client_destroy(client);
+}
+
+static void test_dot_protocol_guard_paths(void **state) {
+    (void)state;
+
+    upstream_config_t config = {
+        .timeout_ms = 100,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_dot_client_t *client = NULL;
+    assert_int_equal(upstream_dot_client_init(&client, &config), 0);
+    assert_non_null(client);
+
+    upstream_server_t server;
+    memset(&server, 0, sizeof(server));
+    server.type = UPSTREAM_TYPE_DOH;
+    strcpy(server.host, "127.0.0.1");
+    server.port = 443;
+
+    uint8_t query[4] = {0, 1, 2, 3};
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+
+    assert_int_equal(upstream_dot_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+
+    server.type = UPSTREAM_TYPE_DOT;
+    server.port = 853;
+    size_t oversized_len = 65534; /* > DOT_MAX_MESSAGE_SIZE - 2 */
+    uint8_t *oversized_query = malloc(oversized_len);
+    assert_non_null(oversized_query);
+    memset(oversized_query, 0xAB, oversized_len);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, oversized_query, oversized_len, &resp, &resp_len), -1);
+    free(oversized_query);
+
+    int cap = 1;
+    int in_use = 1;
+    int alive = 1;
+    assert_int_equal(upstream_dot_client_get_pool_stats(NULL, &cap, &in_use, &alive), -1);
+    assert_int_equal(cap, 0);
+    assert_int_equal(in_use, 0);
+    assert_int_equal(alive, 0);
+
+    upstream_dot_client_destroy(client);
+}
+
+static void test_protocol_client_init_and_destroy_guards(void **state) {
+    (void)state;
+
+    upstream_config_t config = {
+        .timeout_ms = 100,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+
+    upstream_doh_client_t *doh_client = NULL;
+    upstream_dot_client_t *dot_client = NULL;
+
+    assert_int_equal(upstream_doh_client_init(NULL, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&doh_client, NULL), -1);
+    assert_int_equal(upstream_dot_client_init(NULL, &config), -1);
+    assert_int_equal(upstream_dot_client_init(&dot_client, NULL), -1);
+
+    assert_int_equal(upstream_doh_client_init(&doh_client, &config), 0);
+    assert_int_equal(upstream_dot_client_init(&dot_client, &config), 0);
+
+    int cap = 0;
+    int in_use = 0;
+    int alive = 0;
+    uint64_t h2 = 0, h1 = 0, other = 0;
+
+    assert_int_equal(upstream_doh_client_get_pool_stats(doh_client, &cap, &in_use, &h2, &h1, &other), 0);
+    assert_true(cap >= 1);
+    assert_int_equal(in_use, 0);
+
+    assert_int_equal(upstream_dot_client_get_pool_stats(dot_client, &cap, &in_use, &alive), 0);
+    assert_true(cap >= 1);
+    assert_int_equal(in_use, 0);
+    assert_int_equal(alive, 0);
+
+    upstream_doh_client_destroy(doh_client);
+    upstream_dot_client_destroy(dot_client);
+
+    upstream_doh_client_destroy(NULL);
+    upstream_dot_client_destroy(NULL);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_parse_https_default_port),
@@ -268,6 +440,9 @@ int main(void) {
         cmocka_unit_test(test_record_success_resets_failures),
         cmocka_unit_test(test_should_skip_null_inputs),
         cmocka_unit_test(test_runtime_stats_api_guards_and_basics),
+        cmocka_unit_test(test_doh_protocol_guard_paths),
+        cmocka_unit_test(test_dot_protocol_guard_paths),
+        cmocka_unit_test(test_protocol_client_init_and_destroy_guards),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
