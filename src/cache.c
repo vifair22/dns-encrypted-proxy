@@ -369,6 +369,7 @@ int dns_cache_lookup(
     uint8_t **response_out,
     size_t *response_len_out) {
     if (cache == NULL || key == NULL || key_len == 0 || response_out == NULL || response_len_out == NULL ||
+        request_id == NULL ||
         cache->shards == NULL || cache->shard_count == 0) {
         return 0;
     }
@@ -433,8 +434,10 @@ int dns_cache_lookup(
 
     pthread_mutex_unlock(&shard->mutex);
 
-    copy[0] = request_id[0];
-    copy[1] = request_id[1];
+    if (response_len >= 2) {
+        copy[0] = request_id[0];
+        copy[1] = request_id[1];
+    }
     dns_adjust_response_ttls(copy, response_len, age);
 
     *response_out = copy;
