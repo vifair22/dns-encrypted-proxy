@@ -18,23 +18,29 @@ static uint64_t g_now_ms = 0;
 
 static int g_doh_init_rc = 0;
 static int g_dot_init_rc = 0;
+static int g_doq_init_rc = 0;
 static int g_doh_resolve_rc = -1;
 static int g_dot_resolve_rc = -1;
+static int g_doq_resolve_rc = -1;
 static uint8_t g_resp_buf[16];
 static size_t g_resp_len = 0;
 static int g_doh_destroy_calls = 0;
 static int g_dot_destroy_calls = 0;
+static int g_doq_destroy_calls = 0;
 
 static void reset_stubs(void) {
     g_mutex_init_fail = 0;
     g_now_ms = 0;
     g_doh_init_rc = 0;
     g_dot_init_rc = 0;
+    g_doq_init_rc = 0;
     g_doh_resolve_rc = -1;
     g_dot_resolve_rc = -1;
+    g_doq_resolve_rc = -1;
     g_resp_len = 0;
     g_doh_destroy_calls = 0;
     g_dot_destroy_calls = 0;
+    g_doq_destroy_calls = 0;
 }
 
 static int upstream_wrap_pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr) {
@@ -172,6 +178,55 @@ int upstream_dot_client_get_pool_stats(
     return 0;
 }
 
+int upstream_doq_client_init(upstream_doq_client_t **client, const upstream_config_t *config) {
+    (void)config;
+    if (g_doq_init_rc != 0) {
+        return -1;
+    }
+    *client = (upstream_doq_client_t *)(uintptr_t)0x3333;
+    return 0;
+}
+
+void upstream_doq_client_destroy(upstream_doq_client_t *client) {
+    (void)client;
+    g_doq_destroy_calls++;
+}
+
+int upstream_doq_resolve(
+    upstream_doq_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    (void)client;
+    (void)server;
+    (void)timeout_ms;
+    (void)query;
+    (void)query_len;
+    if (g_doq_resolve_rc != 0 || g_resp_len == 0) {
+        return -1;
+    }
+    *response_out = malloc(g_resp_len);
+    assert_non_null(*response_out);
+    memcpy(*response_out, g_resp_buf, g_resp_len);
+    *response_len_out = g_resp_len;
+    return 0;
+}
+
+int upstream_doq_client_get_pool_stats(
+    upstream_doq_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out) {
+    (void)client;
+    if (capacity_out) *capacity_out = 5;
+    if (in_use_out) *in_use_out = 3;
+    if (alive_out) *alive_out = 2;
+    return 0;
+}
+
 #define pthread_mutex_init upstream_wrap_pthread_mutex_init
 #define pthread_mutex_lock upstream_wrap_pthread_mutex_lock
 #define pthread_mutex_unlock upstream_wrap_pthread_mutex_unlock
@@ -287,9 +342,17 @@ static void test_upstream_parse_and_stats_edges(void **state) {
     memset(&client, 0, sizeof(client));
     client.doh_client = (upstream_doh_client_t *)(uintptr_t)0x1111;
     client.dot_client = (upstream_dot_client_t *)(uintptr_t)0x2222;
+#if UPSTREAM_DOQ_ENABLED
+    client.doq_client = (upstream_doq_client_t *)(uintptr_t)0x3333;
+#endif
     assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
     assert_int_equal(stats.doh_pool_capacity, 3);
     assert_int_equal(stats.dot_pool_capacity, 4);
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(stats.doq_pool_capacity, 5);
+#else
+    assert_int_equal(stats.doq_pool_capacity, 0);
+#endif
 }
 
 static void test_upstream_guard_and_limit_edges(void **state) {

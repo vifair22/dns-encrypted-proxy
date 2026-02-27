@@ -507,6 +507,70 @@ static void test_cache_new_branch_paths(void **state) {
     unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
 }
 
+static void test_cache_expired_lookup_in_collision_bucket_keeps_chain_valid(void **state) {
+    (void)state;
+    reset_alloc_stubs();
+
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
+
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 64), 0);
+
+    cache_shard_t *shard = &cache.shards[0];
+    uint8_t k1[2] = {0};
+    uint8_t k2[2] = {0};
+    int found = 0;
+    for (uint32_t i = 0; i < 65536 && !found; i++) {
+        uint8_t a[2] = {(uint8_t)(i & 0xFFu), (uint8_t)((i >> 8) & 0xFFu)};
+        uint64_t ha = hash_key(a, 2);
+        size_t ia = fast_index(ha, shard->bucket_count, shard->bucket_mask);
+        for (uint32_t j = i + 1; j < 65536; j++) {
+            uint8_t b[2] = {(uint8_t)(j & 0xFFu), (uint8_t)((j >> 8) & 0xFFu)};
+            uint64_t hb = hash_key(b, 2);
+            size_t ib = fast_index(hb, shard->bucket_count, shard->bucket_mask);
+            if (ia == ib) {
+                memcpy(k1, a, 2);
+                memcpy(k2, b, 2);
+                found = 1;
+                break;
+            }
+        }
+    }
+    assert_int_equal(found, 1);
+
+    const uint8_t resp1[4] = {0x12, 0x34, 0x81, 0x80};
+    const uint8_t resp2[4] = {0xAB, 0xCD, 0x81, 0x80};
+    const uint8_t req_id[2] = {0xAA, 0x55};
+
+    g_now_time = 100;
+    dns_cache_store(&cache, k1, 2, resp1, sizeof(resp1), 1);   /* expires at 101 */
+    dns_cache_store(&cache, k2, 2, resp2, sizeof(resp2), 60);  /* live, same bucket */
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+
+    g_now_time = 105;
+    assert_int_equal(dns_cache_lookup(&cache, k1, 2, req_id, &out, &out_len), 0);
+
+    g_now_time = 106;
+    assert_int_equal(dns_cache_lookup(&cache, k2, 2, req_id, &out, &out_len), 1);
+    assert_non_null(out);
+    free(out);
+
+    uint64_t hk2 = hash_key(k2, 2);
+    size_t bi = fast_index(hk2, shard->bucket_count, shard->bucket_mask);
+    cache_entry_t *it = shard->buckets[bi];
+    int steps = 0;
+    while (it != NULL && steps < 8) {
+        steps++;
+        it = it->bucket_next;
+    }
+    assert_true(steps < 8);
+
+    dns_cache_destroy(&cache);
+    unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_cache_static_guard_paths),
@@ -518,6 +582,7 @@ int main(void) {
         cmocka_unit_test(test_cache_doorkeeper_drop_path),
         cmocka_unit_test(test_cache_new_helpers_and_single_thread_mode),
         cmocka_unit_test(test_cache_new_branch_paths),
+        cmocka_unit_test(test_cache_expired_lookup_in_collision_bucket_keeps_chain_valid),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

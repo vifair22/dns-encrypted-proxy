@@ -1,7 +1,6 @@
-build/
+build*/
 *.o
 *.obj
 *.exe
 cmake-build-debug/
 .idea
-build-coverage

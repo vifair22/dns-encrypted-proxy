@@ -18,7 +18,7 @@ test:
   script:
     - mkdir -p build
     - cd build
-    - cmake -DBUILD_TESTS=ON -DWARNINGS_AS_ERRORS=ON ..
+    - cmake -DBUILD_TESTS=ON -DWARNINGS_AS_ERRORS=ON -DENABLE_UPSTREAM_DOH=ON -DENABLE_UPSTREAM_DOT=ON -DENABLE_UPSTREAM_DOQ=ON ..
     - cmake --build . -j
     - ctest --output-on-failure
   artifacts:

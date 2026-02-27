@@ -3,11 +3,13 @@
 #include "upstream.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 /* Forward declarations for protocol-specific functions */
+#if UPSTREAM_DOH_ENABLED
 int upstream_doh_client_init(upstream_doh_client_t **client, const upstream_config_t *config);
 void upstream_doh_client_destroy(upstream_doh_client_t *client);
 int upstream_doh_resolve(
@@ -25,7 +27,9 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out);
+#endif
 
+#if UPSTREAM_DOT_ENABLED
 int upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config);
 void upstream_dot_client_destroy(upstream_dot_client_t *client);
 int upstream_dot_resolve(
@@ -41,11 +45,112 @@ int upstream_dot_client_get_pool_stats(
     int *capacity_out,
     int *in_use_out,
     int *alive_out);
+#endif
+
+#if UPSTREAM_DOQ_ENABLED
+int upstream_doq_client_init(upstream_doq_client_t **client, const upstream_config_t *config);
+void upstream_doq_client_destroy(upstream_doq_client_t *client);
+int upstream_doq_resolve(
+    upstream_doq_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out);
+int upstream_doq_client_get_pool_stats(
+    upstream_doq_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out);
+#endif
 
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static int parse_port_strict(const char *port_text, int *port_out) {
+    if (port_text == NULL || port_out == NULL || *port_text == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    char *endptr = NULL;
+    long value = strtol(port_text, &endptr, 10);
+    if (errno != 0 || endptr == NULL || *endptr != '\0') {
+        return -1;
+    }
+    if (value <= 0 || value > 65535) {
+        return -1;
+    }
+
+    *port_out = (int)value;
+    return 0;
+}
+
+static int parse_authority_host_port(
+    const char *authority,
+    char *host_out,
+    size_t host_out_len,
+    int default_port,
+    int *port_out) {
+    if (authority == NULL || host_out == NULL || host_out_len == 0 || port_out == NULL) {
+        return -1;
+    }
+    if (*authority == '\0') {
+        return -1;
+    }
+
+    /* DoT/DoQ authority is host[:port] only; paths/fragments are invalid. */
+    if (strpbrk(authority, "/?#") != NULL) {
+        return -1;
+    }
+
+    const char *host_start = authority;
+    const char *host_end = NULL;
+    const char *port_text = NULL;
+
+    if (authority[0] == '[') {
+        const char *close_bracket = strchr(authority + 1, ']');
+        if (close_bracket == NULL) {
+            return -1;
+        }
+        host_start = authority + 1;
+        host_end = close_bracket;
+        if (close_bracket[1] == ':') {
+            port_text = close_bracket + 2;
+        } else if (close_bracket[1] != '\0') {
+            return -1;
+        }
+    } else {
+        const char *colon = strchr(authority, ':');
+        if (colon != NULL) {
+            if (strchr(colon + 1, ':') != NULL) {
+                return -1;
+            }
+            host_end = colon;
+            port_text = colon + 1;
+        } else {
+            host_end = authority + strlen(authority);
+        }
+    }
+
+    size_t host_len = (size_t)(host_end - host_start);
+    if (host_len == 0 || host_len >= host_out_len) {
+        return -1;
+    }
+
+    memcpy(host_out, host_start, host_len);
+    host_out[host_len] = '\0';
+    *port_out = default_port;
+
+    if (port_text != NULL && parse_port_strict(port_text, port_out) != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 int upstream_parse_url(const char *url, upstream_server_t *server_out) {
@@ -61,6 +166,7 @@ int upstream_parse_url(const char *url, upstream_server_t *server_out) {
      * avoids silently treating unknown schemes as valid upstreams.
      */
     /* Check for https:// (DoH) */
+#if UPSTREAM_DOH_ENABLED
     if (strncmp(url, "https://", 8) == 0) {
         server_out->type = UPSTREAM_TYPE_DOH;
         strncpy(server_out->url, url, UPSTREAM_MAX_URL_LEN - 1);
@@ -93,39 +199,49 @@ int upstream_parse_url(const char *url, upstream_server_t *server_out) {
         server_out->health.healthy = 1;
         return 0;
     }
+#endif
     
     /* Check for tls:// (DoT) */
+#if UPSTREAM_DOT_ENABLED
     if (strncmp(url, "tls://", 6) == 0) {
         server_out->type = UPSTREAM_TYPE_DOT;
         strncpy(server_out->url, url, UPSTREAM_MAX_URL_LEN - 1);
         server_out->url[UPSTREAM_MAX_URL_LEN - 1] = '\0';
-        
-        /* Parse host:port */
-        const char *host_start = url + 6;
-        const char *colon = strchr(host_start, ':');
-        const char *host_end = colon ? colon : (host_start + strlen(host_start));
-        
-        size_t host_len = (size_t)(host_end - host_start);
-        if (host_len == 0 || host_len >= sizeof(server_out->host)) {
+        if (parse_authority_host_port(
+                url + 6,
+                server_out->host,
+                sizeof(server_out->host),
+                853,
+                &server_out->port)
+            != 0) {
             return -1;
-        }
-        
-        memcpy(server_out->host, host_start, host_len);
-        server_out->host[host_len] = '\0';
-        
-        /* Default DoT port is 853 */
-        server_out->port = 853;
-        
-        if (colon != NULL) {
-            server_out->port = atoi(colon + 1);
-            if (server_out->port <= 0 || server_out->port > 65535) {
-                return -1;
-            }
         }
         
         server_out->health.healthy = 1;
         return 0;
     }
+#endif
+
+#if UPSTREAM_DOQ_ENABLED
+    if (strncmp(url, "quic://", 7) == 0) {
+        const char *host_start = url + 7;
+        server_out->type = UPSTREAM_TYPE_DOQ;
+        strncpy(server_out->url, url, UPSTREAM_MAX_URL_LEN - 1);
+        server_out->url[UPSTREAM_MAX_URL_LEN - 1] = '\0';
+        if (parse_authority_host_port(
+                host_start,
+                server_out->host,
+                sizeof(server_out->host),
+                853,
+                &server_out->port)
+            != 0) {
+            return -1;
+        }
+
+        server_out->health.healthy = 1;
+        return 0;
+    }
+#endif
     
     /* Unknown scheme */
     return -1;
@@ -228,12 +344,13 @@ int upstream_client_init(
     }
     
     /*
-     * Lazily initialize DoH/DoT clients so startup remains lightweight when a
+     * Lazily initialize DoH/DoT/DoQ clients so startup remains lightweight when a
      * protocol is configured but never selected on the active path.
      */
     /* Initialize protocol-specific clients lazily on first use */
     client->doh_client = NULL;
     client->dot_client = NULL;
+    client->doq_client = NULL;
     
     return 0;
 }
@@ -243,31 +360,54 @@ void upstream_client_destroy(upstream_client_t *client) {
         return;
     }
     
+#if UPSTREAM_DOH_ENABLED
     if (client->doh_client != NULL) {
         upstream_doh_client_destroy(client->doh_client);
     }
-    
+#endif
+
+#if UPSTREAM_DOT_ENABLED
     if (client->dot_client != NULL) {
         upstream_dot_client_destroy(client->dot_client);
     }
+#endif
+
+#if UPSTREAM_DOQ_ENABLED
+    if (client->doq_client != NULL) {
+        upstream_doq_client_destroy(client->doq_client);
+    }
+#endif
     
     pthread_mutex_destroy(&client->rr_mutex);
     memset(client, 0, sizeof(*client));
 }
 
+#if UPSTREAM_DOH_ENABLED
 static int ensure_doh_client(upstream_client_t *client) {
     if (client->doh_client != NULL) {
         return 0;
     }
     return upstream_doh_client_init(&client->doh_client, &client->config);
 }
+#endif
 
+#if UPSTREAM_DOT_ENABLED
 static int ensure_dot_client(upstream_client_t *client) {
     if (client->dot_client != NULL) {
         return 0;
     }
     return upstream_dot_client_init(&client->dot_client, &client->config);
 }
+#endif
+
+#if UPSTREAM_DOQ_ENABLED
+static int ensure_doq_client(upstream_client_t *client) {
+    if (client->doq_client != NULL) {
+        return 0;
+    }
+    return upstream_doq_client_init(&client->doq_client, &client->config);
+}
+#endif
 
 static int resolve_with_server(
     upstream_client_t *client,
@@ -282,6 +422,7 @@ static int resolve_with_server(
     /* Central protocol dispatch keeps upstream selection policy transport-agnostic. */
     switch (server->type) {
         case UPSTREAM_TYPE_DOH:
+#if UPSTREAM_DOH_ENABLED
             if (ensure_doh_client(client) != 0) {
                 return -1;
             }
@@ -292,8 +433,12 @@ static int resolve_with_server(
                 query, query_len,
                 response_out, response_len_out);
             break;
+#else
+            return -1;
+#endif
             
         case UPSTREAM_TYPE_DOT:
+#if UPSTREAM_DOT_ENABLED
             if (ensure_dot_client(client) != 0) {
                 return -1;
             }
@@ -304,6 +449,27 @@ static int resolve_with_server(
                 query, query_len,
                 response_out, response_len_out);
             break;
+#else
+            return -1;
+#endif
+
+        case UPSTREAM_TYPE_DOQ:
+#if UPSTREAM_DOQ_ENABLED
+            if (ensure_doq_client(client) != 0) {
+                return -1;
+            }
+            result = upstream_doq_resolve(
+                client->doq_client,
+                server,
+                client->config.timeout_ms,
+                query,
+                query_len,
+                response_out,
+                response_len_out);
+            break;
+#else
+            return -1;
+#endif
     }
     
     return result;
@@ -400,6 +566,7 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
         return -1;
     }
 
+#if UPSTREAM_DOH_ENABLED
     if (client->doh_client != NULL) {
         (void)upstream_doh_client_get_pool_stats(
             client->doh_client,
@@ -409,7 +576,9 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             &stats_out->doh_http1_responses_total,
             &stats_out->doh_http_other_responses_total);
     }
+#endif
 
+#if UPSTREAM_DOT_ENABLED
     if (client->dot_client != NULL) {
         (void)upstream_dot_client_get_pool_stats(
             client->dot_client,
@@ -417,6 +586,17 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             &stats_out->dot_pool_in_use,
             &stats_out->dot_connections_alive);
     }
+#endif
+
+#if UPSTREAM_DOQ_ENABLED
+    if (client->doq_client != NULL) {
+        (void)upstream_doq_client_get_pool_stats(
+            client->doq_client,
+            &stats_out->doq_pool_capacity,
+            &stats_out->doq_pool_in_use,
+            &stats_out->doq_connections_alive);
+    }
+#endif
 
     return 0;
 }

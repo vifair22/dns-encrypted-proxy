@@ -46,6 +46,24 @@ int upstream_dot_client_get_pool_stats(
     int *in_use_out,
     int *alive_out);
 
+#if UPSTREAM_DOQ_ENABLED
+int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config);
+void upstream_doq_client_destroy(upstream_doq_client_t *client);
+int upstream_doq_resolve(
+    upstream_doq_client_t *client,
+    const upstream_server_t *server,
+    int timeout_ms,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out);
+int upstream_doq_client_get_pool_stats(
+    upstream_doq_client_t *client,
+    int *capacity_out,
+    int *in_use_out,
+    int *alive_out);
+#endif
+
 static void test_parse_https_default_port(void **state) {
     (void)state;
 
@@ -96,6 +114,18 @@ static void test_parse_tls_custom_port(void **state) {
     assert_int_equal(server.port, 9953);
 }
 
+static void test_parse_tls_ipv6_authority(void **state) {
+    (void)state;
+
+    upstream_server_t server;
+    int result = upstream_parse_url("tls://[2001:db8::1]:853", &server);
+
+    assert_int_equal(result, 0);
+    assert_int_equal(server.type, UPSTREAM_TYPE_DOT);
+    assert_string_equal(server.host, "2001:db8::1");
+    assert_int_equal(server.port, 853);
+}
+
 static void test_parse_invalid_scheme(void **state) {
     (void)state;
 
@@ -104,6 +134,33 @@ static void test_parse_invalid_scheme(void **state) {
 
     assert_int_equal(result, -1);
 }
+
+#if UPSTREAM_DOQ_ENABLED
+static void test_parse_quic_default_and_custom_port(void **state) {
+    (void)state;
+
+    upstream_server_t server;
+    assert_int_equal(upstream_parse_url("quic://dns.example", &server), 0);
+    assert_int_equal(server.type, UPSTREAM_TYPE_DOQ);
+    assert_string_equal(server.host, "dns.example");
+    assert_int_equal(server.port, 853);
+
+    assert_int_equal(upstream_parse_url("quic://dns.example:8853", &server), 0);
+    assert_int_equal(server.type, UPSTREAM_TYPE_DOQ);
+    assert_string_equal(server.host, "dns.example");
+    assert_int_equal(server.port, 8853);
+}
+
+static void test_parse_quic_ipv6_authority(void **state) {
+    (void)state;
+
+    upstream_server_t server;
+    assert_int_equal(upstream_parse_url("quic://[2606:4700:4700::1111]", &server), 0);
+    assert_int_equal(server.type, UPSTREAM_TYPE_DOQ);
+    assert_string_equal(server.host, "2606:4700:4700::1111");
+    assert_int_equal(server.port, 853);
+}
+#endif
 
 static void test_parse_invalid_parameters(void **state) {
     (void)state;
@@ -122,6 +179,13 @@ static void test_parse_invalid_host_or_port(void **state) {
     assert_int_equal(upstream_parse_url("https://dns.google:70000/dns-query", &server), -1);
     assert_int_equal(upstream_parse_url("tls://:853", &server), -1);
     assert_int_equal(upstream_parse_url("tls://1.1.1.1:0", &server), -1);
+    assert_int_equal(upstream_parse_url("tls://1.1.1.1:853/path", &server), -1);
+    assert_int_equal(upstream_parse_url("tls://2001:db8::1:853", &server), -1);
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(upstream_parse_url("doq://dns.example:853", &server), -1);
+    assert_int_equal(upstream_parse_url("quic://dns.example:853/path", &server), -1);
+    assert_int_equal(upstream_parse_url("quic://[2606:4700:4700::1111", &server), -1);
+#endif
 }
 
 static void test_client_init_mixed_urls(void **state) {
@@ -130,7 +194,10 @@ static void test_client_init_mixed_urls(void **state) {
     const char *urls[] = {
         "bad://invalid",
         "https://dns.google/dns-query",
-        "tls://1.1.1.1:853"
+        "tls://1.1.1.1:853",
+#if UPSTREAM_DOQ_ENABLED
+        "quic://9.9.9.9:853"
+#endif
     };
     upstream_config_t config = {
         .timeout_ms = 2000,
@@ -140,12 +207,15 @@ static void test_client_init_mixed_urls(void **state) {
     };
     upstream_client_t client;
 
-    int result = upstream_client_init(&client, urls, 3, &config);
+    int result = upstream_client_init(&client, urls, (int)(sizeof(urls) / sizeof(urls[0])), &config);
 
     assert_int_equal(result, 0);
-    assert_int_equal(client.server_count, 2);
+    assert_int_equal(client.server_count, 2 + (UPSTREAM_DOQ_ENABLED ? 1 : 0));
     assert_int_equal(client.servers[0].type, UPSTREAM_TYPE_DOH);
     assert_int_equal(client.servers[1].type, UPSTREAM_TYPE_DOT);
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(client.servers[2].type, UPSTREAM_TYPE_DOQ);
+#endif
 
     upstream_client_destroy(&client);
 }
@@ -283,6 +353,8 @@ static void test_runtime_stats_api_guards_and_basics(void **state) {
     assert_int_equal(stats.doh_pool_in_use, 0);
     assert_int_equal(stats.dot_pool_capacity, 0);
     assert_int_equal(stats.dot_pool_in_use, 0);
+    assert_int_equal(stats.doq_pool_capacity, 0);
+    assert_int_equal(stats.doq_pool_in_use, 0);
 
     upstream_client_destroy(&client);
 }
@@ -393,14 +465,24 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
 
     upstream_doh_client_t *doh_client = NULL;
     upstream_dot_client_t *dot_client = NULL;
+#if UPSTREAM_DOQ_ENABLED
+    upstream_doq_client_t *doq_client = NULL;
+#endif
 
     assert_int_equal(upstream_doh_client_init(NULL, &config), -1);
     assert_int_equal(upstream_doh_client_init(&doh_client, NULL), -1);
     assert_int_equal(upstream_dot_client_init(NULL, &config), -1);
     assert_int_equal(upstream_dot_client_init(&dot_client, NULL), -1);
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(upstream_doq_client_init(NULL, &config), -1);
+    assert_int_equal(upstream_doq_client_init(&doq_client, NULL), -1);
+#endif
 
     assert_int_equal(upstream_doh_client_init(&doh_client, &config), 0);
     assert_int_equal(upstream_dot_client_init(&dot_client, &config), 0);
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(upstream_doq_client_init(&doq_client, &config), 0);
+#endif
 
     int cap = 0;
     int in_use = 0;
@@ -416,12 +498,69 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
     assert_int_equal(in_use, 0);
     assert_int_equal(alive, 0);
 
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(upstream_doq_client_get_pool_stats(doq_client, &cap, &in_use, &alive), 0);
+    assert_true(cap >= 1);
+    assert_int_equal(in_use, 0);
+    assert_int_equal(alive, 0);
+#endif
+
     upstream_doh_client_destroy(doh_client);
     upstream_dot_client_destroy(dot_client);
+#if UPSTREAM_DOQ_ENABLED
+    upstream_doq_client_destroy(doq_client);
+#endif
 
     upstream_doh_client_destroy(NULL);
     upstream_dot_client_destroy(NULL);
+#if UPSTREAM_DOQ_ENABLED
+    upstream_doq_client_destroy(NULL);
+#endif
 }
+
+#if UPSTREAM_DOQ_ENABLED
+static void test_doq_protocol_guard_paths(void **state) {
+    (void)state;
+
+    upstream_config_t config = {
+        .timeout_ms = 100,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doq_client_t *client = NULL;
+    assert_int_equal(upstream_doq_client_init(&client, &config), 0);
+    assert_non_null(client);
+
+    upstream_server_t server;
+    memset(&server, 0, sizeof(server));
+    server.type = UPSTREAM_TYPE_DOH;
+
+    uint8_t query[4] = {0, 1, 2, 3};
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+
+    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
+
+    server.type = UPSTREAM_TYPE_DOQ;
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+
+    int cap = 1;
+    int in_use = 1;
+    int alive = 1;
+    assert_int_equal(upstream_doq_client_get_pool_stats(NULL, &cap, &in_use, &alive), -1);
+    assert_int_equal(cap, 0);
+    assert_int_equal(in_use, 0);
+    assert_int_equal(alive, 0);
+
+    upstream_doq_client_destroy(client);
+}
+#endif
 
 int main(void) {
     const struct CMUnitTest tests[] = {
@@ -429,7 +568,12 @@ int main(void) {
         cmocka_unit_test(test_parse_https_custom_port),
         cmocka_unit_test(test_parse_tls_default_port),
         cmocka_unit_test(test_parse_tls_custom_port),
+        cmocka_unit_test(test_parse_tls_ipv6_authority),
         cmocka_unit_test(test_parse_invalid_scheme),
+#if UPSTREAM_DOQ_ENABLED
+        cmocka_unit_test(test_parse_quic_default_and_custom_port),
+        cmocka_unit_test(test_parse_quic_ipv6_authority),
+#endif
         cmocka_unit_test(test_parse_invalid_parameters),
         cmocka_unit_test(test_parse_invalid_host_or_port),
         cmocka_unit_test(test_client_init_mixed_urls),
@@ -442,6 +586,9 @@ int main(void) {
         cmocka_unit_test(test_runtime_stats_api_guards_and_basics),
         cmocka_unit_test(test_doh_protocol_guard_paths),
         cmocka_unit_test(test_dot_protocol_guard_paths),
+#if UPSTREAM_DOQ_ENABLED
+        cmocka_unit_test(test_doq_protocol_guard_paths),
+#endif
         cmocka_unit_test(test_protocol_client_init_and_destroy_guards),
     };
 

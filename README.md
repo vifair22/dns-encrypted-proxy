@@ -48,6 +48,23 @@ cmake -S . -B build
 cmake --build build
 ```
 
+Optional upstream provider build flags (all ON by default):
+
+```bash
+cmake -S . -B build \
+  -DENABLE_UPSTREAM_DOH=ON \
+  -DENABLE_UPSTREAM_DOT=ON \
+  -DENABLE_UPSTREAM_DOQ=ON
+```
+
+DoQ ngtcp2 backend is behind an extra flag:
+
+```bash
+cmake -S . -B build -DENABLE_UPSTREAM_DOQ=ON -DENABLE_DOQ_NGTCP2=ON
+```
+
+Current DoQ status: ngtcp2-backed QUIC handshake and DoQ stream request/response flow are implemented behind `ENABLE_DOQ_NGTCP2`; interoperability/performance hardening is still in progress.
+
 Run:
 
 ```bash
@@ -71,7 +88,7 @@ By default the proxy reads `dns-encrypted-proxy.conf` if present. You can also p
 Main config keys:
 
 - `listen_addr`, `listen_port`
-- `upstreams` (comma-separated `https://...` and/or `tls://host:port`)
+- `upstreams` (comma-separated `https://...`, `tls://host[:port]`, and/or `quic://host[:port]`)
 - `upstream_timeout_ms`, `upstream_pool_size`
 - `cache_capacity`
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`

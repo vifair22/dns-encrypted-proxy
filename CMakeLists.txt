@@ -7,6 +7,14 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(ENABLE_COVERAGE "Enable gcov/gcovr coverage instrumentation" OFF)
+option(ENABLE_UPSTREAM_DOH "Enable DoH upstream support" ON)
+option(ENABLE_UPSTREAM_DOT "Enable DoT upstream support" ON)
+option(ENABLE_UPSTREAM_DOQ "Enable DoQ upstream support" ON)
+option(ENABLE_DOQ_NGTCP2 "Enable ngtcp2-backed DoQ transport" OFF)
+
+if(NOT ENABLE_UPSTREAM_DOH AND NOT ENABLE_UPSTREAM_DOT AND NOT ENABLE_UPSTREAM_DOQ)
+    message(FATAL_ERROR "At least one upstream provider must be enabled")
+endif()
 
 set(PROJECT_WARNING_FLAGS -Wall -Wextra -Wpedantic)
 if(WARNINGS_AS_ERRORS)
@@ -25,6 +33,11 @@ endif()
 
 function(apply_target_defaults target_name)
     target_compile_options(${target_name} PRIVATE ${PROJECT_WARNING_FLAGS})
+    target_compile_definitions(${target_name} PRIVATE
+        UPSTREAM_DOH_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOH}>
+        UPSTREAM_DOT_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOT}>
+        UPSTREAM_DOQ_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOQ}>
+        UPSTREAM_DOQ_NGTCP2_ENABLED=$<BOOL:${ENABLE_DOQ_NGTCP2}>)
 
     if(ENABLE_COVERAGE AND COVERAGE_SUPPORTED)
         target_compile_options(${target_name} PRIVATE -O0 -g --coverage)
@@ -36,23 +49,91 @@ function(apply_target_defaults target_name)
     endif()
 endfunction()
 
-find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED)
+if(ENABLE_UPSTREAM_DOH)
+    find_package(CURL REQUIRED)
+endif()
+if(ENABLE_UPSTREAM_DOT)
+    find_package(OpenSSL REQUIRED)
+endif()
 
-# Core library (everything except main.c) for linking tests
-add_library(dns_encrypted_proxy_lib STATIC
+set(DOQ_NGTCP2_LIBS)
+if(ENABLE_UPSTREAM_DOQ AND ENABLE_DOQ_NGTCP2)
+    if(NOT PkgConfig_FOUND)
+        find_package(PkgConfig REQUIRED)
+    endif()
+
+    # Distros vary in pkg-config module naming: some use ngtcp2/*, others
+    # libngtcp2/*. Try both so setup is portable.
+    pkg_check_modules(NGTCP2 QUIET IMPORTED_TARGET ngtcp2)
+    if(NOT NGTCP2_FOUND)
+        pkg_check_modules(NGTCP2 QUIET IMPORTED_TARGET libngtcp2)
+    endif()
+
+    pkg_check_modules(NGTCP2_CRYPTO QUIET IMPORTED_TARGET ngtcp2_crypto_openssl)
+    if(NOT NGTCP2_CRYPTO_FOUND)
+        pkg_check_modules(NGTCP2_CRYPTO QUIET IMPORTED_TARGET libngtcp2_crypto_openssl)
+    endif()
+    if(NOT NGTCP2_CRYPTO_FOUND)
+        pkg_check_modules(NGTCP2_CRYPTO QUIET IMPORTED_TARGET ngtcp2_crypto_ossl)
+    endif()
+    if(NOT NGTCP2_CRYPTO_FOUND)
+        pkg_check_modules(NGTCP2_CRYPTO QUIET IMPORTED_TARGET libngtcp2_crypto_ossl)
+    endif()
+    if(NOT NGTCP2_CRYPTO_FOUND)
+        pkg_check_modules(NGTCP2_CRYPTO QUIET IMPORTED_TARGET ngtcp2_crypto_quictls)
+    endif()
+    if(NOT NGTCP2_CRYPTO_FOUND)
+        pkg_check_modules(NGTCP2_CRYPTO QUIET IMPORTED_TARGET libngtcp2_crypto_quictls)
+    endif()
+
+    if(NOT NGTCP2_FOUND)
+        message(FATAL_ERROR "ENABLE_DOQ_NGTCP2=ON requires ngtcp2 dev pkg-config module (ngtcp2 or libngtcp2)")
+    endif()
+    if(NOT NGTCP2_CRYPTO_FOUND)
+        message(FATAL_ERROR "ENABLE_DOQ_NGTCP2=ON requires an ngtcp2 OpenSSL-family crypto module (ngtcp2/libngtcp2 crypto_openssl, crypto_ossl, or crypto_quictls)")
+    endif()
+
+    list(APPEND DOQ_NGTCP2_LIBS PkgConfig::NGTCP2 PkgConfig::NGTCP2_CRYPTO)
+endif()
+
+set(DNS_ENCRYPTED_PROXY_SOURCES
     src/config.c
     src/cache.c
     src/dns_message.c
     src/upstream.c
-    src/upstream_doh.c
-    src/upstream_dot.c
     src/dns_server.c
     src/metrics.c
 )
+
+if(ENABLE_UPSTREAM_DOH)
+    list(APPEND DNS_ENCRYPTED_PROXY_SOURCES src/upstream_doh.c)
+endif()
+if(ENABLE_UPSTREAM_DOT)
+    list(APPEND DNS_ENCRYPTED_PROXY_SOURCES src/upstream_dot.c)
+endif()
+if(ENABLE_UPSTREAM_DOQ)
+    list(APPEND DNS_ENCRYPTED_PROXY_SOURCES src/upstream_doq.c)
+    if(ENABLE_DOQ_NGTCP2)
+        list(APPEND DNS_ENCRYPTED_PROXY_SOURCES src/upstream_doq_ngtcp2.c)
+    endif()
+endif()
+
+set(DNS_ENCRYPTED_PROXY_LIBS Threads::Threads)
+if(ENABLE_UPSTREAM_DOH)
+    list(APPEND DNS_ENCRYPTED_PROXY_LIBS CURL::libcurl)
+endif()
+if(ENABLE_UPSTREAM_DOT)
+    list(APPEND DNS_ENCRYPTED_PROXY_LIBS OpenSSL::SSL OpenSSL::Crypto)
+endif()
+if(ENABLE_UPSTREAM_DOQ AND ENABLE_DOQ_NGTCP2)
+    list(APPEND DNS_ENCRYPTED_PROXY_LIBS ${DOQ_NGTCP2_LIBS})
+endif()
+
+# Core library (everything except main.c) for linking tests
+add_library(dns_encrypted_proxy_lib STATIC ${DNS_ENCRYPTED_PROXY_SOURCES})
 target_include_directories(dns_encrypted_proxy_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(dns_encrypted_proxy_lib PUBLIC CURL::libcurl Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(dns_encrypted_proxy_lib PUBLIC ${DNS_ENCRYPTED_PROXY_LIBS})
 apply_target_defaults(dns_encrypted_proxy_lib)
 
 # Main executable
@@ -152,12 +233,14 @@ if(BUILD_TESTS)
         apply_target_defaults(test_dns_server_internal)
         add_test(NAME test_dns_server_internal COMMAND test_dns_server_internal)
 
-        # Unit test: upstream DoH internals (static helper branch coverage)
-        add_executable(test_upstream_doh_internal tests/unit/test_upstream_doh_internal.c)
-        target_link_libraries(test_upstream_doh_internal ${CMOCKA_LIBRARIES} Threads::Threads)
-        target_include_directories(test_upstream_doh_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        apply_target_defaults(test_upstream_doh_internal)
-        add_test(NAME test_upstream_doh_internal COMMAND test_upstream_doh_internal)
+        if(ENABLE_UPSTREAM_DOH)
+            # Unit test: upstream DoH internals (static helper branch coverage)
+            add_executable(test_upstream_doh_internal tests/unit/test_upstream_doh_internal.c)
+            target_link_libraries(test_upstream_doh_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+            target_include_directories(test_upstream_doh_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            apply_target_defaults(test_upstream_doh_internal)
+            add_test(NAME test_upstream_doh_internal COMMAND test_upstream_doh_internal)
+        endif()
 
         # Unit test: upstream orchestrator internals (static/helper branch coverage)
         add_executable(test_upstream_internal tests/unit/test_upstream_internal.c)
@@ -166,12 +249,32 @@ if(BUILD_TESTS)
         apply_target_defaults(test_upstream_internal)
         add_test(NAME test_upstream_internal COMMAND test_upstream_internal)
 
-        # Unit test: upstream DoT internals (static helper branch coverage)
-        add_executable(test_upstream_dot_internal tests/unit/test_upstream_dot_internal.c)
-        target_link_libraries(test_upstream_dot_internal ${CMOCKA_LIBRARIES} Threads::Threads)
-        target_include_directories(test_upstream_dot_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        apply_target_defaults(test_upstream_dot_internal)
-        add_test(NAME test_upstream_dot_internal COMMAND test_upstream_dot_internal)
+        if(ENABLE_UPSTREAM_DOT)
+            # Unit test: upstream DoT internals (static helper branch coverage)
+            add_executable(test_upstream_dot_internal tests/unit/test_upstream_dot_internal.c)
+            target_link_libraries(test_upstream_dot_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+            target_include_directories(test_upstream_dot_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            apply_target_defaults(test_upstream_dot_internal)
+            add_test(NAME test_upstream_dot_internal COMMAND test_upstream_dot_internal)
+        endif()
+
+        if(ENABLE_UPSTREAM_DOQ)
+            # Unit test: upstream DoQ internals (validation and backend handoff)
+            add_executable(test_upstream_doq_internal tests/unit/test_upstream_doq_internal.c)
+            target_link_libraries(test_upstream_doq_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+            target_include_directories(test_upstream_doq_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            apply_target_defaults(test_upstream_doq_internal)
+            add_test(NAME test_upstream_doq_internal COMMAND test_upstream_doq_internal)
+
+            if(ENABLE_DOQ_NGTCP2)
+                # Unit test: ngtcp2 DoQ helpers (stream framing/guards)
+                add_executable(test_upstream_doq_ngtcp2_internal tests/unit/test_upstream_doq_ngtcp2_internal.c)
+                target_link_libraries(test_upstream_doq_ngtcp2_internal ${CMOCKA_LIBRARIES} Threads::Threads ${DNS_ENCRYPTED_PROXY_LIBS})
+                target_include_directories(test_upstream_doq_ngtcp2_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+                apply_target_defaults(test_upstream_doq_ngtcp2_internal)
+                add_test(NAME test_upstream_doq_ngtcp2_internal COMMAND test_upstream_doq_ngtcp2_internal)
+            endif()
+        endif()
         
         # Integration tests (split by functional boundary)
         add_executable(test_integration_core tests/integration/test_integration.c)
@@ -201,13 +304,28 @@ if(BUILD_TESTS)
         if(ENABLE_COVERAGE AND COVERAGE_SUPPORTED)
             find_program(GCOVR_EXECUTABLE gcovr)
             if(GCOVR_EXECUTABLE)
+                set(COVERAGE_TEST_DEPS
+                    test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_upstream_internal test_integration_core test_integration_transport test_integration_runtime)
+                if(ENABLE_UPSTREAM_DOH)
+                    list(APPEND COVERAGE_TEST_DEPS test_upstream_doh_internal)
+                endif()
+                if(ENABLE_UPSTREAM_DOT)
+                    list(APPEND COVERAGE_TEST_DEPS test_upstream_dot_internal)
+                endif()
+                if(ENABLE_UPSTREAM_DOQ)
+                    list(APPEND COVERAGE_TEST_DEPS test_upstream_doq_internal)
+                    if(ENABLE_DOQ_NGTCP2)
+                        list(APPEND COVERAGE_TEST_DEPS test_upstream_doq_ngtcp2_internal)
+                    endif()
+                endif()
+
                 add_custom_target(coverage
                     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
                     COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --gcov-ignore-parse-errors negative_hits.warn_once_per_file --print-summary
                     COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --gcov-ignore-parse-errors negative_hits.warn_once_per_file --html-details -o ${CMAKE_BINARY_DIR}/coverage.html
                     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
                     USES_TERMINAL
-                    DEPENDS test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_upstream_doh_internal test_upstream_internal test_upstream_dot_internal test_integration_core test_integration_transport test_integration_runtime
+                    DEPENDS dns-encrypted-proxy ${COVERAGE_TEST_DEPS}
                     COMMENT "Run tests and generate coverage report")
                 message(STATUS "Coverage target available: cmake --build <build-dir> --target coverage")
             else()

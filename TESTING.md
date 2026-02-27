@@ -6,6 +6,7 @@ This project uses CMocka-based unit and integration tests plus optional coverage
 
 - `cmocka`
 - `python3` (required for DoH integration tests that use local HTTPS mock upstream)
+- `python3` + `aioquic` (optional; used by DoQ integration transport test peer)
 
 ## Build and Run All Tests
 

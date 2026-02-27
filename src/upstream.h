@@ -13,7 +13,8 @@
  */
 typedef enum {
     UPSTREAM_TYPE_DOH,  /* DNS-over-HTTPS (https://) */
-    UPSTREAM_TYPE_DOT   /* DNS-over-TLS (tls://) */
+    UPSTREAM_TYPE_DOT,  /* DNS-over-TLS (tls://) */
+    UPSTREAM_TYPE_DOQ   /* DNS-over-QUIC (quic://) */
 } upstream_type_t;
 
 /*
@@ -54,6 +55,7 @@ typedef struct {
  */
 typedef struct upstream_doh_client upstream_doh_client_t;
 typedef struct upstream_dot_client upstream_dot_client_t;
+typedef struct upstream_doq_client upstream_doq_client_t;
 
 /*
  * Main upstream client - manages all upstream servers
@@ -67,6 +69,7 @@ typedef struct {
     /* Protocol-specific clients (lazily initialized) */
     upstream_doh_client_t *doh_client;
     upstream_dot_client_t *dot_client;
+    upstream_doq_client_t *doq_client;
     
     /* Round-robin state */
     pthread_mutex_t rr_mutex;
@@ -83,13 +86,17 @@ typedef struct {
     int dot_pool_capacity;
     int dot_pool_in_use;
     int dot_connections_alive;
+
+    int doq_pool_capacity;
+    int doq_pool_in_use;
+    int doq_connections_alive;
 } upstream_runtime_stats_t;
 
 /*
  * Initialize upstream client with parsed server list
  * 
  * @param client      Client to initialize
- * @param urls        Array of URL strings (https:// or tls://)
+ * @param urls        Array of URL strings (https://, tls://, quic://)
  * @param url_count   Number of URLs
  * @param config      Client configuration
  * @return 0 on success, -1 on error
@@ -131,6 +138,7 @@ int upstream_resolve(
  * Supported schemes:
  *   https://host/path  -> UPSTREAM_TYPE_DOH
  *   tls://host:port    -> UPSTREAM_TYPE_DOT (port defaults to 853)
+ *   quic://host:port   -> UPSTREAM_TYPE_DOQ (port defaults to 853)
  * 
  * @param url        URL string to parse
  * @param server_out Output: parsed server configuration

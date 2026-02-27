@@ -668,6 +668,11 @@ typedef struct {
     char *script_path;
 } python_doh_server_t;
 
+typedef struct {
+    pid_t pid;
+    int port;
+} python_doq_server_t;
+
 static char *bytes_to_hex(const uint8_t *data, size_t len) {
     static const char HEX[] = "0123456789abcdef";
     char *out = malloc(len * 2 + 1);
@@ -813,6 +818,84 @@ static void stop_python_doh_server(python_doh_server_t *server) {
     if (server->script_path != NULL) {
         remove_temp_file(server->script_path);
         server->script_path = NULL;
+    }
+}
+
+static const char *resolve_mock_doq_script_path(void) {
+    if (access("./tools/mock_doq_server.py", R_OK) == 0) {
+        return "./tools/mock_doq_server.py";
+    }
+    if (access("../tools/mock_doq_server.py", R_OK) == 0) {
+        return "../tools/mock_doq_server.py";
+    }
+    return NULL;
+}
+
+static int start_python_doq_server(
+    python_doq_server_t *server,
+    const char *cert_path,
+    const char *key_path) {
+    if (server == NULL || cert_path == NULL || key_path == NULL) {
+        return -1;
+    }
+
+    const char *script = resolve_mock_doq_script_path();
+    if (script == NULL) {
+        return -1;
+    }
+
+    memset(server, 0, sizeof(*server));
+    server->pid = -1;
+    server->port = reserve_unused_port();
+    if (server->port <= 0) {
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+
+    if (pid == 0) {
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", server->port);
+        execlp("python3", "python3", script, port_str, cert_path, key_path, (char *)NULL);
+        _exit(127);
+    }
+
+    server->pid = pid;
+
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 200 * 1000 * 1000;
+    nanosleep(&ts, NULL);
+
+    int child_status = 0;
+    pid_t waited = waitpid(server->pid, &child_status, WNOHANG);
+    if (waited == server->pid) {
+        server->pid = -1;
+        return -1;
+    }
+
+    if (waited < 0 || kill(server->pid, 0) != 0) {
+        kill(server->pid, SIGTERM);
+        waitpid(server->pid, NULL, 0);
+        server->pid = -1;
+        return -1;
+    }
+
+    return 0;
+}
+
+static void stop_python_doq_server(python_doq_server_t *server) {
+    if (server == NULL) {
+        return;
+    }
+
+    if (server->pid > 0) {
+        kill(server->pid, SIGTERM);
+        waitpid(server->pid, NULL, 0);
+        server->pid = -1;
     }
 }
 
@@ -1551,6 +1634,107 @@ static void test_upstream_transport_dot_partial_body(void **state) {
     unsetenv("SSL_CERT_FILE");
 }
 
+#if UPSTREAM_DOQ_ENABLED && UPSTREAM_DOQ_NGTCP2_ENABLED
+/*
+ * Test: DoQ transport path succeeds against local Python QUIC mock
+ */
+static void test_upstream_transport_doq_success(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+    if (system("python3 -c 'import aioquic' >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    python_doq_server_t server;
+    if (start_python_doq_server(&server, cert_path, key_path) != 0) {
+        skip();
+    }
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "quic://localhost:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        0);
+
+    assert_non_null(response);
+    assert_int_equal(response_len, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN);
+    assert_int_equal(response[0], DNS_QUERY_WWW_EXAMPLE_COM_A[0]);
+    assert_int_equal(response[1], DNS_QUERY_WWW_EXAMPLE_COM_A[1]);
+    assert_true((response[2] & 0x80u) != 0);
+
+    free(response);
+    upstream_client_destroy(&client);
+    stop_python_doq_server(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoQ transport path fails cleanly when endpoint is unreachable
+ */
+static void test_upstream_transport_doq_unreachable(void **state) {
+    (void)state;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+
+    char url[256];
+    snprintf(url, sizeof(url), "quic://127.0.0.1:%d", dead_port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 100,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+    assert_true(client.servers[0].health.total_failures >= 1);
+    upstream_client_destroy(&client);
+}
+#endif
+
 /*
  * Test: DoH runtime stats record HTTP/1 responses when forced via test env
  */
@@ -1724,7 +1908,10 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     const char *urls[] = {
         "https://cloudflare-dns.com/dns-query",
-        "tls://1.1.1.1:853"
+        "tls://1.1.1.1:853",
+#if UPSTREAM_DOQ_ENABLED
+        "quic://1.1.1.1:853"
+#endif
     };
     upstream_client_t upstream;
     upstream_config_t cfg = {
@@ -1733,7 +1920,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
         .max_failures_before_unhealthy = 2,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&upstream, urls, 2, &cfg), 0);
+    assert_int_equal(upstream_client_init(&upstream, urls, sizeof(urls) / sizeof(urls[0]), &cfg), 0);
 
     int port = reserve_unused_port();
     assert_true(port > 0);
@@ -1743,11 +1930,74 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
     assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_requests_total{upstream=\"https://cloudflare-dns.com/dns-query\",protocol=\"doh\"}"));
     assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_healthy{upstream=\"tls://1.1.1.1:853\",protocol=\"dot\"}"));
+#if UPSTREAM_DOQ_ENABLED
+    assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_healthy{upstream=\"quic://1.1.1.1:853\",protocol=\"doq\"}"));
+#endif
 
     metrics_server_stop();
     upstream_client_destroy(&upstream);
     dns_cache_destroy(&cache);
 }
+
+#if UPSTREAM_DOQ_ENABLED
+/*
+ * Test: DNS server returns SERVFAIL when DoQ upstream is unreachable and updates counters
+ */
+static void test_dns_server_udp_servfail_path_doq(void **state) {
+    (void)state;
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.upstream_timeout_ms = 80;
+    config.upstream_pool_size = 1;
+    config.upstream_count = 1;
+
+    int dead_port = reserve_unused_port();
+    assert_true(dead_port > 0);
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), 0);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 150 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    assert_int_equal(
+        send_udp_query_and_recv(
+            config.listen_port,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            resp,
+            &resp_len),
+        0);
+    assert_true(resp_len >= 12);
+
+    uint16_t flags = (uint16_t)(((uint16_t)resp[2] << 8) | (uint16_t)resp[3]);
+    uint16_t rcode = (uint16_t)(flags & 0x000Fu);
+    assert_int_equal(rcode, 2);
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    assert_true((uint64_t)atomic_load(&server.metrics.queries_udp) >= 1);
+    assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
+    assert_true((uint64_t)atomic_load(&server.metrics.responses_total) >= 1);
+
+    proxy_server_destroy(&server);
+}
+#endif
 
 /*
  * Test: DNS server returns SERVFAIL when upstream is unreachable and updates counters
@@ -2770,6 +3020,10 @@ int main(void) {
         cmocka_unit_test(test_upstream_transport_dot_malformed_response),
         cmocka_unit_test(test_upstream_transport_dot_close_before_length),
         cmocka_unit_test(test_upstream_transport_dot_partial_body),
+#if UPSTREAM_DOQ_ENABLED && UPSTREAM_DOQ_NGTCP2_ENABLED
+        cmocka_unit_test(test_upstream_transport_doq_success),
+        cmocka_unit_test(test_upstream_transport_doq_unreachable),
+#endif
         cmocka_unit_test(test_upstream_transport_failover_doh_to_dot),
         cmocka_unit_test(test_metrics_endpoint_with_upstream_labels),
     };
@@ -2777,6 +3031,9 @@ int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_metrics_endpoint_http_paths),
         cmocka_unit_test(test_dns_server_udp_servfail_path),
+#if UPSTREAM_DOQ_ENABLED
+        cmocka_unit_test(test_dns_server_udp_servfail_path_doq),
+#endif
         cmocka_unit_test(test_dns_server_tcp_connection_rejection),
         cmocka_unit_test(test_dns_server_tcp_servfail_path),
         cmocka_unit_test(test_main_invalid_config_exits_nonzero),

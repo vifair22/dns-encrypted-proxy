@@ -458,22 +458,22 @@ int dns_cache_lookup(
         return 0;
     }
 
-    /*
-     * Move-to-front inside the bucket chain reduces pointer chasing for hot
-     * keys that repeatedly hash into the same bucket. LRU already handles
-     * global recency; this is purely a bucket-local cache locality win.
-     */
-    if (prev != NULL) {
-        prev->bucket_next = entry->bucket_next;
-        entry->bucket_next = shard->buckets[bucket_idx];
-        shard->buckets[bucket_idx] = entry;
-    }
-
     if (entry->expires_at <= now) {
         remove_bucket_entry(shard, bucket_idx, entry, prev);
         shard->expirations++;
         shard_unlock(cache, shard);
         return 0;
+    }
+
+    /*
+     * Bucket move-to-front is only safe on live entries. If we reorder before
+     * expiry check, the saved |prev| pointer becomes stale and removal can
+     * corrupt the chain. Keep expiry removal first, then apply locality tweak.
+     */
+    if (prev != NULL) {
+        prev->bucket_next = entry->bucket_next;
+        entry->bucket_next = shard->buckets[bucket_idx];
+        shard->buckets[bucket_idx] = entry;
     }
 
     uint8_t *copy = malloc(entry->response_len);

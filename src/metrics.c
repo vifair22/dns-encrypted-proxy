@@ -60,7 +60,15 @@ static int appendf(char *out, size_t out_size, size_t *offset, const char *fmt, 
 }
 
 static const char *upstream_protocol_label(upstream_type_t type) {
-    return (type == UPSTREAM_TYPE_DOT) ? "dot" : "doh";
+    switch (type) {
+        case UPSTREAM_TYPE_DOT:
+            return "dot";
+        case UPSTREAM_TYPE_DOQ:
+            return "doq";
+        case UPSTREAM_TYPE_DOH:
+        default:
+            return "doh";
+    }
 }
 
 static void escape_label_value(const char *src, char *dst, size_t dst_size) {
@@ -182,11 +190,15 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
     (void)upstream_get_runtime_stats(g_upstream, &runtime_stats);
     int doh_pool_idle = runtime_stats.doh_pool_capacity - runtime_stats.doh_pool_in_use;
     int dot_pool_idle = runtime_stats.dot_pool_capacity - runtime_stats.dot_pool_in_use;
+    int doq_pool_idle = runtime_stats.doq_pool_capacity - runtime_stats.doq_pool_in_use;
     if (doh_pool_idle < 0) {
         doh_pool_idle = 0;
     }
     if (dot_pool_idle < 0) {
         dot_pool_idle = 0;
+    }
+    if (doq_pool_idle < 0) {
+        doq_pool_idle = 0;
     }
 
     size_t offset = 0;
@@ -333,7 +345,19 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "dns_encrypted_proxy_dot_pool_idle %d\n"
             "# HELP dns_encrypted_proxy_dot_connections_alive Number of currently established DoT TLS connections.\n"
             "# TYPE dns_encrypted_proxy_dot_connections_alive gauge\n"
-            "dns_encrypted_proxy_dot_connections_alive %d\n",
+            "dns_encrypted_proxy_dot_connections_alive %d\n"
+            "# HELP dns_encrypted_proxy_doq_pool_capacity Configured DoQ connection pool capacity.\n"
+            "# TYPE dns_encrypted_proxy_doq_pool_capacity gauge\n"
+            "dns_encrypted_proxy_doq_pool_capacity %d\n"
+            "# HELP dns_encrypted_proxy_doq_pool_in_use Number of DoQ connection slots currently in use.\n"
+            "# TYPE dns_encrypted_proxy_doq_pool_in_use gauge\n"
+            "dns_encrypted_proxy_doq_pool_in_use %d\n"
+            "# HELP dns_encrypted_proxy_doq_pool_idle Number of idle DoQ connection slots in pool.\n"
+            "# TYPE dns_encrypted_proxy_doq_pool_idle gauge\n"
+            "dns_encrypted_proxy_doq_pool_idle %d\n"
+            "# HELP dns_encrypted_proxy_doq_connections_alive Number of currently established DoQ connections.\n"
+            "# TYPE dns_encrypted_proxy_doq_connections_alive gauge\n"
+            "dns_encrypted_proxy_doq_connections_alive %d\n",
             runtime_stats.doh_pool_capacity,
             runtime_stats.doh_pool_in_use,
             doh_pool_idle,
@@ -343,7 +367,11 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             runtime_stats.dot_pool_capacity,
             runtime_stats.dot_pool_in_use,
             dot_pool_idle,
-            runtime_stats.dot_connections_alive) != 0) {
+            runtime_stats.dot_connections_alive,
+            runtime_stats.doq_pool_capacity,
+            runtime_stats.doq_pool_in_use,
+            doq_pool_idle,
+            runtime_stats.doq_connections_alive) != 0) {
         return -1;
     }
 
