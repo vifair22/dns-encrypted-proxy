@@ -27,10 +27,28 @@ struct upstream_doh_client {
     pthread_mutex_t pool_mutex;
     pthread_cond_t pool_cond;
     int initialized;
+    atomic_uint_fast64_t http3_responses_total;
     atomic_uint_fast64_t http2_responses_total;
     atomic_uint_fast64_t http1_responses_total;
     atomic_uint_fast64_t http_other_responses_total;
 };
+
+static int curl_http_version_is_h3(long http_version) {
+#if !defined(CURL_HTTP_VERSION_3) && !defined(CURL_HTTP_VERSION_3ONLY)
+    (void)http_version;
+#endif
+#ifdef CURL_HTTP_VERSION_3
+    if (http_version == CURL_HTTP_VERSION_3) {
+        return 1;
+    }
+#endif
+#ifdef CURL_HTTP_VERSION_3ONLY
+    if (http_version == CURL_HTTP_VERSION_3ONLY) {
+        return 1;
+    }
+#endif
+    return 0;
+}
 
 static int curl_http_version_is_h2(long http_version) {
 #if !defined(CURL_HTTP_VERSION_2_0) && !defined(CURL_HTTP_VERSION_2) && !defined(CURL_HTTP_VERSION_2TLS) && !defined(CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE)
@@ -209,7 +227,9 @@ static int doh_post_with_handle(
     (void)curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
 
     if (client != NULL) {
-        if (curl_http_version_is_h2(http_version)) {
+        if (curl_http_version_is_h3(http_version)) {
+            atomic_fetch_add(&client->http3_responses_total, 1);
+        } else if (curl_http_version_is_h2(http_version)) {
             atomic_fetch_add(&client->http2_responses_total, 1);
         } else if (curl_http_version_is_h1(http_version)) {
             atomic_fetch_add(&client->http1_responses_total, 1);
@@ -376,6 +396,7 @@ int upstream_doh_client_get_pool_stats(
     upstream_doh_client_t *client,
     int *capacity_out,
     int *in_use_out,
+    uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out) {
@@ -384,6 +405,9 @@ int upstream_doh_client_get_pool_stats(
     }
     if (in_use_out != NULL) {
         *in_use_out = 0;
+    }
+    if (http3_total_out != NULL) {
+        *http3_total_out = 0;
     }
     if (http2_total_out != NULL) {
         *http2_total_out = 0;
@@ -413,6 +437,9 @@ int upstream_doh_client_get_pool_stats(
     }
     if (in_use_out != NULL) {
         *in_use_out = in_use;
+    }
+    if (http3_total_out != NULL) {
+        *http3_total_out = (uint64_t)atomic_load(&client->http3_responses_total);
     }
     if (http2_total_out != NULL) {
         *http2_total_out = (uint64_t)atomic_load(&client->http2_responses_total);

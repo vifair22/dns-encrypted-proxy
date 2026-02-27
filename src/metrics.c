@@ -365,9 +365,11 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "# TYPE dns_encrypted_proxy_upstream_connections_alive gauge\n"
             "# HELP dns_encrypted_proxy_doh_http_responses_total Total DoH responses by negotiated HTTP version.\n"
             "# TYPE dns_encrypted_proxy_doh_http_responses_total counter\n"
+            "dns_encrypted_proxy_doh_http_responses_total{version=\"h3\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h2\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h1\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n",
+            (unsigned long long)runtime_stats.doh_http3_responses_total,
             (unsigned long long)runtime_stats.doh_http2_responses_total,
             (unsigned long long)runtime_stats.doh_http1_responses_total,
             (unsigned long long)runtime_stats.doh_http_other_responses_total) != 0) {

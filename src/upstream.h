@@ -79,6 +79,7 @@ typedef struct {
 typedef struct {
     int doh_pool_capacity;
     int doh_pool_in_use;
+    uint64_t doh_http3_responses_total;
     uint64_t doh_http2_responses_total;
     uint64_t doh_http1_responses_total;
     uint64_t doh_http_other_responses_total;

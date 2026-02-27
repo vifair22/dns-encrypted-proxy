@@ -128,12 +128,14 @@ int upstream_doh_client_get_pool_stats(
     upstream_doh_client_t *client,
     int *capacity_out,
     int *in_use_out,
+    uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out) {
     (void)client;
     if (capacity_out) *capacity_out = 3;
     if (in_use_out) *in_use_out = 1;
+    if (http3_total_out) *http3_total_out = 9;
     if (http2_total_out) *http2_total_out = 7;
     if (http1_total_out) *http1_total_out = 5;
     if (http_other_total_out) *http_other_total_out = 2;

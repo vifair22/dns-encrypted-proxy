@@ -27,6 +27,7 @@ int upstream_doh_client_get_pool_stats(
     upstream_doh_client_t *client,
     int *capacity_out,
     int *in_use_out,
+    uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out);
@@ -440,8 +441,9 @@ static void test_doh_protocol_guard_paths(void **state) {
 
     int cap = 1;
     int in_use = 1;
-    uint64_t h2 = 1, h1 = 1, other = 1;
-    assert_int_equal(upstream_doh_client_get_pool_stats(NULL, &cap, &in_use, &h2, &h1, &other), -1);
+    uint64_t h3 = 1, h2 = 1, h1 = 1, other = 1;
+    assert_int_equal(upstream_doh_client_get_pool_stats(NULL, &cap, &in_use, &h3, &h2, &h1, &other), -1);
+    assert_int_equal(h3, 0);
     assert_int_equal(cap, 0);
     assert_int_equal(in_use, 0);
     assert_int_equal(h2, 0);
@@ -554,11 +556,11 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
     int alive = 0;
 #endif
 #if UPSTREAM_DOH_ENABLED
-    uint64_t h2 = 0, h1 = 0, other = 0;
+    uint64_t h3 = 0, h2 = 0, h1 = 0, other = 0;
 #endif
 
 #if UPSTREAM_DOH_ENABLED
-    assert_int_equal(upstream_doh_client_get_pool_stats(doh_client, &cap, &in_use, &h2, &h1, &other), 0);
+    assert_int_equal(upstream_doh_client_get_pool_stats(doh_client, &cap, &in_use, &h3, &h2, &h1, &other), 0);
     assert_true(cap >= 1);
     assert_int_equal(in_use, 0);
 #endif

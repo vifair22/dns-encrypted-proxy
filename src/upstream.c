@@ -24,6 +24,7 @@ int upstream_doh_client_get_pool_stats(
     upstream_doh_client_t *client,
     int *capacity_out,
     int *in_use_out,
+    uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out);
@@ -574,6 +575,7 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             client->doh_client,
             &stats_out->doh_pool_capacity,
             &stats_out->doh_pool_in_use,
+            &stats_out->doh_http3_responses_total,
             &stats_out->doh_http2_responses_total,
             &stats_out->doh_http1_responses_total,
             &stats_out->doh_http_other_responses_total);

@@ -367,6 +367,16 @@ static void test_doh_post_success_and_http_version_counters(void **state) {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
 
+#if defined(CURL_HTTP_VERSION_3)
+    g_curl_http_version = CURL_HTTP_VERSION_3;
+    assert_int_equal(doh_post_with_handle(&client, (CURL *)0x12, "https://x", 100, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+#elif defined(CURL_HTTP_VERSION_3ONLY)
+    g_curl_http_version = CURL_HTTP_VERSION_3ONLY;
+    assert_int_equal(doh_post_with_handle(&client, (CURL *)0x12, "https://x", 100, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+#endif
+
 #ifdef CURL_HTTP_VERSION_2_0
     g_curl_http_version = CURL_HTTP_VERSION_2_0;
     assert_int_equal(doh_post_with_handle(&client, (CURL *)0x12, "https://x", 100, query, sizeof(query), &resp, &resp_len), 0);
@@ -531,10 +541,11 @@ static void test_doh_pool_stats_in_use_branch(void **state) {
 
     int cap = 0;
     int in_use = 0;
+    uint64_t h3 = 0;
     uint64_t h2 = 0;
     uint64_t h1 = 0;
     uint64_t other = 0;
-    assert_int_equal(upstream_doh_client_get_pool_stats(client, &cap, &in_use, &h2, &h1, &other), 0);
+    assert_int_equal(upstream_doh_client_get_pool_stats(client, &cap, &in_use, &h3, &h2, &h1, &other), 0);
     assert_int_equal(cap, 2);
     assert_int_equal(in_use, 1);
 
