@@ -28,6 +28,17 @@ static int g_doh_destroy_calls = 0;
 static int g_dot_destroy_calls = 0;
 static int g_doq_destroy_calls = 0;
 
+#if UPSTREAM_DOH_ENABLED
+#define PRIMARY_TEST_URL "https://dns.google/dns-query"
+#define PRIMARY_TYPE UPSTREAM_TYPE_DOH
+#elif UPSTREAM_DOT_ENABLED
+#define PRIMARY_TEST_URL "tls://1.1.1.1:853"
+#define PRIMARY_TYPE UPSTREAM_TYPE_DOT
+#else
+#define PRIMARY_TEST_URL "quic://9.9.9.9:853"
+#define PRIMARY_TYPE UPSTREAM_TYPE_DOQ
+#endif
+
 static void reset_stubs(void) {
     g_mutex_init_fail = 0;
     g_now_ms = 0;
@@ -245,7 +256,17 @@ static void test_upstream_resolve_last_resort_unhealthy(void **state) {
     (void)state;
     reset_stubs();
 
-    const char *urls[] = {"https://dns.google/dns-query", "tls://1.1.1.1:853"};
+    const char *urls[] = {
+#if UPSTREAM_DOH_ENABLED
+        "https://dns.google/dns-query",
+#endif
+#if UPSTREAM_DOT_ENABLED
+        "tls://1.1.1.1:853",
+#endif
+#if UPSTREAM_DOQ_ENABLED
+        "quic://9.9.9.9:853",
+#endif
+    };
     upstream_config_t config = {
         .timeout_ms = 50,
         .pool_size = 1,
@@ -253,20 +274,32 @@ static void test_upstream_resolve_last_resort_unhealthy(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_client_t client;
-    assert_int_equal(upstream_client_init(&client, urls, 2, &config), 0);
+    assert_int_equal(upstream_client_init(&client, urls, (int)(sizeof(urls) / sizeof(urls[0])), &config), 0);
 
     g_now_ms = 2000;
-    client.servers[0].health.healthy = 0;
-    client.servers[0].health.last_failure_time = 1500;
-    client.servers[1].health.healthy = 1;
+    if (client.server_count > 0) {
+        client.servers[0].health.healthy = 0;
+        client.servers[0].health.last_failure_time = 1500;
+    }
+    if (client.server_count > 1) {
+        client.servers[1].health.healthy = 1;
+    }
 
-    g_doh_resolve_rc = 0;
+    g_doh_resolve_rc = -1;
     g_resp_len = 4;
     g_resp_buf[0] = 1;
     g_resp_buf[1] = 2;
     g_resp_buf[2] = 3;
     g_resp_buf[3] = 4;
     g_dot_resolve_rc = -1;
+    g_doq_resolve_rc = -1;
+#if UPSTREAM_DOH_ENABLED
+    g_doh_resolve_rc = 0;
+#elif UPSTREAM_DOT_ENABLED
+    g_dot_resolve_rc = 0;
+#else
+    g_doq_resolve_rc = 0;
+#endif
 
     uint8_t q[] = {0xAA};
     uint8_t *out = NULL;
@@ -283,7 +316,7 @@ static void test_upstream_internal_init_and_switch_edges(void **state) {
     (void)state;
     reset_stubs();
 
-    const char *urls[] = {"https://dns.google/dns-query"};
+    const char *urls[] = {PRIMARY_TEST_URL};
     upstream_config_t config = {
         .timeout_ms = 50,
         .pool_size = 1,
@@ -307,13 +340,23 @@ static void test_upstream_internal_init_and_switch_edges(void **state) {
     size_t out_len = 0;
     assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
 
+#if UPSTREAM_DOH_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOH;
     g_doh_init_rc = -1;
     assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+#endif
 
+#if UPSTREAM_DOT_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOT;
     g_dot_init_rc = -1;
     assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+#endif
+
+#if UPSTREAM_DOQ_ENABLED
+    bad_server.type = UPSTREAM_TYPE_DOQ;
+    g_doq_init_rc = -1;
+    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+#endif
 
     upstream_client_destroy(&client);
 }
@@ -340,14 +383,26 @@ static void test_upstream_parse_and_stats_edges(void **state) {
 
     upstream_client_t client;
     memset(&client, 0, sizeof(client));
+#if UPSTREAM_DOH_ENABLED
     client.doh_client = (upstream_doh_client_t *)(uintptr_t)0x1111;
+#endif
+#if UPSTREAM_DOT_ENABLED
     client.dot_client = (upstream_dot_client_t *)(uintptr_t)0x2222;
+#endif
 #if UPSTREAM_DOQ_ENABLED
     client.doq_client = (upstream_doq_client_t *)(uintptr_t)0x3333;
 #endif
     assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+#if UPSTREAM_DOH_ENABLED
     assert_int_equal(stats.doh_pool_capacity, 3);
+#else
+    assert_int_equal(stats.doh_pool_capacity, 0);
+#endif
+#if UPSTREAM_DOT_ENABLED
     assert_int_equal(stats.dot_pool_capacity, 4);
+#else
+    assert_int_equal(stats.dot_pool_capacity, 0);
+#endif
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(stats.doq_pool_capacity, 5);
 #else
@@ -373,7 +428,7 @@ static void test_upstream_guard_and_limit_edges(void **state) {
     upstream_server_record_failure(NULL, &cfg);
     upstream_server_record_failure(&s, NULL);
 
-    const char *one[] = {"https://dns.google/dns-query"};
+    const char *one[] = {PRIMARY_TEST_URL};
     upstream_client_t client;
     assert_int_equal(upstream_client_init(NULL, one, 1, &cfg), -1);
     assert_int_equal(upstream_client_init(&client, NULL, 1, &cfg), -1);
@@ -382,7 +437,7 @@ static void test_upstream_guard_and_limit_edges(void **state) {
 
     const char *many[UPSTREAM_MAX_SERVERS + 4];
     for (size_t i = 0; i < sizeof(many) / sizeof(many[0]); i++) {
-        many[i] = "https://dns.google/dns-query";
+        many[i] = PRIMARY_TEST_URL;
     }
     assert_int_equal(upstream_client_init(&client, many, (int)(sizeof(many) / sizeof(many[0])), &cfg), 0);
     assert_int_equal(client.server_count, UPSTREAM_MAX_SERVERS);

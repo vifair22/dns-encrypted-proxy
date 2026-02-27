@@ -1141,7 +1141,7 @@ static void test_dns_server_tcp_client_error_branches(void **state) {
     uint16_t qlen = 32;
     uint8_t prefix[2] = {(uint8_t)(qlen >> 8), (uint8_t)(qlen & 0xFFu)};
     assert_int_equal((int)write(sv[1], prefix, 2), 2);
-    g_wrap_malloc_fail_on_call = 1;
+    g_wrap_malloc_fail_on_call = 2;
     tcp_client_ctx_t *ctx = calloc(1, sizeof(*ctx));
     assert_non_null(ctx);
     ctx->server = &server;
@@ -1239,7 +1239,7 @@ static void test_dns_server_udp_loop_truncation_fallback(void **state) {
     g_wrap_recvfrom_data = DNS_QUERY_WWW_EXAMPLE_COM_A;
     g_wrap_recvfrom_data_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
     g_wrap_sendto_return = (ssize_t)DNS_RESPONSE_SERVFAIL_LEN;
-    g_wrap_malloc_fail_on_call = 1;
+    g_wrap_malloc_fail_on_call = 2;
 
     assert_ptr_equal(udp_loop(&ctx), NULL);
     assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
@@ -1278,7 +1278,7 @@ static void test_dns_server_udp_truncation_and_servfail_build_fail(void **state)
     g_wrap_recvfrom_data_len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
     g_wrap_sendto_return = (ssize_t)DNS_RESPONSE_SERVFAIL_LEN;
 
-    g_wrap_malloc_fail_on_call = 1; /* fail truncation buffer alloc */
+    g_wrap_malloc_fail_on_call = 2; /* fail truncation buffer alloc (1st malloc is udp buffer) */
     g_wrap_calloc_fail_tcp_ctx_once = 1; /* fail build_servfail_response alloc */
 
     assert_ptr_equal(udp_loop(&ctx), NULL);

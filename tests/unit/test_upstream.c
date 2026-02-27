@@ -11,7 +11,8 @@
 
 #include "upstream.h"
 
-/* Protocol-specific functions under test (implemented in upstream_doh.c/upstream_dot.c) */
+/* Protocol-specific functions under test (implemented in upstream_*.c) */
+#if UPSTREAM_DOH_ENABLED
 int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
 void upstream_doh_client_destroy(upstream_doh_client_t *client);
 int upstream_doh_resolve(
@@ -29,7 +30,9 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out);
+#endif
 
+#if UPSTREAM_DOT_ENABLED
 int upstream_dot_client_init(upstream_dot_client_t **client_out, const upstream_config_t *config);
 void upstream_dot_client_destroy(upstream_dot_client_t *client);
 int upstream_dot_resolve(
@@ -45,7 +48,9 @@ int upstream_dot_client_get_pool_stats(
     int *capacity_out,
     int *in_use_out,
     int *alive_out);
+#endif
 
+#if UPSTREAM_DOQ_ENABLED
 #if UPSTREAM_DOQ_ENABLED
 int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config);
 void upstream_doq_client_destroy(upstream_doq_client_t *client);
@@ -63,7 +68,9 @@ int upstream_doq_client_get_pool_stats(
     int *in_use_out,
     int *alive_out);
 #endif
+#endif
 
+#if UPSTREAM_DOH_ENABLED
 static void test_parse_https_default_port(void **state) {
     (void)state;
 
@@ -88,7 +95,9 @@ static void test_parse_https_custom_port(void **state) {
     assert_string_equal(server.host, "example.com");
     assert_int_equal(server.port, 8443);
 }
+#endif
 
+#if UPSTREAM_DOT_ENABLED
 static void test_parse_tls_default_port(void **state) {
     (void)state;
 
@@ -125,6 +134,7 @@ static void test_parse_tls_ipv6_authority(void **state) {
     assert_string_equal(server.host, "2001:db8::1");
     assert_int_equal(server.port, 853);
 }
+#endif
 
 static void test_parse_invalid_scheme(void **state) {
     (void)state;
@@ -177,10 +187,12 @@ static void test_parse_invalid_host_or_port(void **state) {
     assert_int_equal(upstream_parse_url("https:///dns-query", &server), -1);
     assert_int_equal(upstream_parse_url("https://dns.google:0/dns-query", &server), -1);
     assert_int_equal(upstream_parse_url("https://dns.google:70000/dns-query", &server), -1);
+#if UPSTREAM_DOT_ENABLED
     assert_int_equal(upstream_parse_url("tls://:853", &server), -1);
     assert_int_equal(upstream_parse_url("tls://1.1.1.1:0", &server), -1);
     assert_int_equal(upstream_parse_url("tls://1.1.1.1:853/path", &server), -1);
     assert_int_equal(upstream_parse_url("tls://2001:db8::1:853", &server), -1);
+#endif
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(upstream_parse_url("doq://dns.example:853", &server), -1);
     assert_int_equal(upstream_parse_url("quic://dns.example:853/path", &server), -1);
@@ -193,10 +205,14 @@ static void test_client_init_mixed_urls(void **state) {
 
     const char *urls[] = {
         "bad://invalid",
+#if UPSTREAM_DOH_ENABLED
         "https://dns.google/dns-query",
+#endif
+#if UPSTREAM_DOT_ENABLED
         "tls://1.1.1.1:853",
+#endif
 #if UPSTREAM_DOQ_ENABLED
-        "quic://9.9.9.9:853"
+        "quic://9.9.9.9:853",
 #endif
     };
     upstream_config_t config = {
@@ -210,11 +226,27 @@ static void test_client_init_mixed_urls(void **state) {
     int result = upstream_client_init(&client, urls, (int)(sizeof(urls) / sizeof(urls[0])), &config);
 
     assert_int_equal(result, 0);
-    assert_int_equal(client.server_count, 2 + (UPSTREAM_DOQ_ENABLED ? 1 : 0));
-    assert_int_equal(client.servers[0].type, UPSTREAM_TYPE_DOH);
-    assert_int_equal(client.servers[1].type, UPSTREAM_TYPE_DOT);
+    int expected = 0;
+#if UPSTREAM_DOH_ENABLED
+    expected++;
+#endif
+#if UPSTREAM_DOT_ENABLED
+    expected++;
+#endif
 #if UPSTREAM_DOQ_ENABLED
-    assert_int_equal(client.servers[2].type, UPSTREAM_TYPE_DOQ);
+    expected++;
+#endif
+    assert_int_equal(client.server_count, expected);
+
+    int idx = 0;
+#if UPSTREAM_DOH_ENABLED
+    assert_int_equal(client.servers[idx++].type, UPSTREAM_TYPE_DOH);
+#endif
+#if UPSTREAM_DOT_ENABLED
+    assert_int_equal(client.servers[idx++].type, UPSTREAM_TYPE_DOT);
+#endif
+#if UPSTREAM_DOQ_ENABLED
+    assert_int_equal(client.servers[idx++].type, UPSTREAM_TYPE_DOQ);
 #endif
 
     upstream_client_destroy(&client);
@@ -242,7 +274,15 @@ static void test_client_init_all_invalid_urls_fails(void **state) {
 static void test_client_init_applies_default_policy_values(void **state) {
     (void)state;
 
-    const char *urls[] = {"https://dns.google/dns-query"};
+    const char *urls[] = {
+#if UPSTREAM_DOH_ENABLED
+        "https://dns.google/dns-query"
+#elif UPSTREAM_DOT_ENABLED
+        "tls://1.1.1.1:853"
+#else
+        "quic://9.9.9.9:853"
+#endif
+    };
     upstream_config_t config = {
         .timeout_ms = 1000,
         .pool_size = 1,
@@ -338,7 +378,15 @@ static void test_runtime_stats_api_guards_and_basics(void **state) {
     assert_int_equal(upstream_get_runtime_stats(NULL, NULL), -1);
     assert_int_equal(upstream_get_runtime_stats(NULL, &stats), -1);
 
-    const char *urls[] = {"https://dns.google/dns-query"};
+    const char *urls[] = {
+#if UPSTREAM_DOH_ENABLED
+        "https://dns.google/dns-query"
+#elif UPSTREAM_DOT_ENABLED
+        "tls://1.1.1.1:853"
+#else
+        "quic://9.9.9.9:853"
+#endif
+    };
     upstream_config_t config = {
         .timeout_ms = 1000,
         .pool_size = 2,
@@ -359,6 +407,7 @@ static void test_runtime_stats_api_guards_and_basics(void **state) {
     upstream_client_destroy(&client);
 }
 
+#if UPSTREAM_DOH_ENABLED
 static void test_doh_protocol_guard_paths(void **state) {
     (void)state;
 
@@ -401,7 +450,9 @@ static void test_doh_protocol_guard_paths(void **state) {
 
     upstream_doh_client_destroy(client);
 }
+#endif
 
+#if UPSTREAM_DOT_ENABLED
 static void test_dot_protocol_guard_paths(void **state) {
     (void)state;
 
@@ -452,6 +503,7 @@ static void test_dot_protocol_guard_paths(void **state) {
 
     upstream_dot_client_destroy(client);
 }
+#endif
 
 static void test_protocol_client_init_and_destroy_guards(void **state) {
     (void)state;
@@ -463,40 +515,60 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
 
+#if UPSTREAM_DOH_ENABLED
     upstream_doh_client_t *doh_client = NULL;
+#endif
+#if UPSTREAM_DOT_ENABLED
     upstream_dot_client_t *dot_client = NULL;
+#endif
 #if UPSTREAM_DOQ_ENABLED
     upstream_doq_client_t *doq_client = NULL;
 #endif
 
+#if UPSTREAM_DOH_ENABLED
     assert_int_equal(upstream_doh_client_init(NULL, &config), -1);
     assert_int_equal(upstream_doh_client_init(&doh_client, NULL), -1);
+#endif
+#if UPSTREAM_DOT_ENABLED
     assert_int_equal(upstream_dot_client_init(NULL, &config), -1);
     assert_int_equal(upstream_dot_client_init(&dot_client, NULL), -1);
+#endif
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(upstream_doq_client_init(NULL, &config), -1);
     assert_int_equal(upstream_doq_client_init(&doq_client, NULL), -1);
 #endif
 
+#if UPSTREAM_DOH_ENABLED
     assert_int_equal(upstream_doh_client_init(&doh_client, &config), 0);
+#endif
+#if UPSTREAM_DOT_ENABLED
     assert_int_equal(upstream_dot_client_init(&dot_client, &config), 0);
+#endif
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(upstream_doq_client_init(&doq_client, &config), 0);
 #endif
 
     int cap = 0;
     int in_use = 0;
+#if UPSTREAM_DOT_ENABLED || UPSTREAM_DOQ_ENABLED
     int alive = 0;
+#endif
+#if UPSTREAM_DOH_ENABLED
     uint64_t h2 = 0, h1 = 0, other = 0;
+#endif
 
+#if UPSTREAM_DOH_ENABLED
     assert_int_equal(upstream_doh_client_get_pool_stats(doh_client, &cap, &in_use, &h2, &h1, &other), 0);
     assert_true(cap >= 1);
     assert_int_equal(in_use, 0);
+#endif
 
+#if UPSTREAM_DOT_ENABLED
     assert_int_equal(upstream_dot_client_get_pool_stats(dot_client, &cap, &in_use, &alive), 0);
     assert_true(cap >= 1);
     assert_int_equal(in_use, 0);
     assert_int_equal(alive, 0);
+#endif
 
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(upstream_doq_client_get_pool_stats(doq_client, &cap, &in_use, &alive), 0);
@@ -505,14 +577,22 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
     assert_int_equal(alive, 0);
 #endif
 
+#if UPSTREAM_DOH_ENABLED
     upstream_doh_client_destroy(doh_client);
+#endif
+#if UPSTREAM_DOT_ENABLED
     upstream_dot_client_destroy(dot_client);
+#endif
 #if UPSTREAM_DOQ_ENABLED
     upstream_doq_client_destroy(doq_client);
 #endif
 
+#if UPSTREAM_DOH_ENABLED
     upstream_doh_client_destroy(NULL);
+#endif
+#if UPSTREAM_DOT_ENABLED
     upstream_dot_client_destroy(NULL);
+#endif
 #if UPSTREAM_DOQ_ENABLED
     upstream_doq_client_destroy(NULL);
 #endif
@@ -564,11 +644,15 @@ static void test_doq_protocol_guard_paths(void **state) {
 
 int main(void) {
     const struct CMUnitTest tests[] = {
+#if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_parse_https_default_port),
         cmocka_unit_test(test_parse_https_custom_port),
+#endif
+#if UPSTREAM_DOT_ENABLED
         cmocka_unit_test(test_parse_tls_default_port),
         cmocka_unit_test(test_parse_tls_custom_port),
         cmocka_unit_test(test_parse_tls_ipv6_authority),
+#endif
         cmocka_unit_test(test_parse_invalid_scheme),
 #if UPSTREAM_DOQ_ENABLED
         cmocka_unit_test(test_parse_quic_default_and_custom_port),
@@ -584,8 +668,12 @@ int main(void) {
         cmocka_unit_test(test_record_success_resets_failures),
         cmocka_unit_test(test_should_skip_null_inputs),
         cmocka_unit_test(test_runtime_stats_api_guards_and_basics),
+#if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_doh_protocol_guard_paths),
+#endif
+#if UPSTREAM_DOT_ENABLED
         cmocka_unit_test(test_dot_protocol_guard_paths),
+#endif
 #if UPSTREAM_DOQ_ENABLED
         cmocka_unit_test(test_doq_protocol_guard_paths),
 #endif

@@ -167,8 +167,8 @@ static void test_build_metrics_body_guards_and_idle_clamp(void **state) {
     char body[32768];
     int len = build_metrics_body(&m, body, sizeof(body));
     assert_true(len > 0);
-    assert_non_null(strstr(body, "dns_encrypted_proxy_doh_pool_idle 0"));
-    assert_non_null(strstr(body, "dns_encrypted_proxy_dot_pool_idle 0"));
+    assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_pool_idle{protocol=\"doh\"} 0"));
+    assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_pool_idle{protocol=\"dot\"} 0"));
 
     g_cache = NULL;
     g_upstream = NULL;

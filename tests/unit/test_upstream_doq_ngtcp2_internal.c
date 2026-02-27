@@ -8,8 +8,8 @@
 
 #include <string.h>
 
-#undef UPSTREAM_DOQ_NGTCP2_ENABLED
-#define UPSTREAM_DOQ_NGTCP2_ENABLED 1
+#undef UPSTREAM_DOQ_ENABLED
+#define UPSTREAM_DOQ_ENABLED 1
 #include "../../src/upstream_doq_ngtcp2.c"
 
 static void test_prepare_query_stream_data_success(void **state) {
@@ -46,6 +46,11 @@ static void test_recv_stream_data_complete_frame(void **state) {
     doq_ngtcp2_session_t session;
     memset(&session, 0, sizeof(session));
     session.stream_id = 4;
+    uint8_t stream_buf[64] = {0};
+    uint8_t stream_seen[64] = {0};
+    session.stream_rx = stream_buf;
+    session.stream_rx_seen = stream_seen;
+    session.stream_rx_cap = sizeof(stream_buf);
 
     uint8_t chunk1[] = {0x00, 0x03, 0xaa};
     uint8_t chunk2[] = {0xbb, 0xcc};
@@ -67,7 +72,7 @@ static void test_recv_stream_data_complete_frame(void **state) {
             &session,
             NULL),
         0);
-    assert_int_equal(session.stream_rx_len, 5);
+    assert_int_equal(session.stream_rx_seen_count, 5);
     assert_int_equal(session.stream_fin, 1);
     assert_int_equal(session.stream_response_ready, 1);
 }
@@ -78,17 +83,19 @@ static void test_recv_stream_data_offset_and_bounds_guards(void **state) {
     doq_ngtcp2_session_t session;
     memset(&session, 0, sizeof(session));
     session.stream_id = 0;
-    session.stream_rx_len = 2;
-
+    uint8_t stream_buf[8] = {0};
+    uint8_t stream_seen[8] = {0};
+    session.stream_rx = stream_buf;
+    session.stream_rx_seen = stream_seen;
+    session.stream_rx_cap = sizeof(stream_buf);
     uint8_t data[] = {0x11};
 
     assert_int_equal(
-        doq_ngtcp2_recv_stream_data(NULL, 0, 0, 1, data, sizeof(data), &session, NULL),
+        doq_ngtcp2_recv_stream_data(NULL, 0, 0, session.stream_rx_cap + 1, data, sizeof(data), &session, NULL),
         NGTCP2_ERR_CALLBACK_FAILURE);
 
-    session.stream_rx_len = sizeof(session.stream_rx) - 1;
     assert_int_equal(
-        doq_ngtcp2_recv_stream_data(NULL, 0, 0, session.stream_rx_len, data, sizeof(data) + 1, &session, NULL),
+        doq_ngtcp2_recv_stream_data(NULL, 0, 0, session.stream_rx_cap - 1, data, sizeof(data) + 1, &session, NULL),
         NGTCP2_ERR_CALLBACK_FAILURE);
 }
 
@@ -106,12 +113,17 @@ static void test_recv_stream_data_max_announced_length_accepted(void **state) {
     doq_ngtcp2_session_t session;
     memset(&session, 0, sizeof(session));
     session.stream_id = 2;
+    uint8_t stream_buf[2 + DOQ_MAX_DNS_MESSAGE_SIZE] = {0};
+    uint8_t stream_seen[2 + DOQ_MAX_DNS_MESSAGE_SIZE] = {0};
+    session.stream_rx = stream_buf;
+    session.stream_rx_seen = stream_seen;
+    session.stream_rx_cap = sizeof(stream_buf);
 
     uint8_t header[] = {0xFF, 0xFF};
     assert_int_equal(
         doq_ngtcp2_recv_stream_data(NULL, 0, 2, 0, header, sizeof(header), &session, NULL),
         0);
-    assert_int_equal(session.stream_expected_len, sizeof(session.stream_rx));
+    assert_int_equal(session.stream_expected_len, session.stream_rx_cap);
 }
 
 static void test_recv_stream_data_more_than_announced_guard(void **state) {
@@ -120,6 +132,11 @@ static void test_recv_stream_data_more_than_announced_guard(void **state) {
     doq_ngtcp2_session_t session;
     memset(&session, 0, sizeof(session));
     session.stream_id = 7;
+    uint8_t stream_buf[8] = {0};
+    uint8_t stream_seen[8] = {0};
+    session.stream_rx = stream_buf;
+    session.stream_rx_seen = stream_seen;
+    session.stream_rx_cap = sizeof(stream_buf);
 
     uint8_t header_and_payload[] = {0x00, 0x01, 0xAA};
     uint8_t extra = 0xBB;
@@ -139,11 +156,89 @@ static void test_recv_stream_data_ignores_other_stream_id(void **state) {
     doq_ngtcp2_session_t session;
     memset(&session, 0, sizeof(session));
     session.stream_id = 4;
+    uint8_t stream_buf[8] = {0};
+    uint8_t stream_seen[8] = {0};
+    session.stream_rx = stream_buf;
+    session.stream_rx_seen = stream_seen;
+    session.stream_rx_cap = sizeof(stream_buf);
 
     uint8_t data[] = {0x00, 0x01, 0xaa};
     assert_int_equal(doq_ngtcp2_recv_stream_data(NULL, 0, 8, 0, data, sizeof(data), &session, NULL), 0);
-    assert_int_equal(session.stream_rx_len, 0);
+    assert_int_equal(session.stream_rx_seen_count, 0);
     assert_int_equal(session.stream_expected_len, 0);
+}
+
+static void test_stream_control_callbacks_flag_target_stream(void **state) {
+    (void)state;
+
+    doq_ngtcp2_session_t session;
+    memset(&session, 0, sizeof(session));
+    session.stream_id = 11;
+
+    assert_int_equal(doq_ngtcp2_stream_reset(NULL, 9, 0, 0, &session, NULL), 0);
+    assert_int_equal(session.stream_reset_by_peer, 0);
+    assert_int_equal(doq_ngtcp2_stream_reset(NULL, 11, 0, 0, &session, NULL), 0);
+    assert_int_equal(session.stream_reset_by_peer, 1);
+
+    assert_int_equal(doq_ngtcp2_stream_stop_sending(NULL, 7, 0, &session, NULL), 0);
+    assert_int_equal(session.stream_stop_sending, 0);
+    assert_int_equal(doq_ngtcp2_stream_stop_sending(NULL, 11, 0, &session, NULL), 0);
+    assert_int_equal(session.stream_stop_sending, 1);
+}
+
+static void test_stream_frame_complete_helper(void **state) {
+    (void)state;
+
+    doq_ngtcp2_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    assert_int_equal(stream_frame_complete(NULL), 0);
+    assert_int_equal(stream_frame_complete(&session), 0);
+
+    uint8_t seen[8] = {0};
+    session.stream_rx_seen = seen;
+    session.stream_expected_len = 4;
+    assert_int_equal(stream_frame_complete(&session), 0);
+    seen[0] = 1;
+    seen[1] = 1;
+    seen[2] = 1;
+    seen[3] = 1;
+    assert_int_equal(stream_frame_complete(&session), 1);
+}
+
+static void test_doq_helpers_guard_paths(void **state) {
+    (void)state;
+
+    doq_ngtcp2_session_t session;
+    memset(&session, 0, sizeof(session));
+
+    assert_int_equal(doq_ngtcp2_conn_is_terminal(NULL), 1);
+    assert_int_equal(doq_ngtcp2_conn_is_terminal(&session), 1);
+    assert_int_equal(doq_ngtcp2_send_generated_packet(NULL, -1), -1);
+    assert_int_equal(doq_ngtcp2_send_generated_packet(&session, -1), -1);
+    assert_int_equal(doq_ngtcp2_receive_packets(NULL, -1), -1);
+    assert_int_equal(doq_ngtcp2_receive_packets(&session, -1), -1);
+    assert_int_equal(doq_ngtcp2_send_stream_data(NULL, -1, NULL, 0, NULL, NULL), -1);
+    assert_int_equal(doq_ngtcp2_send_stream_data(&session, -1, NULL, 0, NULL, NULL), -1);
+}
+
+static void test_exchange_on_fd_guard_path(void **state) {
+    (void)state;
+
+    upstream_server_t server;
+    memset(&server, 0, sizeof(server));
+    strcpy(server.host, "127.0.0.1");
+    server.port = 853;
+
+    uint8_t framed_query[] = {0x00, 0x02, 0x12, 0x34};
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+
+    assert_int_equal(
+        doq_ngtcp2_exchange_on_fd(-1, &server, 50, framed_query, sizeof(framed_query), &response, &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
 }
 
 static int reserve_unused_udp_port(void) {
@@ -196,14 +291,19 @@ static void test_resolve_timeout_path_no_server(void **state) {
 
 static void test_wait_for_io_invalid_fd(void **state) {
     (void)state;
-    assert_int_equal(doq_ngtcp2_wait_for_io(-1, now_ns() + 1000000ULL), -1);
+    doq_ngtcp2_session_t session;
+    memset(&session, 0, sizeof(session));
+    assert_int_equal(doq_ngtcp2_wait_for_io(&session, -1, now_ns() + 1000000ULL), -1);
 }
 
-static void test_wait_for_io_timeout_returns_zero(void **state) {
+static void test_wait_for_io_requires_live_conn(void **state) {
     (void)state;
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     assert_true(fd >= 0);
+
+    doq_ngtcp2_session_t session;
+    memset(&session, 0, sizeof(session));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -213,8 +313,8 @@ static void test_wait_for_io_timeout_returns_zero(void **state) {
     assert_int_equal(bind(fd, (struct sockaddr *)&addr, sizeof(addr)), 0);
 
     uint64_t deadline = now_ns() + 2 * 1000000ULL;
-    int rc = doq_ngtcp2_wait_for_io(fd, deadline);
-    assert_true(rc == 0 || rc == 1);
+    int rc = doq_ngtcp2_wait_for_io(&session, fd, deadline);
+    assert_int_equal(rc, -1);
 
     close(fd);
 }
@@ -273,8 +373,12 @@ int main(void) {
         cmocka_unit_test(test_recv_stream_data_max_announced_length_accepted),
         cmocka_unit_test(test_recv_stream_data_more_than_announced_guard),
         cmocka_unit_test(test_recv_stream_data_ignores_other_stream_id),
+        cmocka_unit_test(test_stream_control_callbacks_flag_target_stream),
+        cmocka_unit_test(test_stream_frame_complete_helper),
+        cmocka_unit_test(test_doq_helpers_guard_paths),
+        cmocka_unit_test(test_exchange_on_fd_guard_path),
         cmocka_unit_test(test_wait_for_io_invalid_fd),
-        cmocka_unit_test(test_wait_for_io_timeout_returns_zero),
+        cmocka_unit_test(test_wait_for_io_requires_live_conn),
         cmocka_unit_test(test_resolve_timeout_path_no_server),
         cmocka_unit_test(test_resolve_argument_guards),
     };

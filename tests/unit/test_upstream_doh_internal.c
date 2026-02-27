@@ -40,6 +40,8 @@ static int g_calloc_fail_on_call = 0;
 static int g_calloc_calls = 0;
 static int g_realloc_fail_on_call = 0;
 static int g_realloc_calls = 0;
+static int g_curl_http_version_setopt_calls = 0;
+static long g_curl_http_version_setopt_value = 0;
 
 typedef struct {
     size_t (*write_fn)(char *, size_t, size_t, void *);
@@ -67,6 +69,8 @@ static void reset_stubs(void) {
     g_calloc_calls = 0;
     g_realloc_fail_on_call = 0;
     g_realloc_calls = 0;
+    g_curl_http_version_setopt_calls = 0;
+    g_curl_http_version_setopt_value = 0;
     memset(g_slots, 0, sizeof(g_slots));
 }
 
@@ -139,6 +143,9 @@ CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
         g_slots[idx].write_fn = va_arg(ap, size_t (*)(char *, size_t, size_t, void *));
     } else if (option == CURLOPT_WRITEDATA) {
         g_slots[idx].write_data = va_arg(ap, void *);
+    } else if (option == CURLOPT_HTTP_VERSION) {
+        g_curl_http_version_setopt_value = va_arg(ap, long);
+        g_curl_http_version_setopt_calls++;
     } else {
         (void)va_arg(ap, void *);
     }
@@ -383,6 +390,49 @@ static void test_doh_post_success_and_http_version_counters(void **state) {
     assert_true((uint64_t)atomic_load(&client.http_other_responses_total) >= 1);
 }
 
+static void test_doh_post_http_version_preference(void **state) {
+    (void)state;
+    reset_stubs();
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    assert_int_equal(doh_post_with_handle(NULL, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_true(g_curl_http_version_setopt_calls >= 1);
+
+#ifdef CURL_HTTP_VERSION_3
+    assert_int_equal(g_curl_http_version_setopt_value, CURL_HTTP_VERSION_3);
+#elif defined(CURL_HTTP_VERSION_3ONLY)
+    assert_int_equal(g_curl_http_version_setopt_value, CURL_HTTP_VERSION_3ONLY);
+#elif defined(CURL_HTTP_VERSION_2TLS)
+    assert_int_equal(g_curl_http_version_setopt_value, CURL_HTTP_VERSION_2TLS);
+#elif defined(CURL_HTTP_VERSION_2)
+    assert_int_equal(g_curl_http_version_setopt_value, CURL_HTTP_VERSION_2);
+#else
+    assert_int_equal(g_curl_http_version_setopt_value, CURL_HTTP_VERSION_NONE);
+#endif
+
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    reset_stubs();
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+    resp = NULL;
+    assert_int_equal(doh_post_with_handle(NULL, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_true(g_curl_http_version_setopt_calls >= 1);
+#ifdef CURL_HTTP_VERSION_1_1
+    assert_int_equal(g_curl_http_version_setopt_value, CURL_HTTP_VERSION_1_1);
+#endif
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+}
+
 static void test_doh_client_init_failure_paths(void **state) {
     (void)state;
     reset_stubs();
@@ -499,6 +549,7 @@ int main(void) {
         cmocka_unit_test(test_doh_post_header_failures),
         cmocka_unit_test(test_doh_post_transport_and_status_failures),
         cmocka_unit_test(test_doh_post_success_and_http_version_counters),
+        cmocka_unit_test(test_doh_post_http_version_preference),
         cmocka_unit_test(test_doh_client_init_failure_paths),
         cmocka_unit_test(test_doh_resolve_success_and_validation_failure),
         cmocka_unit_test(test_doh_pool_stats_in_use_branch),

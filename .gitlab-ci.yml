@@ -14,17 +14,46 @@ test:
   tags:
     - docker
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3
+    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3 autoconf automake libtool git
+    - git clone --depth 1 -b v1.12.0 https://github.com/ngtcp2/ngtcp2 /tmp/ngtcp2
+    - cd /tmp/ngtcp2
+    - autoreconf -fi
+    - ./configure --enable-lib-only --with-openssl
+    - make -j"$(nproc)"
+    - make install
+    - export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/pkgconfig
+    - export LD_LIBRARY_PATH=/usr/local/lib
+    - cd "$CI_PROJECT_DIR"
   script:
-    - mkdir -p build
-    - cd build
-    - cmake -DBUILD_TESTS=ON -DWARNINGS_AS_ERRORS=ON -DENABLE_UPSTREAM_DOH=ON -DENABLE_UPSTREAM_DOT=ON -DENABLE_UPSTREAM_DOQ=ON ..
-    - cmake --build . -j
-    - ctest --output-on-failure
+    - |
+      set -euo pipefail
+      mkdir -p build-matrix-ci
+      for doh in OFF ON; do
+        for dot in OFF ON; do
+          for doq in OFF ON; do
+            if [ "$doh" = "OFF" ] && [ "$dot" = "OFF" ] && [ "$doq" = "OFF" ]; then
+              continue
+            fi
+            combo="doh-${doh}_dot-${dot}_doq-${doq}"
+            bdir="build-matrix-ci/$combo"
+            echo "==> Configure $combo"
+            cmake -S . -B "$bdir" \
+              -DBUILD_TESTS=ON \
+              -DBUILD_BENCHMARKS=OFF \
+              -DENABLE_UPSTREAM_DOH="$doh" \
+              -DENABLE_UPSTREAM_DOT="$dot" \
+              -DENABLE_UPSTREAM_DOQ="$doq"
+            echo "==> Build $combo"
+            cmake --build "$bdir" -j
+            echo "==> Test $combo"
+            ctest --test-dir "$bdir" --output-on-failure --timeout 30
+          done
+        done
+      done
   artifacts:
     when: on_failure
     paths:
-      - build/Testing/
+      - build-matrix-ci/
     expire_in: 1 week
 
 build:

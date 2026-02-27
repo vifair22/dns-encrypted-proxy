@@ -18,10 +18,8 @@
 
 struct upstream_doq_client {
     int pool_size;
-    int ngtcp2_enabled;
 };
 
-#if UPSTREAM_DOQ_NGTCP2_ENABLED
 int upstream_doq_ngtcp2_resolve(
     const upstream_server_t *server,
     int timeout_ms,
@@ -29,7 +27,6 @@ int upstream_doq_ngtcp2_resolve(
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out);
-#endif
 
 int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config) {
     if (client_out == NULL || config == NULL) {
@@ -42,11 +39,6 @@ int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_
     }
 
     client->pool_size = config->pool_size > 0 ? config->pool_size : 1;
-#if UPSTREAM_DOQ_NGTCP2_ENABLED
-    client->ngtcp2_enabled = 1;
-#else
-    client->ngtcp2_enabled = 0;
-#endif
     *client_out = client;
     return 0;
 }
@@ -79,20 +71,13 @@ int upstream_doq_resolve(
         return -1;
     }
 
-    (void)timeout_ms;
-    int result = -1;
-
-#if UPSTREAM_DOQ_NGTCP2_ENABLED
-    if (client->ngtcp2_enabled) {
-        result = upstream_doq_ngtcp2_resolve(
-            server,
-            timeout_ms,
-            query,
-            query_len,
-            response_out,
-            response_len_out);
-    }
-#endif
+    int result = upstream_doq_ngtcp2_resolve(
+        server,
+        timeout_ms,
+        query,
+        query_len,
+        response_out,
+        response_len_out);
 
     if (result != 0 || *response_out == NULL || *response_len_out == 0) {
         free(*response_out);

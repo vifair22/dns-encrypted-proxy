@@ -2,7 +2,19 @@
 
 dns-encrypted-proxy is a small, high-performance DNS forward proxy written in C.
 
-It listens on classic DNS (`UDP`/`TCP`) and forwards to encrypted upstreams (`DoH` and `DoT`). The goal is simple: keep the data path fast, predictable, and easy to reason about.
+It listens on classic DNS (`UDP`/`TCP`) and forwards to encrypted upstreams. The goal is simple: keep the data path fast, predictable, and easy to reason about.
+
+## Protocol Support
+
+- **DoH (HTTP/1.1 + HTTP/2 + HTTP/3):** supported. The proxy automatically prefers the highest HTTP version available in the linked `libcurl` build.
+- **DoT:** supported and production-ready.
+- **DoQ:** supported behind build flag and currently experimental.
+
+Notes on DoH HTTP version selection:
+
+- If `libcurl` is built with HTTP/3 support, DoH requests prefer HTTP/3.
+- Otherwise, DoH falls back to HTTP/2 (and HTTP/1.1 where needed).
+- The test hook `DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1` can force HTTP/1.1 for integration tests.
 
 ## What This Proxy Is For
 
@@ -48,7 +60,7 @@ cmake -S . -B build
 cmake --build build
 ```
 
-Optional upstream provider build flags (all ON by default):
+Optional upstream provider build flags (DoH/DoT ON by default, DoQ OFF by default):
 
 ```bash
 cmake -S . -B build \
@@ -57,13 +69,17 @@ cmake -S . -B build \
   -DENABLE_UPSTREAM_DOQ=ON
 ```
 
-DoQ ngtcp2 backend is behind an extra flag:
+Tip: verify HTTP/3 availability in your runtime image/host with:
 
 ```bash
-cmake -S . -B build -DENABLE_UPSTREAM_DOQ=ON -DENABLE_DOQ_NGTCP2=ON
+curl -V
 ```
 
-Current DoQ status: ngtcp2-backed QUIC handshake and DoQ stream request/response flow are implemented behind `ENABLE_DOQ_NGTCP2`; interoperability/performance hardening is still in progress.
+Look for `HTTP3` in the `Features` list.
+
+DoQ uses ngtcp2 and requires ngtcp2 + OpenSSL-family crypto modules when enabled.
+
+Current DoQ status: experimental and disabled by default; implementation exists behind `-DENABLE_UPSTREAM_DOQ=ON`, but interoperability is still provider/environment dependent.
 
 Run:
 

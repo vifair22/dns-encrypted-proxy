@@ -71,6 +71,7 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+#if UPSTREAM_DOT_ENABLED || UPSTREAM_DOQ_ENABLED
 static int parse_port_strict(const char *port_text, int *port_out) {
     if (port_text == NULL || port_out == NULL || *port_text == '\0') {
         return -1;
@@ -152,6 +153,7 @@ static int parse_authority_host_port(
 
     return 0;
 }
+#endif
 
 int upstream_parse_url(const char *url, upstream_server_t *server_out) {
     if (url == NULL || server_out == NULL) {

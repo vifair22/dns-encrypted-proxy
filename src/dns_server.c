@@ -552,7 +552,10 @@ static void *udp_loop(void *arg) {
     proxy_server_t *server = ctx->server;
     int fd = ctx->fd;
 
-    uint8_t buffer[DNS_MAX_MESSAGE_SIZE];
+    uint8_t *buffer = (uint8_t *)malloc(DNS_MAX_MESSAGE_SIZE);
+    if (buffer == NULL) {
+        return NULL;
+    }
 
     while (!should_stop(server)) {
         struct pollfd pfd = {0};
@@ -578,7 +581,7 @@ static void *udp_loop(void *arg) {
 
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
-        ssize_t n = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
+        ssize_t n = recvfrom(fd, buffer, DNS_MAX_MESSAGE_SIZE, 0, (struct sockaddr *)&client_addr, &client_len);
         if (n <= 0) {
             continue;
         }
@@ -625,6 +628,7 @@ static void *udp_loop(void *arg) {
         }
     }
 
+    free(buffer);
     return NULL;
 }
 

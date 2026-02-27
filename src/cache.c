@@ -83,6 +83,24 @@ static size_t entry_bytes(const cache_entry_t *entry) {
     return entry->key_len + entry->response_len;
 }
 
+static size_t shard_iteration_limit(const cache_shard_t *shard) {
+    if (shard == NULL) {
+        return 8;
+    }
+
+    size_t limit = shard->entry_count + 1;
+    if (limit < 8) {
+        limit = 8;
+    }
+
+    size_t cap = shard->max_entries + 8;
+    if (cap >= 8 && limit > cap) {
+        limit = cap;
+    }
+
+    return limit;
+}
+
 static void lru_remove(cache_shard_t *shard, cache_entry_t *entry) {
     if (shard == NULL || entry == NULL) {
         return;
@@ -162,9 +180,12 @@ static void evict_lru_tail(cache_shard_t *shard) {
     size_t bucket_idx = fast_index(victim->hash, shard->bucket_count, shard->bucket_mask);
     cache_entry_t *iter = shard->buckets[bucket_idx];
     cache_entry_t *prev = NULL;
-    while (iter != NULL && iter != victim) {
+    size_t scanned = 0;
+    size_t scan_limit = shard_iteration_limit(shard);
+    while (iter != NULL && iter != victim && scanned < scan_limit) {
         prev = iter;
         iter = iter->bucket_next;
+        scanned++;
     }
     if (iter != NULL) {
         remove_bucket_entry(shard, bucket_idx, iter, prev);
@@ -202,7 +223,9 @@ static void shard_sweep_expired(cache_shard_t *shard, uint64_t now, size_t bucke
     while (scanned < bucket_budget) {
         cache_entry_t *entry = shard->buckets[cursor];
         cache_entry_t *prev = NULL;
-        while (entry != NULL) {
+        size_t traversed = 0;
+        size_t traverse_limit = shard_iteration_limit(shard);
+        while (entry != NULL && traversed < traverse_limit) {
             cache_entry_t *next = entry->bucket_next;
             if (entry->expires_at <= now) {
                 remove_bucket_entry(shard, cursor, entry, prev);
@@ -211,6 +234,7 @@ static void shard_sweep_expired(cache_shard_t *shard, uint64_t now, size_t bucke
                 prev = entry;
             }
             entry = next;
+            traversed++;
         }
 
         cursor++;
@@ -236,12 +260,15 @@ static int shard_rehash(cache_shard_t *shard, size_t new_bucket_count) {
 
     for (size_t i = 0; i < shard->bucket_count; i++) {
         cache_entry_t *entry = shard->buckets[i];
-        while (entry != NULL) {
+        size_t traversed = 0;
+        size_t traverse_limit = shard_iteration_limit(shard);
+        while (entry != NULL && traversed < traverse_limit) {
             cache_entry_t *next = entry->bucket_next;
             size_t idx = (size_t)(entry->hash % (uint64_t)new_bucket_count);
             entry->bucket_next = new_buckets[idx];
             new_buckets[idx] = entry;
             entry = next;
+            traversed++;
         }
     }
 
@@ -329,12 +356,15 @@ static void shard_destroy(cache_shard_t *shard) {
     if (shard->buckets != NULL) {
         for (size_t i = 0; i < shard->bucket_count; i++) {
             cache_entry_t *entry = shard->buckets[i];
-            while (entry != NULL) {
+            size_t traversed = 0;
+            size_t traverse_limit = shard_iteration_limit(shard);
+            while (entry != NULL && traversed < traverse_limit) {
                 cache_entry_t *next = entry->bucket_next;
                 free(entry->key);
                 free(entry->response);
                 free(entry);
                 entry = next;
+                traversed++;
             }
         }
         free(shard->buckets);
@@ -445,15 +475,18 @@ int dns_cache_lookup(
     size_t bucket_idx = fast_index(hash, shard->bucket_count, shard->bucket_mask);
     cache_entry_t *entry = shard->buckets[bucket_idx];
     cache_entry_t *prev = NULL;
-    while (entry != NULL) {
+    size_t scanned = 0;
+    size_t scan_limit = shard_iteration_limit(shard);
+    while (entry != NULL && scanned < scan_limit) {
         if (key_equals(entry, hash, key, key_len)) {
             break;
         }
         prev = entry;
         entry = entry->bucket_next;
+        scanned++;
     }
 
-    if (entry == NULL) {
+    if (entry == NULL || scanned >= scan_limit) {
         shard_unlock(cache, shard);
         return 0;
     }
@@ -537,12 +570,20 @@ void dns_cache_store(
     size_t bucket_idx = fast_index(hash, shard->bucket_count, shard->bucket_mask);
     cache_entry_t *entry = shard->buckets[bucket_idx];
     cache_entry_t *prev = NULL;
-    while (entry != NULL) {
+    size_t scanned = 0;
+    size_t scan_limit = shard_iteration_limit(shard);
+    while (entry != NULL && scanned < scan_limit) {
         if (key_equals(entry, hash, key, key_len)) {
             break;
         }
         prev = entry;
         entry = entry->bucket_next;
+        scanned++;
+    }
+
+    if (scanned >= scan_limit) {
+        shard_unlock(cache, shard);
+        return;
     }
 
     if (entry != NULL) {

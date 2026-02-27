@@ -39,8 +39,18 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.metrics_enabled, 1);
     assert_int_equal(config.metrics_port, 9090);
     assert_int_equal(config.upstream_count, 2);
+#if UPSTREAM_DOH_ENABLED
     assert_string_equal(config.upstream_urls[0], "https://cloudflare-dns.com/dns-query");
     assert_string_equal(config.upstream_urls[1], "https://dns.google/dns-query");
+#elif UPSTREAM_DOT_ENABLED
+    assert_string_equal(config.upstream_urls[0], "tls://cloudflare-dns.com:853");
+    assert_string_equal(config.upstream_urls[1], "tls://dns.google:853");
+#elif UPSTREAM_DOQ_ENABLED
+    assert_string_equal(config.upstream_urls[0], "quic://dns.adguard-dns.com:853");
+    assert_string_equal(config.upstream_urls[1], "quic://dns.adguard-dns.com:8853");
+#else
+    assert_true(0);
+#endif
 }
 
 /*

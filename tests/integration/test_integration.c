@@ -321,11 +321,13 @@ static void mock_tls_server_join_and_destroy(mock_tls_server_t *server) {
 static int resolve_test_cert_paths(char *cert_out, size_t cert_out_len, char *key_out, size_t key_out_len) {
     const char *cert_candidates[] = {
         "tests/certs/localhost.cert.pem",
-        "../tests/certs/localhost.cert.pem"
+        "../tests/certs/localhost.cert.pem",
+        "../../tests/certs/localhost.cert.pem"
     };
     const char *key_candidates[] = {
         "tests/certs/localhost.key.pem",
-        "../tests/certs/localhost.key.pem"
+        "../tests/certs/localhost.key.pem",
+        "../../tests/certs/localhost.key.pem"
     };
 
     int cert_found = 0;
@@ -593,8 +595,20 @@ static const char *resolve_proxy_binary_path(void) {
     if (access("./dns-encrypted-proxy", X_OK) == 0) {
         return "./dns-encrypted-proxy";
     }
+    if (access("./build-no-doh/dns-encrypted-proxy", X_OK) == 0) {
+        return "./build-no-doh/dns-encrypted-proxy";
+    }
+    if (access("./build-doq-ngtcp2/dns-encrypted-proxy", X_OK) == 0) {
+        return "./build-doq-ngtcp2/dns-encrypted-proxy";
+    }
+    if (access("./build/dns-encrypted-proxy", X_OK) == 0) {
+        return "./build/dns-encrypted-proxy";
+    }
     if (access("../dns-encrypted-proxy", X_OK) == 0) {
         return "../dns-encrypted-proxy";
+    }
+    if (access("../build/dns-encrypted-proxy", X_OK) == 0) {
+        return "../build/dns-encrypted-proxy";
     }
     return NULL;
 }
@@ -834,8 +848,9 @@ static const char *resolve_mock_doq_script_path(void) {
 static int start_python_doq_server(
     python_doq_server_t *server,
     const char *cert_path,
-    const char *key_path) {
-    if (server == NULL || cert_path == NULL || key_path == NULL) {
+    const char *key_path,
+    const char *mode) {
+    if (server == NULL || cert_path == NULL || key_path == NULL || mode == NULL) {
         return -1;
     }
 
@@ -859,7 +874,7 @@ static int start_python_doq_server(
     if (pid == 0) {
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", server->port);
-        execlp("python3", "python3", script, port_str, cert_path, key_path, (char *)NULL);
+        execlp("python3", "python3", script, port_str, cert_path, key_path, mode, (char *)NULL);
         _exit(127);
     }
 
@@ -1224,6 +1239,7 @@ static void test_ttl_aging_in_cache(void **state) {
 /*
  * Test: DoH transport path succeeds against local HTTPS mock
  */
+#if UPSTREAM_DOH_ENABLED
 static void test_upstream_transport_doh_success(void **state) {
     (void)state;
 
@@ -1294,10 +1310,12 @@ static void test_upstream_transport_doh_success(void **state) {
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
+#endif
 
 /*
  * Test: DoH transport path handles unreachable endpoint failure
  */
+#if UPSTREAM_DOH_ENABLED
 static void test_upstream_transport_doh_unreachable(void **state) {
     (void)state;
 
@@ -1335,6 +1353,7 @@ static void test_upstream_transport_doh_unreachable(void **state) {
     assert_true(client.servers[0].health.total_failures >= 1);
     upstream_client_destroy(&client);
 }
+#endif
 
 /*
  * Test: DoT transport path succeeds over local TLS server
@@ -1634,7 +1653,7 @@ static void test_upstream_transport_dot_partial_body(void **state) {
     unsetenv("SSL_CERT_FILE");
 }
 
-#if UPSTREAM_DOQ_ENABLED && UPSTREAM_DOQ_NGTCP2_ENABLED
+#if UPSTREAM_DOQ_ENABLED
 /*
  * Test: DoQ transport path succeeds against local Python QUIC mock
  */
@@ -1653,7 +1672,7 @@ static void test_upstream_transport_doq_success(void **state) {
     assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
 
     python_doq_server_t server;
-    if (start_python_doq_server(&server, cert_path, key_path) != 0) {
+    if (start_python_doq_server(&server, cert_path, key_path, "ok") != 0) {
         skip();
     }
 
@@ -1733,11 +1752,232 @@ static void test_upstream_transport_doq_unreachable(void **state) {
     assert_true(client.servers[0].health.total_failures >= 1);
     upstream_client_destroy(&client);
 }
+
+/*
+ * Test: DoQ transport fails when peer negotiates non-DoQ ALPN
+ */
+static void test_upstream_transport_doq_alpn_mismatch(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+    if (system("python3 -c 'import aioquic' >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    python_doq_server_t server;
+    if (start_python_doq_server(&server, cert_path, key_path, "alpn_mismatch") != 0) {
+        skip();
+    }
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "quic://localhost:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 300,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    stop_python_doq_server(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoQ transport fails when peer sends malformed framed response length
+ */
+static void test_upstream_transport_doq_malformed_len(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+    if (system("python3 -c 'import aioquic' >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    python_doq_server_t server;
+    if (start_python_doq_server(&server, cert_path, key_path, "malformed_len") != 0) {
+        skip();
+    }
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "quic://localhost:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 300,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    stop_python_doq_server(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoQ transport fails when peer never sends FIN on response stream
+ */
+static void test_upstream_transport_doq_no_fin(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+    if (system("python3 -c 'import aioquic' >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    python_doq_server_t server;
+    if (start_python_doq_server(&server, cert_path, key_path, "no_fin") != 0) {
+        skip();
+    }
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "quic://localhost:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 300,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    stop_python_doq_server(&server);
+    unsetenv("SSL_CERT_FILE");
+}
+
+/*
+ * Test: DoQ transport fails when peer closes stream early
+ */
+static void test_upstream_transport_doq_close_early(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+    if (system("python3 -c 'import aioquic' >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    python_doq_server_t server;
+    if (start_python_doq_server(&server, cert_path, key_path, "close_early") != 0) {
+        skip();
+    }
+
+    setenv("SSL_CERT_FILE", cert_path, 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "quic://localhost:%d", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 300,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 1,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    assert_int_equal(
+        upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len),
+        -1);
+    assert_null(response);
+    assert_int_equal(response_len, 0);
+
+    upstream_client_destroy(&client);
+    stop_python_doq_server(&server);
+    unsetenv("SSL_CERT_FILE");
+}
 #endif
 
 /*
  * Test: DoH runtime stats record HTTP/1 responses when forced via test env
  */
+#if UPSTREAM_DOH_ENABLED
 static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
     (void)state;
 
@@ -1794,10 +2034,12 @@ static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
+#endif
 
 /*
  * Test: Failover from failed DoH upstream to healthy DoT upstream
  */
+#if UPSTREAM_DOH_ENABLED && UPSTREAM_DOT_ENABLED
 static void test_upstream_transport_failover_doh_to_dot(void **state) {
     (void)state;
 
@@ -1856,6 +2098,7 @@ static void test_upstream_transport_failover_doh_to_dot(void **state) {
     unsetenv("CURL_CA_BUNDLE");
     unsetenv("SSL_CERT_FILE");
 }
+#endif
 
 /*
  * Test: Metrics endpoint serves prometheus text and 404 for non-metrics routes
@@ -1907,8 +2150,12 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
     assert_int_equal(dns_cache_init(&cache, 16), 0);
 
     const char *urls[] = {
+#if UPSTREAM_DOH_ENABLED
         "https://cloudflare-dns.com/dns-query",
+#endif
+#if UPSTREAM_DOT_ENABLED
         "tls://1.1.1.1:853",
+#endif
 #if UPSTREAM_DOQ_ENABLED
         "quic://1.1.1.1:853"
 #endif
@@ -1928,8 +2175,12 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
+#if UPSTREAM_DOH_ENABLED
     assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_requests_total{upstream=\"https://cloudflare-dns.com/dns-query\",protocol=\"doh\"}"));
+#endif
+#if UPSTREAM_DOT_ENABLED
     assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_healthy{upstream=\"tls://1.1.1.1:853\",protocol=\"dot\"}"));
+#endif
 #if UPSTREAM_DOQ_ENABLED
     assert_non_null(strstr(body, "dns_encrypted_proxy_upstream_server_healthy{upstream=\"quic://1.1.1.1:853\",protocol=\"doq\"}"));
 #endif
@@ -2017,7 +2268,13 @@ static void test_dns_server_udp_servfail_path(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2076,7 +2333,13 @@ static void test_dns_server_tcp_connection_rejection(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2130,7 +2393,13 @@ static void test_dns_server_tcp_servfail_path(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2363,7 +2632,13 @@ static void test_main_runtime_bind_failure_exits_nonzero(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
+#if UPSTREAM_DOH_ENABLED
         "upstream_url=https://127.0.0.1:6553/dns-query\n"
+#elif UPSTREAM_DOT_ENABLED
+        "upstream_url=tls://127.0.0.1:6553\n"
+#else
+        "upstream_url=quic://127.0.0.1:6553\n"
+#endif
         "metrics_enabled=0\n"
         "metrics_port=9090\n";
     (void)dead_upstream;
@@ -2402,7 +2677,13 @@ static void test_main_start_metrics_disabled_and_signal_shutdown(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
+#if UPSTREAM_DOH_ENABLED
         "upstreams=https://127.0.0.1:%d/dns-query\n"
+#elif UPSTREAM_DOT_ENABLED
+        "upstreams=tls://127.0.0.1:%d\n"
+#else
+        "upstreams=quic://127.0.0.1:%d\n"
+#endif
         "metrics_enabled=0\n"
         "metrics_port=9090\n",
         listen_port,
@@ -2448,7 +2729,13 @@ static void test_main_no_arg_uses_env_config_and_signal_shutdown(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
+#if UPSTREAM_DOH_ENABLED
         "upstreams=https://127.0.0.1:%d/dns-query\n"
+#elif UPSTREAM_DOT_ENABLED
+        "upstreams=tls://127.0.0.1:%d\n"
+#else
+        "upstreams=quic://127.0.0.1:%d\n"
+#endif
         "metrics_enabled=0\n"
         "metrics_port=9090\n",
         listen_port,
@@ -2496,7 +2783,13 @@ static void test_dns_server_tcp_max_queries_per_connection(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2596,7 +2889,13 @@ static void test_dns_server_tcp_zero_length_frame_ignored(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2650,7 +2949,13 @@ static void test_dns_server_tcp_partial_frame_close(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2696,6 +3001,7 @@ static void test_dns_server_tcp_partial_frame_close(void **state) {
 /*
  * Test: UDP path truncates oversized upstream response for non-EDNS query
  */
+#if UPSTREAM_DOH_ENABLED
 static void test_dns_server_udp_truncation_path(void **state) {
     (void)state;
 
@@ -2814,6 +3120,8 @@ static void test_dns_server_udp_truncation_path(void **state) {
     unsetenv("CURL_CA_BUNDLE");
 }
 
+#endif
+
 /*
  * Test: TCP idle timeout closes silent client connection
  */
@@ -2835,7 +3143,13 @@ static void test_dns_server_tcp_idle_timeout_close(void **state) {
 
     int dead_port = reserve_unused_port();
     assert_true(dead_port > 0);
+#if UPSTREAM_DOH_ENABLED
     snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://127.0.0.1:%d/dns-query", dead_port);
+#elif UPSTREAM_DOT_ENABLED
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "tls://127.0.0.1:%d", dead_port);
+#else
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "quic://127.0.0.1:%d", dead_port);
+#endif
 
     volatile sig_atomic_t stop = 0;
     proxy_server_t server;
@@ -2875,6 +3189,7 @@ static void test_dns_server_tcp_idle_timeout_close(void **state) {
 /*
  * Test: EDNS query keeps oversized UDP response untruncated (no TC)
  */
+#if UPSTREAM_DOH_ENABLED
 static void test_dns_server_udp_edns_no_truncation(void **state) {
     (void)state;
 
@@ -2992,6 +3307,7 @@ static void test_dns_server_udp_edns_no_truncation(void **state) {
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
+#endif
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
@@ -3011,20 +3327,30 @@ int main(void) {
     };
 #elif defined(INTEGRATION_GROUP_TRANSPORT)
     const struct CMUnitTest tests[] = {
+#if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_upstream_transport_doh_success),
         cmocka_unit_test(test_upstream_transport_doh_unreachable),
         cmocka_unit_test(test_upstream_transport_doh_http1_runtime_stats),
+#endif
+#if UPSTREAM_DOT_ENABLED
         cmocka_unit_test(test_upstream_transport_dot),
         cmocka_unit_test(test_upstream_transport_dot_unreachable),
         cmocka_unit_test(test_upstream_transport_dot_zero_length_response),
         cmocka_unit_test(test_upstream_transport_dot_malformed_response),
         cmocka_unit_test(test_upstream_transport_dot_close_before_length),
         cmocka_unit_test(test_upstream_transport_dot_partial_body),
-#if UPSTREAM_DOQ_ENABLED && UPSTREAM_DOQ_NGTCP2_ENABLED
+#endif
+#if UPSTREAM_DOQ_ENABLED
         cmocka_unit_test(test_upstream_transport_doq_success),
         cmocka_unit_test(test_upstream_transport_doq_unreachable),
+        cmocka_unit_test(test_upstream_transport_doq_alpn_mismatch),
+        cmocka_unit_test(test_upstream_transport_doq_malformed_len),
+        cmocka_unit_test(test_upstream_transport_doq_no_fin),
+        cmocka_unit_test(test_upstream_transport_doq_close_early),
 #endif
+#if UPSTREAM_DOH_ENABLED && UPSTREAM_DOT_ENABLED
         cmocka_unit_test(test_upstream_transport_failover_doh_to_dot),
+#endif
         cmocka_unit_test(test_metrics_endpoint_with_upstream_labels),
     };
 #elif defined(INTEGRATION_GROUP_RUNTIME)
@@ -3047,9 +3373,13 @@ int main(void) {
         cmocka_unit_test(test_runtime_api_invalid_arguments),
         cmocka_unit_test(test_dns_server_tcp_zero_length_frame_ignored),
         cmocka_unit_test(test_dns_server_tcp_partial_frame_close),
+#if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_dns_server_udp_truncation_path),
+#endif
         cmocka_unit_test(test_dns_server_tcp_idle_timeout_close),
+#if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_dns_server_udp_edns_no_truncation),
+#endif
     };
 #else
 #error "Define one integration group macro"

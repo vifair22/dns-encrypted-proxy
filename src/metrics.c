@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -110,6 +111,8 @@ static void escape_label_value(const char *src, char *dst, size_t dst_size) {
 
 static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
     if (appendf(out, out_size, offset,
+                "\n"
+                "# ---- upstream servers ----\n"
                 "# HELP dns_encrypted_proxy_upstream_server_requests_total Total requests attempted against each configured upstream.\n"
                 "# TYPE dns_encrypted_proxy_upstream_server_requests_total counter\n"
                 "# HELP dns_encrypted_proxy_upstream_server_failures_total Total failed requests against each configured upstream.\n"
@@ -155,6 +158,33 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
     }
 
     return 0;
+}
+
+static int append_pool_metric_row(
+    char *out,
+    size_t out_size,
+    size_t *offset,
+    const char *protocol,
+    int capacity,
+    int in_use,
+    int idle,
+    int connections_alive) {
+    return appendf(
+        out,
+        out_size,
+        offset,
+        "dns_encrypted_proxy_upstream_pool_capacity{protocol=\"%s\"} %d\n"
+        "dns_encrypted_proxy_upstream_pool_in_use{protocol=\"%s\"} %d\n"
+        "dns_encrypted_proxy_upstream_pool_idle{protocol=\"%s\"} %d\n"
+        "dns_encrypted_proxy_upstream_connections_alive{protocol=\"%s\"} %d\n",
+        protocol,
+        capacity,
+        protocol,
+        in_use,
+        protocol,
+        idle,
+        protocol,
+        connections_alive);
 }
 
 static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_size) {
@@ -206,6 +236,7 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             out,
             out_size,
             &offset,
+            "# ---- traffic and responses ----\n"
             "# HELP dns_encrypted_proxy_uptime_seconds Process uptime in seconds.\n"
             "# TYPE dns_encrypted_proxy_uptime_seconds gauge\n"
             "dns_encrypted_proxy_uptime_seconds %.3f\n"
@@ -277,6 +308,8 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             out,
             out_size,
             &offset,
+            "\n"
+            "# ---- cache and metrics endpoint ----\n"
             "# HELP dns_encrypted_proxy_cache_entries Number of cache entries currently in use.\n"
             "# TYPE dns_encrypted_proxy_cache_entries gauge\n"
             "dns_encrypted_proxy_cache_entries %llu\n"
@@ -320,58 +353,63 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             out,
             out_size,
             &offset,
-            "# HELP dns_encrypted_proxy_doh_pool_capacity Configured DoH handle pool capacity.\n"
-            "# TYPE dns_encrypted_proxy_doh_pool_capacity gauge\n"
-            "dns_encrypted_proxy_doh_pool_capacity %d\n"
-            "# HELP dns_encrypted_proxy_doh_pool_in_use Number of DoH handles currently in use.\n"
-            "# TYPE dns_encrypted_proxy_doh_pool_in_use gauge\n"
-            "dns_encrypted_proxy_doh_pool_in_use %d\n"
-            "# HELP dns_encrypted_proxy_doh_pool_idle Number of idle DoH handles in pool.\n"
-            "# TYPE dns_encrypted_proxy_doh_pool_idle gauge\n"
-            "dns_encrypted_proxy_doh_pool_idle %d\n"
+            "\n"
+            "# ---- upstream pools and protocol runtime ----\n"
+            "# HELP dns_encrypted_proxy_upstream_pool_capacity Configured upstream connection/handle pool capacity by protocol.\n"
+            "# TYPE dns_encrypted_proxy_upstream_pool_capacity gauge\n"
+            "# HELP dns_encrypted_proxy_upstream_pool_in_use Number of upstream connection/handle slots currently in use by protocol.\n"
+            "# TYPE dns_encrypted_proxy_upstream_pool_in_use gauge\n"
+            "# HELP dns_encrypted_proxy_upstream_pool_idle Number of idle upstream connection/handle slots by protocol.\n"
+            "# TYPE dns_encrypted_proxy_upstream_pool_idle gauge\n"
+            "# HELP dns_encrypted_proxy_upstream_connections_alive Number of currently established upstream transport connections by protocol.\n"
+            "# TYPE dns_encrypted_proxy_upstream_connections_alive gauge\n"
             "# HELP dns_encrypted_proxy_doh_http_responses_total Total DoH responses by negotiated HTTP version.\n"
             "# TYPE dns_encrypted_proxy_doh_http_responses_total counter\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h2\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h1\"} %llu\n"
-            "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n"
-            "# HELP dns_encrypted_proxy_dot_pool_capacity Configured DoT connection pool capacity.\n"
-            "# TYPE dns_encrypted_proxy_dot_pool_capacity gauge\n"
-            "dns_encrypted_proxy_dot_pool_capacity %d\n"
-            "# HELP dns_encrypted_proxy_dot_pool_in_use Number of DoT connection slots currently in use.\n"
-            "# TYPE dns_encrypted_proxy_dot_pool_in_use gauge\n"
-            "dns_encrypted_proxy_dot_pool_in_use %d\n"
-            "# HELP dns_encrypted_proxy_dot_pool_idle Number of idle DoT connection slots in pool.\n"
-            "# TYPE dns_encrypted_proxy_dot_pool_idle gauge\n"
-            "dns_encrypted_proxy_dot_pool_idle %d\n"
-            "# HELP dns_encrypted_proxy_dot_connections_alive Number of currently established DoT TLS connections.\n"
-            "# TYPE dns_encrypted_proxy_dot_connections_alive gauge\n"
-            "dns_encrypted_proxy_dot_connections_alive %d\n"
-            "# HELP dns_encrypted_proxy_doq_pool_capacity Configured DoQ connection pool capacity.\n"
-            "# TYPE dns_encrypted_proxy_doq_pool_capacity gauge\n"
-            "dns_encrypted_proxy_doq_pool_capacity %d\n"
-            "# HELP dns_encrypted_proxy_doq_pool_in_use Number of DoQ connection slots currently in use.\n"
-            "# TYPE dns_encrypted_proxy_doq_pool_in_use gauge\n"
-            "dns_encrypted_proxy_doq_pool_in_use %d\n"
-            "# HELP dns_encrypted_proxy_doq_pool_idle Number of idle DoQ connection slots in pool.\n"
-            "# TYPE dns_encrypted_proxy_doq_pool_idle gauge\n"
-            "dns_encrypted_proxy_doq_pool_idle %d\n"
-            "# HELP dns_encrypted_proxy_doq_connections_alive Number of currently established DoQ connections.\n"
-            "# TYPE dns_encrypted_proxy_doq_connections_alive gauge\n"
-            "dns_encrypted_proxy_doq_connections_alive %d\n",
+            "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n",
+            (unsigned long long)runtime_stats.doh_http2_responses_total,
+            (unsigned long long)runtime_stats.doh_http1_responses_total,
+            (unsigned long long)runtime_stats.doh_http_other_responses_total) != 0) {
+        return -1;
+    }
+
+    if (append_pool_metric_row(
+            out,
+            out_size,
+            &offset,
+            "doh",
             runtime_stats.doh_pool_capacity,
             runtime_stats.doh_pool_in_use,
             doh_pool_idle,
-            (unsigned long long)runtime_stats.doh_http2_responses_total,
-            (unsigned long long)runtime_stats.doh_http1_responses_total,
-            (unsigned long long)runtime_stats.doh_http_other_responses_total,
+            0)
+        != 0) {
+        return -1;
+    }
+
+    if (append_pool_metric_row(
+            out,
+            out_size,
+            &offset,
+            "dot",
             runtime_stats.dot_pool_capacity,
             runtime_stats.dot_pool_in_use,
             dot_pool_idle,
-            runtime_stats.dot_connections_alive,
+            runtime_stats.dot_connections_alive)
+        != 0) {
+        return -1;
+    }
+
+    if (append_pool_metric_row(
+            out,
+            out_size,
+            &offset,
+            "doq",
             runtime_stats.doq_pool_capacity,
             runtime_stats.doq_pool_in_use,
             doq_pool_idle,
-            runtime_stats.doq_connections_alive) != 0) {
+            runtime_stats.doq_connections_alive)
+        != 0) {
         return -1;
     }
 
@@ -407,9 +445,19 @@ static void handle_client(int client_fd) {
         goto done;
     }
 
-    char body[32768];
-    int body_len = build_metrics_body(g_metrics, body, sizeof(body));
+    char *body = (char *)malloc(32768);
+    if (body == NULL) {
+        const char *resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        (void)write_all(client_fd, resp, strlen(resp));
+        if (g_metrics != NULL) {
+            atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
+        }
+        goto done;
+    }
+
+    int body_len = build_metrics_body(g_metrics, body, 32768);
     if (body_len < 0) {
+        free(body);
         const char *resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         (void)write_all(client_fd, resp, strlen(resp));
         if (g_metrics != NULL) {
@@ -428,6 +476,7 @@ static void handle_client(int client_fd) {
         "Connection: close\r\n\r\n",
         body_len);
     if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
+        free(body);
         if (g_metrics != NULL) {
             atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
         }
@@ -435,6 +484,7 @@ static void handle_client(int client_fd) {
     }
 
     if (write_all(client_fd, header, (size_t)header_len) != 0) {
+        free(body);
         if (g_metrics != NULL) {
             atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
         }
@@ -448,6 +498,7 @@ static void handle_client(int client_fd) {
     } else if (g_metrics != NULL) {
         atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
     }
+    free(body);
 
 done:
     if (tracked) {

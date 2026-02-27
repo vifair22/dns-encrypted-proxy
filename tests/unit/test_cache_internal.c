@@ -571,6 +571,68 @@ static void test_cache_expired_lookup_in_collision_bucket_keeps_chain_valid(void
     unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
 }
 
+static void test_cache_cycle_guard_prevents_lookup_and_store_lockup(void **state) {
+    (void)state;
+    reset_alloc_stubs();
+
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
+    dns_cache_t cache;
+    assert_int_equal(dns_cache_init(&cache, 32), 0);
+
+    cache_shard_t *shard = &cache.shards[0];
+    const uint8_t key_a[] = {0x11};
+    const uint8_t key_b[] = {0x22};
+    const uint8_t resp[] = {0x12, 0x34, 0x81, 0x80};
+
+    cache_entry_t *a = calloc(1, sizeof(*a));
+    cache_entry_t *b = calloc(1, sizeof(*b));
+    assert_non_null(a);
+    assert_non_null(b);
+
+    a->key = (uint8_t *)malloc(sizeof(key_a));
+    b->key = (uint8_t *)malloc(sizeof(key_b));
+    a->response = (uint8_t *)malloc(sizeof(resp));
+    b->response = (uint8_t *)malloc(sizeof(resp));
+    assert_non_null(a->key);
+    assert_non_null(b->key);
+    assert_non_null(a->response);
+    assert_non_null(b->response);
+
+    memcpy(a->key, key_a, sizeof(key_a));
+    memcpy(b->key, key_b, sizeof(key_b));
+    memcpy(a->response, resp, sizeof(resp));
+    memcpy(b->response, resp, sizeof(resp));
+
+    a->key_len = sizeof(key_a);
+    b->key_len = sizeof(key_b);
+    a->response_len = sizeof(resp);
+    b->response_len = sizeof(resp);
+    a->ttl_seconds = 60;
+    b->ttl_seconds = 60;
+    a->expires_at = 1000;
+    b->expires_at = 1000;
+    a->hash = 1;
+    b->hash = 2;
+
+    size_t bi = 0;
+    shard->buckets[bi] = a;
+    a->bucket_next = b;
+    b->bucket_next = a; /* intentional corruption cycle */
+    shard->entry_count = 2;
+
+    uint8_t req_id[2] = {0xAA, 0x55};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+
+    assert_int_equal(dns_cache_lookup(&cache, (const uint8_t *)"missing", 7, req_id, &out, &out_len), 0);
+    dns_cache_store(&cache, (const uint8_t *)"new", 3, resp, sizeof(resp), 60);
+
+    a->bucket_next = b;
+    b->bucket_next = NULL;
+    dns_cache_destroy(&cache);
+    unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_cache_static_guard_paths),
@@ -583,6 +645,7 @@ int main(void) {
         cmocka_unit_test(test_cache_new_helpers_and_single_thread_mode),
         cmocka_unit_test(test_cache_new_branch_paths),
         cmocka_unit_test(test_cache_expired_lookup_in_collision_bucket_keeps_chain_valid),
+        cmocka_unit_test(test_cache_cycle_guard_prevents_lookup_and_store_lockup),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

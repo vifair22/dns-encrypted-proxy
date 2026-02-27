@@ -234,9 +234,21 @@ static void set_defaults(proxy_config_t *config) {
     config->upstream_pool_size = 6;
     config->cache_capacity = 1024;
 
+#if UPSTREAM_DOH_ENABLED
     strncpy(config->upstream_urls[0], "https://cloudflare-dns.com/dns-query", MAX_URL_LEN - 1);
     strncpy(config->upstream_urls[1], "https://dns.google/dns-query", MAX_URL_LEN - 1);
     config->upstream_count = 2;
+#elif UPSTREAM_DOT_ENABLED
+    strncpy(config->upstream_urls[0], "tls://cloudflare-dns.com:853", MAX_URL_LEN - 1);
+    strncpy(config->upstream_urls[1], "tls://dns.google:853", MAX_URL_LEN - 1);
+    config->upstream_count = 2;
+#elif UPSTREAM_DOQ_ENABLED
+    strncpy(config->upstream_urls[0], "quic://dns.adguard-dns.com:853", MAX_URL_LEN - 1);
+    strncpy(config->upstream_urls[1], "quic://dns.adguard-dns.com:8853", MAX_URL_LEN - 1);
+    config->upstream_count = 2;
+#else
+    config->upstream_count = 0;
+#endif
 
     strncpy(config->config_path, "dns-encrypted-proxy.conf", sizeof(config->config_path) - 1);
 
@@ -298,8 +310,14 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
         }
     }
 
-    strncpy(config->config_path, path, sizeof(config->config_path) - 1);
-    config->config_path[sizeof(config->config_path) - 1] = '\0';
+    /*
+     * |path| can alias config->config_path when defaults are used, so copy
+     * through a temporary buffer to avoid undefined overlap behavior.
+     */
+    char selected_path[sizeof(config->config_path)];
+    strncpy(selected_path, path, sizeof(selected_path) - 1);
+    selected_path[sizeof(selected_path) - 1] = '\0';
+    memcpy(config->config_path, selected_path, sizeof(selected_path));
 
     load_config_file(config, config->config_path);
     apply_env_overrides(config);

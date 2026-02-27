@@ -33,6 +33,9 @@ struct upstream_doh_client {
 };
 
 static int curl_http_version_is_h2(long http_version) {
+#if !defined(CURL_HTTP_VERSION_2_0) && !defined(CURL_HTTP_VERSION_2) && !defined(CURL_HTTP_VERSION_2TLS) && !defined(CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE)
+    (void)http_version;
+#endif
 #ifdef CURL_HTTP_VERSION_2_0
     if (http_version == CURL_HTTP_VERSION_2_0) {
         return 1;
@@ -57,6 +60,9 @@ static int curl_http_version_is_h2(long http_version) {
 }
 
 static int curl_http_version_is_h1(long http_version) {
+#if !defined(CURL_HTTP_VERSION_1_0) && !defined(CURL_HTTP_VERSION_1_1)
+    (void)http_version;
+#endif
 #ifdef CURL_HTTP_VERSION_1_0
     if (http_version == CURL_HTTP_VERSION_1_0) {
         return 1;
@@ -68,6 +74,20 @@ static int curl_http_version_is_h1(long http_version) {
     }
 #endif
     return 0;
+}
+
+static long doh_preferred_http_version(void) {
+#ifdef CURL_HTTP_VERSION_3
+    return CURL_HTTP_VERSION_3;
+#elif defined(CURL_HTTP_VERSION_3ONLY)
+    return CURL_HTTP_VERSION_3ONLY;
+#elif defined(CURL_HTTP_VERSION_2TLS)
+    return CURL_HTTP_VERSION_2TLS;
+#elif defined(CURL_HTTP_VERSION_2)
+    return CURL_HTTP_VERSION_2;
+#else
+    return CURL_HTTP_VERSION_NONE;
+#endif
 }
 
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
@@ -163,7 +183,7 @@ static int doh_post_with_handle(
     if (force_http1 != NULL && *force_http1 != '\0') {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     } else {
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, doh_preferred_http_version());
     }
 
     const char *insecure_tls = getenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");

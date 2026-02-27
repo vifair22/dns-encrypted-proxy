@@ -71,15 +71,15 @@ int dns_validate_response_for_query(
     return g_validate_rc;
 }
 
-#undef UPSTREAM_DOQ_NGTCP2_ENABLED
-#define UPSTREAM_DOQ_NGTCP2_ENABLED 1
+#undef UPSTREAM_DOQ_ENABLED
+#define UPSTREAM_DOQ_ENABLED 1
 #include "../../src/upstream_doq.c"
 
 static void test_upstream_doq_resolve_backend_failure(void **state) {
     (void)state;
     reset_stubs();
 
-    upstream_doq_client_t client = {.pool_size = 1, .ngtcp2_enabled = 1};
+    upstream_doq_client_t client = {.pool_size = 1};
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
     server.type = UPSTREAM_TYPE_DOQ;
@@ -99,7 +99,7 @@ static void test_upstream_doq_resolve_validation_failure_frees_response(void **s
     (void)state;
     reset_stubs();
 
-    upstream_doq_client_t client = {.pool_size = 1, .ngtcp2_enabled = 1};
+    upstream_doq_client_t client = {.pool_size = 1};
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
     server.type = UPSTREAM_TYPE_DOQ;
@@ -125,7 +125,7 @@ static void test_upstream_doq_resolve_success_path(void **state) {
     (void)state;
     reset_stubs();
 
-    upstream_doq_client_t client = {.pool_size = 2, .ngtcp2_enabled = 1};
+    upstream_doq_client_t client = {.pool_size = 2};
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
     server.type = UPSTREAM_TYPE_DOQ;
@@ -153,7 +153,7 @@ static void test_upstream_doq_resolve_guards(void **state) {
     (void)state;
     reset_stubs();
 
-    upstream_doq_client_t client = {.pool_size = 1, .ngtcp2_enabled = 1};
+    upstream_doq_client_t client = {.pool_size = 1};
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
     server.type = UPSTREAM_TYPE_DOQ;

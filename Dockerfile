@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM alpine:3.19 AS build
+FROM alpine:edge AS build
 
 RUN apk add --no-cache \
     build-base \
@@ -21,13 +21,14 @@ RUN cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_TESTS=OFF \
     -DBUILD_BENCHMARKS=OFF \
+    -DENABLE_UPSTREAM_DOQ=OFF \
     -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -ffunction-sections -fdata-sections" \
     -DCMAKE_EXE_LINKER_FLAGS_RELEASE="-Wl,--gc-sections" \
     && cmake --build build --target dns-encrypted-proxy -j \
     && strip /src/build/dns-encrypted-proxy
 
-FROM alpine:3.19 AS runtime
+FROM alpine:edge AS runtime
 
 RUN apk add --no-cache \
     libcurl \
