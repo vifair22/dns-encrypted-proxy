@@ -38,7 +38,10 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 COPY --from=build /src/build/dns-encrypted-proxy /app/dns-encrypted-proxy
-COPY dns-encrypted-proxy.conf.example /app/dns-encrypted-proxy.conf.example
+RUN mkdir -p /app/config
+COPY dns-encrypted-proxy.conf.example /app/config/dns-encrypted-proxy.conf
+
+ENV DNS_ENCRYPTED_PROXY_CONFIG=/app/config/dns-encrypted-proxy.conf
 
 EXPOSE 53/tcp
 EXPOSE 53/udp

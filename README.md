@@ -150,6 +150,17 @@ Run:
 docker run --rm -p 53:53/udp -p 53:53/tcp dns-encrypted-proxy:dev
 ```
 
+Docker image config path:
+
+- The container reads config from `/app/config/dns-encrypted-proxy.conf` via `DNS_ENCRYPTED_PROXY_CONFIG`.
+- Mount your own file there to override defaults.
+
+```bash
+docker run --rm -p 53:53/udp -p 53:53/tcp \
+  -v "$(pwd)/dns-encrypted-proxy.conf:/app/config/dns-encrypted-proxy.conf:ro" \
+  dns-encrypted-proxy:dev
+```
+
 ## Project Guides
 
 - Testing guide: `TESTING.md`
