@@ -74,45 +74,103 @@ build:
   needs:
     - test
 
-.deploy_template: &deploy_template
+generate_deploy_child_pipeline:
   stage: deploy
-  image: alpine
+  image: alpine:latest
   tags:
     - docker
     - unraid
-  variables:
-    UNRAID_SSH_KEY: $UNRAID_SSH_KEY
-  before_script:
-    - apk add --no-cache openssh-client
-    - mkdir -p ~/.ssh
-    - echo "$UNRAID_SSH_KEY" > ~/.ssh/id_rsa
-    - chmod 600 ~/.ssh/id_rsa
-    - ssh-keyscan "$UNRAID_HOST" >> ~/.ssh/known_hosts
   script:
+    - apk add --no-cache python3
     - |
-      ssh root@"$UNRAID_HOST" <<EOF
-      echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin "$CI_REGISTRY"
-      docker pull "$IMAGE:$TAG"
-      docker stop $SERVICE_NAME || true
-      docker rm $SERVICE_NAME || true
-      docker run -d \
-        --name $SERVICE_NAME \
-        -l net.unraid.docker.managed=dockerman \
-        --restart unless-stopped \
-        --network bridge \
-        -v /mnt/cache/appdata/dns-encrypted-proxy:/app/config \
-        -p 5053:53/udp \
-        -p 5053:53/tcp \
-        -p 9090:9090/tcp \
-        -e CACHE_CAPACITY=8192 \
-        "$IMAGE:$TAG"
-      EOF
-  only:
-    - master
+      set -euo pipefail
+      : "${UNRAID_DEPLOY_TARGETS:?UNRAID_DEPLOY_TARGETS is not set}"
+
+      python3 - <<'PY'
+      import os, sys
+
+      targets_raw = os.environ.get("UNRAID_DEPLOY_TARGETS", "")
+      if not targets_raw.strip():
+        print("UNRAID_DEPLOY_TARGETS is empty", file=sys.stderr)
+        sys.exit(1)
+
+      targets = []
+      for ln in targets_raw.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+          continue
+        parts = [p.strip() for p in ln.split("|")]
+        if len(parts) != 3 or any(not p for p in parts):
+          print(f"Bad line in UNRAID_DEPLOY_TARGETS: {ln!r}", file=sys.stderr)
+          print("Expected: <UNRAID_HOST>|<DOCKER_NETWORK>|<CONTAINER_IP>", file=sys.stderr)
+          sys.exit(1)
+        targets.append(parts)
+
+      def q(s: str) -> str:
+        return '"' + s.replace("\\\\", "\\\\\\\\").replace('"', '\\"') + '"'
+
+      out = []
+      out.append("stages: [deploy]")
+      out.append("")
+
+      for i, (host, net, ip) in enumerate(targets):
+        out.append(f"deploy_{i}:")
+        out.append("  stage: deploy")
+        out.append("  image: alpine:latest")
+        out.append("  tags: [docker, unraid]")
+        out.append("  variables:")
+        out.append(f"    UNRAID_HOST: {q(host)}")
+        out.append(f"    DOCKER_NET: {q(net)}")
+        out.append(f"    CONTAINER_IP: {q(ip)}")
+        out.append("  before_script:")
+        out.append("    - apk add --no-cache openssh-client")
+        out.append("    - mkdir -p ~/.ssh")
+        out.append('    - echo "$UNRAID_SSH_KEY" > ~/.ssh/id_rsa')
+        out.append("    - chmod 600 ~/.ssh/id_rsa")
+        out.append('    - ssh-keyscan "$UNRAID_HOST" >> ~/.ssh/known_hosts')
+        out.append("  script:")
+        out.append("    - |")
+        out.append('      ssh root@"$UNRAID_HOST" <<EOF')
+        out.append("      set -euo pipefail")
+        out.append('      echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin "$CI_REGISTRY"')
+        out.append('      docker pull "$IMAGE:$TAG"')
+        out.append('      docker stop "$SERVICE_NAME" || true')
+        out.append('      docker rm "$SERVICE_NAME" || true')
+        out.append("")
+        out.append("      docker run -d \\")
+        out.append('        --name "$SERVICE_NAME" \\')
+        out.append("        -l net.unraid.docker.managed=dockerman \\")
+        out.append("        --restart unless-stopped \\")
+        out.append('        --network "$DOCKER_NET" \\')
+        out.append('        --ip "$CONTAINER_IP" \\')
+        out.append("        -v /mnt/cache/appdata/dns-encrypted-proxy:/app/config \\")
+        out.append("        -e CACHE_CAPACITY=8192 \\")
+        out.append('        "$IMAGE:$TAG"')
+        out.append("      EOF")
+        out.append("  rules:")
+        out.append('    - if: \'$CI_COMMIT_BRANCH == "master"\'')
+        out.append("")
+
+      with open("deploy-child.yml", "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+
+      print(f"Generated deploy-child.yml with {len(targets)} job(s).")
+      PY
+  artifacts:
+    paths:
+      - deploy-child.yml
+    expire_in: 1 hour
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
 
 deploy:
-  <<: *deploy_template
-  parallel:
-    matrix:
-      - UNRAID_HOST: "172.20.0.50"
-      - UNRAID_HOST: "192.168.1.50"
+  stage: deploy
+  trigger:
+    include:
+      - artifact: deploy-child.yml
+        job: generate_deploy_child_pipeline
+    strategy: depend
+  needs:
+    - generate_deploy_child_pipeline
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
