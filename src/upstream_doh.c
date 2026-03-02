@@ -226,6 +226,14 @@ static int doh_post_with_handle(
     long http_version = 0;
     (void)curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
 
+    curl_slist_free_all(headers);
+
+    /* Empty body is treated as transport failure for resolver semantics. */
+    if (rc != CURLE_OK || status != 200 || response.len == 0) {
+        free(response.data);
+        return -1;
+    }
+
     if (client != NULL) {
         if (curl_http_version_is_h3(http_version)) {
             atomic_fetch_add(&client->http3_responses_total, 1);
@@ -236,14 +244,6 @@ static int doh_post_with_handle(
         } else {
             atomic_fetch_add(&client->http_other_responses_total, 1);
         }
-    }
-
-    curl_slist_free_all(headers);
-
-    /* Empty body is treated as transport failure for resolver semantics. */
-    if (rc != CURLE_OK || status != 200 || response.len == 0) {
-        free(response.data);
-        return -1;
     }
 
     *response_out = response.data;

@@ -336,19 +336,30 @@ static void test_doh_post_transport_and_status_failures(void **state) {
     (void)state;
     reset_stubs();
 
+    upstream_doh_client_t client;
+    memset(&client, 0, sizeof(client));
+
     uint8_t *resp = NULL;
     size_t resp_len = 0;
     uint8_t query[2] = {0x12, 0x34};
 
     g_curl_perform_rc = CURLE_COULDNT_CONNECT;
-    assert_int_equal(doh_post_with_handle(NULL, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), -1);
+    g_curl_http_version = 9999;
+    assert_int_equal(doh_post_with_handle(&client, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal((uint64_t)atomic_load(&client.http_other_responses_total), 0);
 
     reset_stubs();
+    memset(&client, 0, sizeof(client));
     g_curl_response_code = 503;
-    assert_int_equal(doh_post_with_handle(NULL, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), -1);
+    g_curl_http_version = 9999;
+    assert_int_equal(doh_post_with_handle(&client, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal((uint64_t)atomic_load(&client.http_other_responses_total), 0);
 
     reset_stubs();
-    assert_int_equal(doh_post_with_handle(NULL, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), -1);
+    memset(&client, 0, sizeof(client));
+    g_curl_http_version = 9999;
+    assert_int_equal(doh_post_with_handle(&client, (CURL *)0x11, "https://x", 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal((uint64_t)atomic_load(&client.http_other_responses_total), 0);
 }
 
 static void test_doh_post_success_and_http_version_counters(void **state) {
