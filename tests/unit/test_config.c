@@ -10,7 +10,10 @@
 #include <cmocka.h>
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+
+#include <arpa/inet.h>
 
 #include "config.h"
 #include "test_helpers.h"
@@ -38,6 +41,7 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.tcp_max_queries_per_conn, 0);
     assert_int_equal(config.metrics_enabled, 1);
     assert_int_equal(config.metrics_port, 9090);
+    assert_int_equal(config.hosts_a_override_count, 0);
     assert_int_equal(config.upstream_count, 2);
 #if UPSTREAM_DOH_ENABLED
     assert_string_equal(config.upstream_urls[0], "https://cloudflare-dns.com/dns-query");
@@ -395,6 +399,97 @@ static void test_config_validation_failures_from_env(void **state) {
     clear_config_env_vars();
 }
 
+static void test_config_hosts_a_parse_and_lookup(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    const char *config_content =
+        "hosts_a=example.com=1.2.3.4, bad*=1.1.1.1, www.example.com:10.0.0.10\n";
+
+    char *temp_file = create_temp_file(config_content);
+    assert_non_null(temp_file);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, temp_file), 0);
+    assert_int_equal(config.hosts_a_override_count, 2);
+
+    uint32_t addr = 0;
+    struct in_addr expected;
+
+    assert_int_equal(config_lookup_hosts_a(&config, "EXAMPLE.COM.", &addr), 1);
+    assert_int_equal(inet_pton(AF_INET, "1.2.3.4", &expected), 1);
+    assert_int_equal(addr, expected.s_addr);
+
+    assert_int_equal(config_lookup_hosts_a(&config, "www.example.com", &addr), 1);
+    assert_int_equal(inet_pton(AF_INET, "10.0.0.10", &expected), 1);
+    assert_int_equal(addr, expected.s_addr);
+
+    assert_int_equal(config_lookup_hosts_a(&config, "missing.example", &addr), 0);
+
+    setenv("HOSTS_A", "example.com=9.9.9.9", 1);
+    assert_int_equal(config_load(&config, temp_file), 0);
+    assert_int_equal(config.hosts_a_override_count, 1);
+    assert_int_equal(config_lookup_hosts_a(&config, "example.com", &addr), 1);
+    assert_int_equal(inet_pton(AF_INET, "9.9.9.9", &expected), 1);
+    assert_int_equal(addr, expected.s_addr);
+
+    remove_temp_file(temp_file);
+    clear_config_env_vars();
+}
+
+static void test_config_hosts_a_duplicate_and_capacity(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    char hosts_env[8192];
+    size_t pos = 0;
+    for (int i = 0; i < MAX_HOSTS_A_OVERRIDES + 4; i++) {
+        int octet = (i % 250) + 1;
+        int n = snprintf(
+            hosts_env + pos,
+            sizeof(hosts_env) - pos,
+            "h%02d.local=10.0.1.%d%s",
+            i,
+            octet,
+            (i + 1 < MAX_HOSTS_A_OVERRIDES + 4) ? "," : "");
+        assert_true(n > 0);
+        assert_true((size_t)n < sizeof(hosts_env) - pos);
+        pos += (size_t)n;
+    }
+
+    setenv("HOSTS_A", hosts_env, 1);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), 0);
+    assert_int_equal(config.hosts_a_override_count, MAX_HOSTS_A_OVERRIDES);
+
+    uint32_t addr = 0;
+    struct in_addr expected;
+
+    assert_int_equal(config_lookup_hosts_a(&config, "h00.local", &addr), 1);
+    assert_int_equal(inet_pton(AF_INET, "10.0.1.1", &expected), 1);
+    assert_int_equal(addr, expected.s_addr);
+
+    assert_int_equal(config_lookup_hosts_a(&config, "h63.local", &addr), 1);
+    assert_int_equal(config_lookup_hosts_a(&config, "h67.local", &addr), 0);
+    assert_int_equal(config_lookup_hosts_a(&config, "zz-not-present.local", &addr), 0);
+
+    assert_int_equal(config_lookup_hosts_a(NULL, "h00.local", &addr), 0);
+    assert_int_equal(config_lookup_hosts_a(&config, NULL, &addr), 0);
+    assert_int_equal(config_lookup_hosts_a(&config, "", &addr), 0);
+
+    setenv("HOSTS_A", "dup.local=1.1.1.1,dup.local=2.2.2.2", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), 0);
+    assert_int_equal(config.hosts_a_override_count, 1);
+    assert_int_equal(config_lookup_hosts_a(&config, "dup.local", &addr), 1);
+    assert_int_equal(inet_pton(AF_INET, "2.2.2.2", &expected), 1);
+    assert_int_equal(addr, expected.s_addr);
+
+    clear_config_env_vars();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_config_defaults),
@@ -410,6 +505,8 @@ int main(void) {
         cmocka_unit_test(test_config_all_env_overrides_and_empty_tokens),
         cmocka_unit_test(test_config_invalid_lines_and_empty_explicit_path),
         cmocka_unit_test(test_config_validation_failures_from_env),
+        cmocka_unit_test(test_config_hosts_a_parse_and_lookup),
+        cmocka_unit_test(test_config_hosts_a_duplicate_and_capacity),
     };
     
     return cmocka_run_group_tests(tests, NULL, NULL);

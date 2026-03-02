@@ -35,6 +35,8 @@ static int g_stub_cacheable = 0;
 static int g_stub_ttl_ok = 0;
 static uint32_t g_stub_min_ttl = 0;
 static int g_stub_cache_store_calls = 0;
+static int g_stub_hosts_lookup_hit = 0;
+static uint32_t g_stub_hosts_lookup_addr_be = 0;
 static uint8_t g_huge_response[70000];
 static int g_stub_dns_cache_init_rc = 0;
 static int g_stub_upstream_client_init_rc = 0;
@@ -113,6 +115,8 @@ static void reset_stubs(void) {
     g_stub_ttl_ok = 0;
     g_stub_min_ttl = 0;
     g_stub_cache_store_calls = 0;
+    g_stub_hosts_lookup_hit = 0;
+    g_stub_hosts_lookup_addr_be = 0;
     g_stub_dns_cache_init_rc = 0;
     g_stub_upstream_client_init_rc = 0;
     g_stub_dns_cache_destroy_calls = 0;
@@ -420,6 +424,18 @@ void metrics_init(proxy_metrics_t *m) {
     }
 }
 
+int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32_t *addr_v4_be_out) {
+    (void)config;
+    (void)name;
+    if (!g_stub_hosts_lookup_hit) {
+        return 0;
+    }
+    if (addr_v4_be_out != NULL) {
+        *addr_v4_be_out = g_stub_hosts_lookup_addr_be;
+    }
+    return 1;
+}
+
 int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *key_out, size_t key_capacity, size_t *key_len_out) {
     (void)query;
     (void)query_len;
@@ -642,6 +658,19 @@ static void test_process_query_branches(void **state) {
     uint8_t *out = NULL;
     size_t out_len = 0;
     assert_int_equal(process_query(NULL, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), -1);
+
+    g_stub_hosts_lookup_hit = 1;
+    g_stub_hosts_lookup_addr_be = htonl(0x01020304u);
+    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    assert_true(out_len >= 16);
+    assert_int_equal(out[out_len - 4], 1);
+    assert_int_equal(out[out_len - 3], 2);
+    assert_int_equal(out[out_len - 2], 3);
+    assert_int_equal(out[out_len - 1], 4);
+    free(out);
+    out = NULL;
+    g_stub_hosts_lookup_hit = 0;
 
     g_stub_key_ok = 1;
     g_stub_key_len = 8;
@@ -1434,6 +1463,99 @@ static void test_dns_server_udp_loop_poll_and_process_fail_paths(void **state) {
     assert_true((uint64_t)atomic_load(&server.metrics.queries_udp) >= 1);
 }
 
+static void test_hosts_override_edns_and_parser_edges(void **state) {
+    (void)state;
+    reset_stubs();
+
+    char name[256];
+    size_t q_end = 0;
+    assert_int_equal(
+        dns_extract_single_question_name_a(
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            name,
+            sizeof(name),
+            &q_end),
+        0);
+    assert_string_equal(name, "www.example.com");
+
+    uint8_t bad_qd[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
+    memcpy(bad_qd, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_qd));
+    bad_qd[4] = 0x00;
+    bad_qd[5] = 0x02;
+    assert_int_equal(dns_extract_single_question_name_a(bad_qd, sizeof(bad_qd), name, sizeof(name), &q_end), -1);
+
+    uint8_t bad_qtype[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
+    memcpy(bad_qtype, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_qtype));
+    bad_qtype[sizeof(bad_qtype) - 4] = 0x00;
+    bad_qtype[sizeof(bad_qtype) - 3] = 0x1C;
+    assert_int_equal(dns_extract_single_question_name_a(bad_qtype, sizeof(bad_qtype), name, sizeof(name), &q_end), -1);
+
+    uint8_t bad_label[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
+    memcpy(bad_label, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_label));
+    bad_label[12] = 0xC0;
+    assert_int_equal(dns_extract_single_question_name_a(bad_label, sizeof(bad_label), name, sizeof(name), &q_end), -1);
+
+    assert_int_equal(build_hosts_a_response(NULL, 0, htonl(0x01020304u), NULL, NULL), -1);
+
+    uint8_t *direct = NULL;
+    size_t direct_len = 0;
+    assert_int_equal(
+        build_hosts_a_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            htonl(0x05060708u),
+            &direct,
+            &direct_len),
+        0);
+    assert_non_null(direct);
+    assert_true(direct_len > 20);
+    free(direct);
+
+    proxy_server_t server;
+    memset(&server, 0, sizeof(server));
+    metrics_init(&server.metrics);
+
+    g_stub_hosts_lookup_hit = 1;
+    g_stub_hosts_lookup_addr_be = htonl(0x01020304u);
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(
+        process_query(
+            &server,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            &out,
+            &out_len),
+        0);
+    assert_non_null(out);
+
+    uint16_t ancount = (uint16_t)(((uint16_t)out[6] << 8) | out[7]);
+    uint16_t arcount = (uint16_t)(((uint16_t)out[10] << 8) | out[11]);
+    assert_int_equal(ancount, 1);
+    assert_int_equal(arcount, 1);
+
+    size_t q_opt_s = 0;
+    size_t q_opt_e = 0;
+    size_t r_opt_s = 0;
+    size_t r_opt_e = 0;
+    assert_int_equal(dns_find_query_opt(DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS, DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN, &q_opt_s, &q_opt_e), 0);
+    assert_int_equal(dns_find_opt_record(out, out_len, &r_opt_s, &r_opt_e), 0);
+    assert_int_equal((int)(r_opt_e - r_opt_s), (int)(q_opt_e - q_opt_s));
+    assert_memory_equal(out + r_opt_s, DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS + q_opt_s, q_opt_e - q_opt_s);
+
+    size_t out_q_end = 0;
+    assert_int_equal(dns_extract_single_question_name_a(out, out_len, name, sizeof(name), &out_q_end), 0);
+    size_t ans = out_q_end;
+    assert_int_equal(out[ans + 12], 1);
+    assert_int_equal(out[ans + 13], 2);
+    assert_int_equal(out[ans + 14], 3);
+    assert_int_equal(out[ans + 15], 4);
+
+    free(out);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_dns_wire_helpers_branches),
@@ -1455,6 +1577,7 @@ int main(void) {
         cmocka_unit_test(test_dns_server_randomized_helper_exploration),
         cmocka_unit_test(test_dns_server_specific_helper_paths),
         cmocka_unit_test(test_udp_loop_and_proxy_run_thread_failure_paths),
+        cmocka_unit_test(test_hosts_override_edns_and_parser_edges),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

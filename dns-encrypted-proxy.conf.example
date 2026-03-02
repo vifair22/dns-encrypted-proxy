@@ -8,4 +8,5 @@ upstream_pool_size=64
 cache_capacity=1024
 metrics_enabled=1
 metrics_port=9090
+hosts_a=router.local=192.168.1.1,nas.local=192.168.1.20
 upstreams=https://cloudflare-dns.com/dns-query,https://dns.google/dns-query

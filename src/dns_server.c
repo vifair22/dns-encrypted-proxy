@@ -42,6 +42,13 @@ static void write_u16(uint8_t *ptr, uint16_t value) {
     ptr[1] = (uint8_t)(value & 0xFFu);
 }
 
+static void write_u32(uint8_t *ptr, uint32_t value) {
+    ptr[0] = (uint8_t)((value >> 24) & 0xFFu);
+    ptr[1] = (uint8_t)((value >> 16) & 0xFFu);
+    ptr[2] = (uint8_t)((value >> 8) & 0xFFu);
+    ptr[3] = (uint8_t)(value & 0xFFu);
+}
+
 static void metrics_record_response(proxy_server_t *server, const uint8_t *response, size_t response_len) {
     if (server == NULL || response == NULL || response_len < 4) {
         return;
@@ -158,6 +165,130 @@ static int dns_find_query_opt(const uint8_t *query, size_t query_len, size_t *op
         offset = rr_end;
     }
     return -1;
+}
+
+static int dns_extract_single_question_name_a(
+    const uint8_t *query,
+    size_t query_len,
+    char *name_out,
+    size_t name_out_len,
+    size_t *question_end_out) {
+    if (query == NULL || query_len < 12 || name_out == NULL || name_out_len == 0 || question_end_out == NULL) {
+        return -1;
+    }
+
+    if (read_u16(query + 4) != 1) {
+        return -1;
+    }
+
+    size_t offset = 12;
+    size_t out_len = 0;
+    int label_count = 0;
+
+    while (offset < query_len) {
+        uint8_t label_len = query[offset++];
+        if (label_len == 0) {
+            break;
+        }
+        if (label_len > 63 || (label_len & 0xC0u) != 0) {
+            return -1;
+        }
+        if (offset + label_len > query_len) {
+            return -1;
+        }
+        if (label_count > 0) {
+            if (out_len + 1 >= name_out_len) {
+                return -1;
+            }
+            name_out[out_len++] = '.';
+        }
+        for (uint8_t i = 0; i < label_len; i++) {
+            uint8_t ch = query[offset + i];
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = (uint8_t)(ch - 'A' + 'a');
+            }
+            if (out_len + 1 >= name_out_len) {
+                return -1;
+            }
+            name_out[out_len++] = (char)ch;
+        }
+        offset += label_len;
+        label_count++;
+    }
+
+    if (offset + 4 > query_len) {
+        return -1;
+    }
+
+    uint16_t qtype = read_u16(query + offset);
+    uint16_t qclass = read_u16(query + offset + 2);
+    if (qtype != 1 || qclass != 1) {
+        return -1;
+    }
+
+    name_out[out_len] = '\0';
+    *question_end_out = offset + 4;
+    return 0;
+}
+
+static int build_hosts_a_response(
+    const uint8_t *query,
+    size_t query_len,
+    uint32_t addr_v4_be,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    if (query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL) {
+        return -1;
+    }
+
+    size_t question_end = 0;
+    char unused_name[256];
+    if (dns_extract_single_question_name_a(query, query_len, unused_name, sizeof(unused_name), &question_end) != 0) {
+        return -1;
+    }
+
+    size_t question_len = question_end - 12;
+    size_t opt_start = 0;
+    size_t opt_end = 0;
+    int has_opt = (dns_find_query_opt(query, query_len, &opt_start, &opt_end) == 0);
+    size_t opt_len = has_opt ? (opt_end - opt_start) : 0;
+
+    size_t answer_len = 16;
+    size_t response_len = 12 + question_len + answer_len + opt_len;
+    uint8_t *response = calloc(1, response_len);
+    if (response == NULL) {
+        return -1;
+    }
+
+    response[0] = query[0];
+    response[1] = query[1];
+
+    uint16_t query_flags = read_u16(query + 2);
+    uint16_t response_flags = (uint16_t)(0x8000u | (query_flags & 0x7800u) | (query_flags & 0x0100u) | (query_flags & 0x0010u) | 0x0080u);
+    write_u16(response + 2, response_flags);
+    write_u16(response + 4, 1);
+    write_u16(response + 6, 1);
+    write_u16(response + 8, 0);
+    write_u16(response + 10, has_opt ? 1 : 0);
+
+    memcpy(response + 12, query + 12, question_len);
+
+    size_t ans = 12 + question_len;
+    response[ans + 0] = 0xC0;
+    response[ans + 1] = 0x0C;
+    write_u16(response + ans + 2, 1);
+    write_u16(response + ans + 4, 1);
+    write_u32(response + ans + 6, 60);
+    write_u16(response + ans + 10, 4);
+    memcpy(response + ans + 12, &addr_v4_be, 4);
+
+    if (has_opt) {
+        memcpy(response + ans + answer_len, query + opt_start, opt_len);
+    }
+
+    *response_out = response;
+    *response_len_out = response_len;
+    return 0;
 }
 
 static int build_servfail_response(const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
@@ -449,6 +580,17 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
     int key_ok = (dns_extract_question_key(query, query_len, key, sizeof(key), &key_len) == 0);
 
     const uint8_t request_id[2] = {query[0], query[1]};
+
+    char qname[256];
+    size_t question_end = 0;
+    if (dns_extract_single_question_name_a(query, query_len, qname, sizeof(qname), &question_end) == 0) {
+        uint32_t addr_v4_be = 0;
+        if (config_lookup_hosts_a(&server->config, qname, &addr_v4_be)) {
+            if (build_hosts_a_response(query, query_len, addr_v4_be, response_out, response_len_out) == 0) {
+                return 0;
+            }
+        }
+    }
 
     /*
      * Cache path is best-effort: malformed/unkeyable queries bypass cache and

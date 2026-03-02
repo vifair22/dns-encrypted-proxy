@@ -1,9 +1,173 @@
 #include "config.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void trim_in_place(char *s);
+
+static uint32_t hosts_name_hash(const char *name) {
+    uint32_t hash = 2166136261u;
+    if (name == NULL) {
+        return hash;
+    }
+    while (*name != '\0') {
+        unsigned char ch = (unsigned char)*name;
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = (unsigned char)(ch - 'A' + 'a');
+        }
+        hash ^= (uint32_t)ch;
+        hash *= 16777619u;
+        name++;
+    }
+    return hash;
+}
+
+static void hosts_clear(proxy_config_t *config) {
+    if (config == NULL) {
+        return;
+    }
+    memset(config->hosts_a_overrides, 0, sizeof(config->hosts_a_overrides));
+    config->hosts_a_override_count = 0;
+}
+
+static int normalize_host_name(const char *input, char *output, size_t output_size) {
+    if (input == NULL || output == NULL || output_size == 0) {
+        return -1;
+    }
+
+    size_t start = 0;
+    size_t end = strlen(input);
+
+    while (start < end && (unsigned char)input[start] <= ' ') {
+        start++;
+    }
+    while (end > start && (unsigned char)input[end - 1] <= ' ') {
+        end--;
+    }
+
+    if (start == end) {
+        return -1;
+    }
+
+    if (input[end - 1] == '.') {
+        end--;
+    }
+    size_t in_len = end - start;
+    if (in_len == 0 || in_len >= output_size) {
+        return -1;
+    }
+
+    size_t label_len = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        unsigned char ch = (unsigned char)input[start + i];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = (unsigned char)(ch - 'A' + 'a');
+        }
+
+        if (ch == '.') {
+            if (label_len == 0 || label_len > 63) {
+                return -1;
+            }
+            label_len = 0;
+            output[i] = (char)ch;
+            continue;
+        }
+
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+            label_len++;
+            output[i] = (char)ch;
+            continue;
+        }
+
+        return -1;
+    }
+
+    if (label_len == 0 || label_len > 63) {
+        return -1;
+    }
+
+    output[in_len] = '\0';
+    return 0;
+}
+
+static void hosts_add_or_update(proxy_config_t *config, const char *name, uint32_t addr_v4_be) {
+    if (config == NULL || name == NULL || *name == '\0') {
+        return;
+    }
+
+    uint32_t hash = hosts_name_hash(name);
+    size_t start = (size_t)(hash % MAX_HOSTS_A_OVERRIDES);
+    int free_slot = -1;
+
+    for (size_t probe = 0; probe < MAX_HOSTS_A_OVERRIDES; probe++) {
+        size_t idx = (start + probe) % MAX_HOSTS_A_OVERRIDES;
+        hosts_a_override_t *entry = &config->hosts_a_overrides[idx];
+        if (!entry->in_use) {
+            if (free_slot < 0) {
+                free_slot = (int)idx;
+            }
+            break;
+        }
+        if (entry->name_hash == hash && strcmp(entry->name, name) == 0) {
+            entry->addr_v4_be = addr_v4_be;
+            return;
+        }
+    }
+
+    if (free_slot < 0) {
+        return;
+    }
+
+    hosts_a_override_t *entry = &config->hosts_a_overrides[free_slot];
+    strncpy(entry->name, name, sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+    entry->addr_v4_be = addr_v4_be;
+    entry->name_hash = hash;
+    entry->in_use = 1;
+    config->hosts_a_override_count++;
+}
+
+static void split_hosts_a_overrides(proxy_config_t *config, const char *value) {
+    if (config == NULL || value == NULL) {
+        return;
+    }
+
+    char buffer[MAX_HOSTS_A_OVERRIDES * 80];
+    strncpy(buffer, value, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    hosts_clear(config);
+
+    char *token = strtok(buffer, ",");
+    while (token != NULL) {
+        trim_in_place(token);
+        if (*token != '\0') {
+            char *sep = strchr(token, '=');
+            if (sep == NULL) {
+                sep = strchr(token, ':');
+            }
+
+            if (sep != NULL) {
+                *sep = '\0';
+                char *name_part = token;
+                char *addr_part = sep + 1;
+                trim_in_place(name_part);
+                trim_in_place(addr_part);
+
+                char normalized_name[256];
+                struct in_addr addr;
+                if (normalize_host_name(name_part, normalized_name, sizeof(normalized_name)) == 0 &&
+                    inet_pton(AF_INET, addr_part, &addr) == 1) {
+                    hosts_add_or_update(config, normalized_name, addr.s_addr);
+                }
+            }
+        }
+        token = strtok(NULL, ",");
+    }
+}
 
 static void trim_in_place(char *s) {
     char *start = s;
@@ -134,6 +298,11 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         if (parse_int(value, &parsed) == 0) {
             config->metrics_enabled = parsed ? 1 : 0;
         }
+        return;
+    }
+
+    if (strcmp(key, "hosts_a") == 0) {
+        split_hosts_a_overrides(config, value);
     }
 }
 
@@ -224,6 +393,11 @@ static void apply_env_overrides(proxy_config_t *config) {
             config->metrics_enabled = parsed ? 1 : 0;
         }
     }
+
+    value = getenv("HOSTS_A");
+    if (value != NULL && *value != '\0') {
+        split_hosts_a_overrides(config, value);
+    }
 }
 
 static void set_defaults(proxy_config_t *config) {
@@ -257,6 +431,7 @@ static void set_defaults(proxy_config_t *config) {
     config->tcp_max_queries_per_conn = 0;
     config->metrics_enabled = 1;
     config->metrics_port = 9090;
+    hosts_clear(config);
 }
 
 static void load_config_file(proxy_config_t *config, const char *path) {
@@ -369,9 +544,52 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);
     fprintf(out, "  metrics_enabled=%d\n", config->metrics_enabled);
     fprintf(out, "  metrics_port=%d\n", config->metrics_port);
+    fprintf(out, "  hosts_a=");
+    int wrote_hosts = 0;
+    for (int i = 0; i < MAX_HOSTS_A_OVERRIDES; i++) {
+        const hosts_a_override_t *entry = &config->hosts_a_overrides[i];
+        if (!entry->in_use) {
+            continue;
+        }
+        struct in_addr addr;
+        addr.s_addr = entry->addr_v4_be;
+        fprintf(out, "%s%s=%s", wrote_hosts ? "," : "", entry->name, inet_ntoa(addr));
+        wrote_hosts = 1;
+    }
+    fprintf(out, "\n");
     fprintf(out, "  upstreams=");
     for (int i = 0; i < config->upstream_count; i++) {
         fprintf(out, "%s%s", config->upstream_urls[i], (i + 1 == config->upstream_count) ? "" : ",");
     }
     fprintf(out, "\n");
+}
+
+int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32_t *addr_v4_be_out) {
+    if (config == NULL || name == NULL || *name == '\0') {
+        return 0;
+    }
+
+    char normalized[256];
+    if (normalize_host_name(name, normalized, sizeof(normalized)) != 0) {
+        return 0;
+    }
+
+    uint32_t hash = hosts_name_hash(normalized);
+    size_t start = (size_t)(hash % MAX_HOSTS_A_OVERRIDES);
+
+    for (size_t probe = 0; probe < MAX_HOSTS_A_OVERRIDES; probe++) {
+        size_t idx = (start + probe) % MAX_HOSTS_A_OVERRIDES;
+        const hosts_a_override_t *entry = &config->hosts_a_overrides[idx];
+        if (!entry->in_use) {
+            return 0;
+        }
+        if (entry->name_hash == hash && strcmp(entry->name, normalized) == 0) {
+            if (addr_v4_be_out != NULL) {
+                *addr_v4_be_out = entry->addr_v4_be;
+            }
+            return 1;
+        }
+    }
+
+    return 0;
 }

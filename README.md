@@ -107,6 +107,7 @@ Main config keys:
 - `upstreams` (comma-separated `https://...`, `tls://host[:port]`, and/or `quic://host[:port]`)
 - `upstream_timeout_ms`, `upstream_pool_size`
 - `cache_capacity`
+- `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`
 - `metrics_enabled`, `metrics_port`
 
@@ -115,8 +116,15 @@ Environment override support includes:
 - `DNS_ENCRYPTED_PROXY_CONFIG`, `LISTEN_ADDR`, `LISTEN_PORT`
 - `UPSTREAMS`, `UPSTREAM_TIMEOUT_MS`, `UPSTREAM_POOL_SIZE`
 - `CACHE_CAPACITY`
+- `HOSTS_A`
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
 - `METRICS_ENABLED`, `METRICS_PORT`
+
+`hosts_a` behavior:
+
+- Applied before cache/upstream resolution for single-question `A IN` queries.
+- Returns a local synthesized DNS answer with fixed TTL `60`.
+- Intended as a fast hosts-style override path for internal names.
 
 ## Metrics
 
