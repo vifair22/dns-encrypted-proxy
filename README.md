@@ -131,7 +131,7 @@ Environment override support includes:
 `upstream_bootstrap_a` behavior:
 
 - Upstream dial flow is local resolver first; if that fails, configured bootstrap IPv4 is attempted.
-- Set `upstream_bootstrap_enabled=0` to disable step 2 (iterative bootstrap fallback is currently stubbed for future work).
+- Set `upstream_bootstrap_enabled=0` to disable step 2; resolver still attempts iterative stage-3 bootstrap.
 
 ## Metrics
 

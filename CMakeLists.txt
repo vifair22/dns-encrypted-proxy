@@ -114,6 +114,8 @@ set(DNS_ENCRYPTED_PROXY_SOURCES
     src/config.c
     src/cache.c
     src/dns_message.c
+    src/iterative_resolver.c
+    src/upstream_bootstrap.c
     src/upstream.c
     src/dns_server.c
     src/metrics.c
@@ -246,6 +248,20 @@ if(BUILD_TESTS)
         apply_target_defaults(test_dns_server_internal)
         add_proxy_test(test_dns_server_internal)
 
+        # Unit test: iterative resolver internals (parser/cache behavior)
+        add_executable(test_iterative_resolver_internal tests/unit/test_iterative_resolver_internal.c)
+        target_link_libraries(test_iterative_resolver_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_iterative_resolver_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_iterative_resolver_internal)
+        add_proxy_test(test_iterative_resolver_internal)
+
+        # Unit test: upstream bootstrap internals (config apply + stage3)
+        add_executable(test_upstream_bootstrap_internal tests/unit/test_upstream_bootstrap_internal.c)
+        target_link_libraries(test_upstream_bootstrap_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_upstream_bootstrap_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_upstream_bootstrap_internal)
+        add_proxy_test(test_upstream_bootstrap_internal)
+
         if(ENABLE_UPSTREAM_DOH)
             # Unit test: upstream DoH internals (static helper branch coverage)
             add_executable(test_upstream_doh_internal tests/unit/test_upstream_doh_internal.c)
@@ -316,7 +332,7 @@ if(BUILD_TESTS)
             find_program(GCOVR_EXECUTABLE gcovr)
             if(GCOVR_EXECUTABLE)
                 set(COVERAGE_TEST_DEPS
-                    test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_upstream_internal test_integration_core test_integration_transport test_integration_runtime)
+                    test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_iterative_resolver_internal test_upstream_bootstrap_internal test_upstream_internal test_integration_core test_integration_transport test_integration_runtime)
                 if(ENABLE_UPSTREAM_DOH)
                     list(APPEND COVERAGE_TEST_DEPS test_upstream_doh_internal)
                 endif()
@@ -330,8 +346,8 @@ if(BUILD_TESTS)
 
                 add_custom_target(coverage
                     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --timeout 30
-                    COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --gcov-ignore-parse-errors negative_hits.warn_once_per_file --print-summary
-                    COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --gcov-ignore-parse-errors negative_hits.warn_once_per_file --html-details -o ${CMAKE_BINARY_DIR}/coverage.html
+                    COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --merge-mode-functions merge-use-line-min --gcov-ignore-parse-errors negative_hits.warn_once_per_file --print-summary
+                    COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --merge-mode-functions merge-use-line-min --gcov-ignore-parse-errors negative_hits.warn_once_per_file --html-details -o ${CMAKE_BINARY_DIR}/coverage.html
                     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
                     USES_TERMINAL
                     DEPENDS dns-encrypted-proxy ${COVERAGE_TEST_DEPS}

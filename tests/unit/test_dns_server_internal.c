@@ -401,6 +401,22 @@ int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *ho
     return 0;
 }
 
+int upstream_bootstrap_apply_from_config(
+    upstream_client_t *client,
+    const proxy_config_t *config,
+    int *applied_out,
+    int *unmatched_out) {
+    (void)client;
+    (void)config;
+    if (applied_out != NULL) {
+        *applied_out = 0;
+    }
+    if (unmatched_out != NULL) {
+        *unmatched_out = 0;
+    }
+    return 0;
+}
+
 int upstream_resolve(
     upstream_client_t *client,
     const uint8_t *query,

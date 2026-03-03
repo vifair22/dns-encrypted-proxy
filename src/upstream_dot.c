@@ -459,6 +459,10 @@ int upstream_dot_resolve(
     
     if (need_connect) {
         if (establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0) != 0) {
+            /*
+             * Stage-2 fallback: connect socket to pinned IPv4 only for dial,
+             * but keep TLS hostname checks against server->host for security.
+             */
             LOGF_WARN("DoT stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
             if (!server->has_bootstrap_v4 ||
                 establish_tls_connection(

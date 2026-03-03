@@ -2,6 +2,7 @@
 
 #include "dns_message.h"
 #include "logger.h"
+#include "upstream_bootstrap.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -696,6 +697,7 @@ static void *udp_loop(void *arg) {
     int fd = ctx->fd;
     const char *exit_reason = "stop_requested";
 
+    /* One-time lifecycle log; avoid per-query noise. */
     LOGF_INFO("UDP loop thread started");
 
     uint8_t *buffer = (uint8_t *)malloc(DNS_MAX_MESSAGE_SIZE);
@@ -932,6 +934,7 @@ static void *tcp_accept_loop(void *arg) {
     int max_clients = server->config.tcp_max_clients;
     const char *exit_reason = "stop_requested";
 
+    /* One-time lifecycle log for accept thread health. */
     LOGF_INFO("TCP accept loop thread started");
 
     while (!should_stop(server)) {
@@ -1051,21 +1054,25 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
     }
 
     int bootstrap_applied = 0;
-    if (config->upstream_bootstrap_enabled) {
-        for (int i = 0; i < MAX_UPSTREAM_BOOTSTRAP_A; i++) {
-            const upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[i];
-            if (!entry->in_use) {
-                continue;
-            }
-            bootstrap_applied += upstream_client_set_bootstrap_ipv4(&server->upstream, entry->name, entry->addr_v4_be);
-        }
-    }
+    int bootstrap_unmatched = 0;
+    (void)upstream_bootstrap_apply_from_config(
+        &server->upstream,
+        config,
+        &bootstrap_applied,
+        &bootstrap_unmatched);
 
+    LOGF_INFO("Upstream fallback configuration:");
     LOGF_INFO(
-        "Upstream bootstrap map entries=%d enabled=%d applied=%d (iterative fallback currently stubbed)",
-        config->upstream_bootstrap_a_count,
+        "  stage2 bootstrap IPv4: enabled=%d entries=%d applied=%d unmatched=%d",
         config->upstream_bootstrap_enabled,
-        bootstrap_applied);
+        config->upstream_bootstrap_a_count,
+        bootstrap_applied,
+        bootstrap_unmatched);
+    LOGF_INFO("  stage3 iterative resolver: enabled=%d", upstream_cfg.iterative_bootstrap_enabled);
+
+    if (config->upstream_bootstrap_enabled && bootstrap_unmatched > 0) {
+        LOGF_WARN("Some upstream bootstrap entries did not match configured upstream hosts");
+    }
     
     /* Initialize metrics */
     metrics_init(&server->metrics);

@@ -633,6 +633,85 @@ static void test_cache_cycle_guard_prevents_lookup_and_store_lockup(void **state
     unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
 }
 
+static void test_cache_additional_guard_and_branch_paths(void **state) {
+    (void)state;
+    reset_alloc_stubs();
+
+    unsetenv("DOH_PROXY_CACHE_SINGLE_THREAD");
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 0);
+    setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "yes", 1);
+    assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 1);
+
+    assert_int_equal(dns_cache_init(NULL, 1), -1);
+
+    dns_cache_t cache;
+    memset(&cache, 0, sizeof(cache));
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    const uint8_t key[] = {0xAA};
+    const uint8_t resp[] = {0x11, 0x22};
+    const uint8_t req_id[2] = {0x01, 0x02};
+
+    assert_int_equal(dns_cache_lookup(&cache, key, sizeof(key), req_id, &out, &out_len), 0);
+    assert_int_equal(dns_cache_lookup(&cache, key, sizeof(key), NULL, &out, &out_len), 0);
+    assert_int_equal(dns_cache_lookup(&cache, key, sizeof(key), req_id, NULL, &out_len), 0);
+    assert_int_equal(dns_cache_lookup(&cache, key, sizeof(key), req_id, &out, NULL), 0);
+
+    dns_cache_store(&cache, key, sizeof(key), resp, sizeof(resp), 0);
+    dns_cache_store(&cache, key, sizeof(key), resp, 0, 10);
+
+    cache_shard_t shard;
+    memset(&shard, 0, sizeof(shard));
+    shard_maybe_grow(&shard);
+    shard_sweep_expired(NULL, 0, 1);
+    shard_sweep_expired(&shard, 0, 0);
+
+    shard.bucket_count = (size_t)-1;
+    shard_maybe_grow(&shard);
+
+    assert_int_equal(shard_init(&shard, 1), 0);
+    assert_int_equal(key_equals(NULL, 1, key, sizeof(key)), 0);
+
+    cache_entry_t *e1 = calloc(1, sizeof(*e1));
+    cache_entry_t *e2 = calloc(1, sizeof(*e2));
+    assert_non_null(e1);
+    assert_non_null(e2);
+    e1->key = (uint8_t *)strdup("k1");
+    e2->key = (uint8_t *)strdup("k2");
+    e1->response = (uint8_t *)strdup("r1");
+    e2->response = (uint8_t *)strdup("r2");
+    assert_non_null(e1->key);
+    assert_non_null(e2->key);
+    assert_non_null(e1->response);
+    assert_non_null(e2->response);
+    e1->key_len = 2;
+    e2->key_len = 2;
+    e1->response_len = 2;
+    e2->response_len = 2;
+    e1->hash = hash_key(e1->key, e1->key_len);
+    e2->hash = e1->hash;
+
+    size_t bi = fast_index(e1->hash, shard.bucket_count, shard.bucket_mask);
+    e1->bucket_next = e2;
+    shard.buckets[bi] = e1;
+    shard.entry_count = 2;
+    shard.bytes_in_use = entry_bytes(e1) + entry_bytes(e2);
+    shard.lru_head = e1;
+    shard.lru_tail = e2;
+    e1->lru_prev = NULL;
+    e1->lru_next = e2;
+    e2->lru_prev = e1;
+    e2->lru_next = NULL;
+
+    remove_bucket_entry(&shard, bi, e2, e1);
+    assert_int_equal(shard.entry_count, 1);
+
+    evict_lru_tail(&shard);
+    assert_true(shard.evictions >= 1);
+
+    shard_destroy(&shard);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_cache_static_guard_paths),
@@ -646,6 +725,7 @@ int main(void) {
         cmocka_unit_test(test_cache_new_branch_paths),
         cmocka_unit_test(test_cache_expired_lookup_in_collision_bucket_keeps_chain_valid),
         cmocka_unit_test(test_cache_cycle_guard_prevents_lookup_and_store_lockup),
+        cmocka_unit_test(test_cache_additional_guard_and_branch_paths),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

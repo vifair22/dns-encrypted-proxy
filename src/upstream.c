@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "upstream_bootstrap.h"
 #include "logger.h"
 
 #include <ctype.h>
@@ -72,14 +73,6 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-}
-
-static int upstream_iterative_bootstrap_stub(upstream_server_t *server) {
-    if (server == NULL) {
-        return -1;
-    }
-    server->iterative_stub_done = 1;
-    return -1;
 }
 
 static const char *upstream_type_name(upstream_type_t type) {
@@ -282,17 +275,16 @@ int upstream_server_should_skip(const upstream_server_t *server, const upstream_
         return 0;
     }
     
-    /*
-     * Backoff gating prevents hot-loop retries against known-bad upstreams.
-     * Once backoff elapses we allow probes again to recover without manual
-     * intervention.
-     */
+    /* Skip recently-failed upstreams for a bit so we don't thrash them. */
     /* Check if backoff period has elapsed */
     uint64_t now = now_ms();
     uint64_t elapsed = now - server->health.last_failure_time;
     
     if (elapsed >= (uint64_t)config->unhealthy_backoff_ms) {
-        /* Backoff elapsed, allow retry */
+        /*
+         * Retry probe after backoff even for unhealthy servers so they can
+         * re-enter service automatically without operator intervention.
+         */
         return 0;
     }
     
@@ -551,8 +543,8 @@ int upstream_resolve(
     pthread_mutex_unlock(&client->rr_mutex);
     
     /*
-     * Pass 1: healthy/backoff-eligible servers only.
-     * We fail fast through candidates and update health on each outcome.
+     * Pass 1 = normal path. Pass 2 = last-chance probe of unhealthy servers.
+     * Keeps normal latency low but still lets bad servers recover.
      */
     /* Try each server in order, starting from round-robin index */
     for (int attempt = 0; attempt < client->server_count; attempt++) {
@@ -567,6 +559,7 @@ int upstream_resolve(
         uint8_t *response = NULL;
         size_t response_len = 0;
 
+        /* Stage 1 first on purpose: local DNS tracks provider IP changes. */
         LOGF_INFO("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
         
         if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
@@ -576,15 +569,28 @@ int upstream_resolve(
             return 0;
         }
 
+        /* Keep this per-attempt so failover behavior is visible in prod logs. */
         LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
 
-        if (client->config.iterative_bootstrap_enabled && !server->iterative_stub_done) {
+        if (client->config.iterative_bootstrap_enabled) {
             if (server->has_bootstrap_v4) {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s after stage2 bootstrap failure", server->host);
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 bootstrap failure", server->host);
             } else {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s stage2 bootstrap unavailable/disabled", server->host);
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s stage2 bootstrap unavailable/disabled", server->host);
             }
-            (void)upstream_iterative_bootstrap_stub(server);
+
+            if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms) == 0) {
+                LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
+                if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+                    upstream_server_record_success(server);
+                    *response_out = response;
+                    *response_len_out = response_len;
+                    return 0;
+                }
+                LOGF_WARN("Upstream stage3 iterative bootstrap retry failed: host=%s", server->host);
+            } else {
+                LOGF_WARN("Upstream stage3 iterative bootstrap failed: host=%s", server->host);
+            }
         }
 
         upstream_server_record_failure(server, &client->config);
@@ -606,6 +612,11 @@ int upstream_resolve(
         uint8_t *response = NULL;
         size_t response_len = 0;
 
+        /*
+         * Pass 2 is a bounded "last chance" probe for currently unhealthy
+         * entries. This avoids permanent brownout after stale health state while
+         * keeping normal success path in pass 1 fast.
+         */
         LOGF_INFO("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
         
         if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
@@ -617,13 +628,25 @@ int upstream_resolve(
 
         LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
 
-        if (client->config.iterative_bootstrap_enabled && !server->iterative_stub_done) {
+        if (client->config.iterative_bootstrap_enabled) {
             if (server->has_bootstrap_v4) {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s after stage2 bootstrap failure", server->host);
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 bootstrap failure", server->host);
             } else {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s stage2 bootstrap unavailable/disabled", server->host);
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s stage2 bootstrap unavailable/disabled", server->host);
             }
-            (void)upstream_iterative_bootstrap_stub(server);
+
+            if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms) == 0) {
+                LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
+                if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+                    upstream_server_record_success(server);
+                    *response_out = response;
+                    *response_len_out = response_len;
+                    return 0;
+                }
+                LOGF_WARN("Upstream stage3 iterative bootstrap retry failed: host=%s", server->host);
+            } else {
+                LOGF_WARN("Upstream stage3 iterative bootstrap failed: host=%s", server->host);
+            }
         }
 
         upstream_server_record_failure(server, &client->config);

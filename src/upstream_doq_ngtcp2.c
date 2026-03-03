@@ -862,6 +862,10 @@ int upstream_doq_ngtcp2_resolve(
     }
 
     if (result != 0 && server->has_bootstrap_v4) {
+        /*
+         * Stage-2 DoQ bootstrap path: retry against explicit IPv4 endpoint
+         * within the remaining overall timeout budget for this query.
+         */
         LOGF_WARN("DoQ stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
         uint64_t now = now_ns();
         if (now < overall_deadline) {

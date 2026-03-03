@@ -186,6 +186,10 @@ static void upstream_bootstrap_add_or_update(proxy_config_t *config, const char 
     size_t start = (size_t)(hash % MAX_UPSTREAM_BOOTSTRAP_A);
     int free_slot = -1;
 
+    /*
+     * Open-addressed fixed table keeps lookup/updates allocation-free and
+     * deterministic at startup/runtime. Capacity is intentionally bounded.
+     */
     for (size_t probe = 0; probe < MAX_UPSTREAM_BOOTSTRAP_A; probe++) {
         size_t idx = (start + probe) % MAX_UPSTREAM_BOOTSTRAP_A;
         upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[idx];
@@ -223,6 +227,10 @@ static void split_upstream_bootstrap_a(proxy_config_t *config, const char *value
     strncpy(buffer, value, sizeof(buffer) - 1);
     buffer[sizeof(buffer) - 1] = '\0';
 
+    /*
+     * Replace-on-parse semantics: latest source (file/env) fully defines the
+     * bootstrap map so stale entries from previous loads cannot linger.
+     */
     upstream_bootstrap_clear(config);
 
     char *token = strtok(buffer, ",");
@@ -739,6 +747,10 @@ int config_lookup_upstream_bootstrap_a(const proxy_config_t *config, const char 
     uint32_t hash = hosts_name_hash(normalized);
     size_t start = (size_t)(hash % MAX_UPSTREAM_BOOTSTRAP_A);
 
+    /*
+     * Probe stops at first empty slot because insertion never leaves tombstones;
+     * once an empty bucket is found, key cannot exist further in the chain.
+     */
     for (size_t probe = 0; probe < MAX_UPSTREAM_BOOTSTRAP_A; probe++) {
         size_t idx = (start + probe) % MAX_UPSTREAM_BOOTSTRAP_A;
         const upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[idx];

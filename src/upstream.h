@@ -39,7 +39,7 @@ typedef struct {
     int port;                         /* Parsed port (853 default for DoT) */
     uint32_t bootstrap_addr_v4_be;    /* Optional IPv4 bootstrap override (network byte order) */
     int has_bootstrap_v4;
-    int iterative_stub_done;
+    uint64_t iterative_last_attempt_ms;
     upstream_health_t health;
 } upstream_server_t;
 

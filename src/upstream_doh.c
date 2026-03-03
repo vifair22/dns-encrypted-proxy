@@ -403,6 +403,13 @@ int upstream_doh_resolve(
         &response, &response_len);
 
     if (result != 0 && server->has_bootstrap_v4) {
+        /*
+         * Stage 2 fallback: pin host:port to bootstrap IP for this request.
+         * We still keep the original hostname for SNI/cert checks.
+         *
+         * Not the default path: local DNS is usually fresher when providers
+         * rotate or rebalance endpoints.
+         */
         LOGF_WARN("DoH stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
         result = doh_post_with_handle(
             client,

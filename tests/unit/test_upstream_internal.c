@@ -240,6 +240,19 @@ int upstream_doq_client_get_pool_stats(
     return 0;
 }
 
+int iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
+    (void)hostname;
+    (void)timeout_ms;
+    (void)addr_v4_be_out;
+    return -1;
+}
+
+int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms) {
+    (void)server;
+    (void)timeout_ms;
+    return -1;
+}
+
 #define pthread_mutex_init upstream_wrap_pthread_mutex_init
 #define pthread_mutex_lock upstream_wrap_pthread_mutex_lock
 #define pthread_mutex_unlock upstream_wrap_pthread_mutex_unlock
