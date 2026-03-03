@@ -106,6 +106,7 @@ Main config keys:
 - `listen_addr`, `listen_port`
 - `upstreams` (comma-separated `https://...`, `tls://host[:port]`, and/or `quic://host[:port]`)
 - `upstream_timeout_ms`, `upstream_pool_size`
+- `upstream_bootstrap_enabled`, `upstream_bootstrap_a` (optional hostname->IPv4 bootstrap map for upstream dialing fallback)
 - `cache_capacity`
 - `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`
@@ -115,6 +116,7 @@ Environment override support includes:
 
 - `DNS_ENCRYPTED_PROXY_CONFIG`, `LISTEN_ADDR`, `LISTEN_PORT`
 - `UPSTREAMS`, `UPSTREAM_TIMEOUT_MS`, `UPSTREAM_POOL_SIZE`
+- `UPSTREAM_BOOTSTRAP_ENABLED`, `UPSTREAM_BOOTSTRAP_A`
 - `CACHE_CAPACITY`
 - `HOSTS_A`
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
@@ -125,6 +127,11 @@ Environment override support includes:
 - Applied before cache/upstream resolution for single-question `A IN` queries.
 - Returns a local synthesized DNS answer with fixed TTL `60`.
 - Intended as a fast hosts-style override path for internal names.
+
+`upstream_bootstrap_a` behavior:
+
+- Upstream dial flow is local resolver first; if that fails, configured bootstrap IPv4 is attempted.
+- Set `upstream_bootstrap_enabled=0` to disable step 2 (iterative bootstrap fallback is currently stubbed for future work).
 
 ## Metrics
 

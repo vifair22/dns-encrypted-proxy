@@ -551,24 +551,24 @@ static void test_establish_tls_connection_paths(void **state) {
     conn.fd = -1;
 
     g_getaddrinfo_rc = EAI_FAIL;
-    assert_int_equal(establish_tls_connection(&client, &conn, "h", 853, 10), -1);
+    assert_int_equal(establish_tls_connection(&client, &conn, "h", 853, 10, 0, 0), -1);
 
     reset_stubs();
     memset(&conn, 0, sizeof(conn));
     conn.fd = -1;
     g_ssl_new_fail = 1;
-    assert_int_equal(establish_tls_connection(&client, &conn, "h", 853, 10), -1);
+    assert_int_equal(establish_tls_connection(&client, &conn, "h", 853, 10, 0, 0), -1);
 
     reset_stubs();
     memset(&conn, 0, sizeof(conn));
     conn.fd = -1;
     g_ssl_connect_rc = 0;
-    assert_int_equal(establish_tls_connection(&client, &conn, "h", 853, 10), -1);
+    assert_int_equal(establish_tls_connection(&client, &conn, "h", 853, 10, 0, 0), -1);
 
     reset_stubs();
     memset(&conn, 0, sizeof(conn));
     conn.fd = -1;
-    assert_int_equal(establish_tls_connection(&client, &conn, "host.example", 853, 10), 0);
+    assert_int_equal(establish_tls_connection(&client, &conn, "host.example", 853, 10, 0, 0), 0);
     assert_string_equal(conn.host, "host.example");
     assert_int_equal(conn.port, 853);
     close_connection(&conn);

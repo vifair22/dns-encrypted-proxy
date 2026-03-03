@@ -37,6 +37,9 @@ typedef struct {
     char url[UPSTREAM_MAX_URL_LEN];  /* Full URL for DoH, or host:port for DoT */
     char host[256];                   /* Parsed hostname */
     int port;                         /* Parsed port (853 default for DoT) */
+    uint32_t bootstrap_addr_v4_be;    /* Optional IPv4 bootstrap override (network byte order) */
+    int has_bootstrap_v4;
+    int iterative_stub_done;
     upstream_health_t health;
 } upstream_server_t;
 
@@ -48,6 +51,7 @@ typedef struct {
     int pool_size;                   /* Connection pool size per protocol */
     int max_failures_before_unhealthy;  /* Mark unhealthy after N consecutive failures */
     int unhealthy_backoff_ms;        /* Wait time before retrying unhealthy server */
+    int iterative_bootstrap_enabled; /* Placeholder for future iterative bootstrap resolver */
 } upstream_config_t;
 
 /*
@@ -163,5 +167,6 @@ void upstream_server_record_success(upstream_server_t *server);
 void upstream_server_record_failure(upstream_server_t *server, const upstream_config_t *config);
 
 int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats_t *stats_out);
+int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *host, uint32_t addr_v4_be);
 
 #endif /* UPSTREAM_H */

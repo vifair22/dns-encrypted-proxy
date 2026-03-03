@@ -859,6 +859,44 @@ int upstream_doq_ngtcp2_resolve(
             break;
         }
     }
+
+    if (result != 0 && server->has_bootstrap_v4) {
+        uint64_t now = now_ns();
+        if (now < overall_deadline) {
+            int remaining_ms = (int)((overall_deadline - now) / 1000000ULL);
+            if (remaining_ms <= 0) {
+                remaining_ms = 1;
+            }
+
+            struct sockaddr_in addr4;
+            memset(&addr4, 0, sizeof(addr4));
+            addr4.sin_family = AF_INET;
+            addr4.sin_port = htons((uint16_t)server->port);
+            addr4.sin_addr.s_addr = server->bootstrap_addr_v4_be;
+
+            struct addrinfo ai;
+            memset(&ai, 0, sizeof(ai));
+            ai.ai_family = AF_INET;
+            ai.ai_socktype = SOCK_DGRAM;
+            ai.ai_protocol = IPPROTO_UDP;
+            ai.ai_addr = (struct sockaddr *)&addr4;
+            ai.ai_addrlen = sizeof(addr4);
+
+            int fd = connect_udp_with_timeout(&ai, remaining_ms);
+            if (fd >= 0) {
+                result = doq_ngtcp2_exchange_on_fd(
+                    fd,
+                    server,
+                    remaining_ms,
+                    stream_data,
+                    stream_data_len,
+                    response_out,
+                    response_len_out);
+                close(fd);
+            }
+        }
+    }
+
     freeaddrinfo(res);
     free(stream_data);
     return result;

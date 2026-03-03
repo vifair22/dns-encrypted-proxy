@@ -33,6 +33,14 @@ static void hosts_clear(proxy_config_t *config) {
     config->hosts_a_override_count = 0;
 }
 
+static void upstream_bootstrap_clear(proxy_config_t *config) {
+    if (config == NULL) {
+        return;
+    }
+    memset(config->upstream_bootstrap_a, 0, sizeof(config->upstream_bootstrap_a));
+    config->upstream_bootstrap_a_count = 0;
+}
+
 static int normalize_host_name(const char *input, char *output, size_t output_size) {
     if (input == NULL || output == NULL || output_size == 0) {
         return -1;
@@ -162,6 +170,82 @@ static void split_hosts_a_overrides(proxy_config_t *config, const char *value) {
                 if (normalize_host_name(name_part, normalized_name, sizeof(normalized_name)) == 0 &&
                     inet_pton(AF_INET, addr_part, &addr) == 1) {
                     hosts_add_or_update(config, normalized_name, addr.s_addr);
+                }
+            }
+        }
+        token = strtok(NULL, ",");
+    }
+}
+
+static void upstream_bootstrap_add_or_update(proxy_config_t *config, const char *name, uint32_t addr_v4_be) {
+    if (config == NULL || name == NULL || *name == '\0') {
+        return;
+    }
+
+    uint32_t hash = hosts_name_hash(name);
+    size_t start = (size_t)(hash % MAX_UPSTREAM_BOOTSTRAP_A);
+    int free_slot = -1;
+
+    for (size_t probe = 0; probe < MAX_UPSTREAM_BOOTSTRAP_A; probe++) {
+        size_t idx = (start + probe) % MAX_UPSTREAM_BOOTSTRAP_A;
+        upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[idx];
+        if (!entry->in_use) {
+            if (free_slot < 0) {
+                free_slot = (int)idx;
+            }
+            break;
+        }
+        if (entry->name_hash == hash && strcmp(entry->name, name) == 0) {
+            entry->addr_v4_be = addr_v4_be;
+            return;
+        }
+    }
+
+    if (free_slot < 0) {
+        return;
+    }
+
+    upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[free_slot];
+    strncpy(entry->name, name, sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+    entry->addr_v4_be = addr_v4_be;
+    entry->name_hash = hash;
+    entry->in_use = 1;
+    config->upstream_bootstrap_a_count++;
+}
+
+static void split_upstream_bootstrap_a(proxy_config_t *config, const char *value) {
+    if (config == NULL || value == NULL) {
+        return;
+    }
+
+    char buffer[MAX_UPSTREAM_BOOTSTRAP_A * 80];
+    strncpy(buffer, value, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    upstream_bootstrap_clear(config);
+
+    char *token = strtok(buffer, ",");
+    while (token != NULL) {
+        trim_in_place(token);
+        if (*token != '\0') {
+            char *sep = strchr(token, '=');
+            if (sep == NULL) {
+                sep = strchr(token, ':');
+            }
+
+            if (sep != NULL) {
+                *sep = '\0';
+                char *name_part = token;
+                char *addr_part = sep + 1;
+                trim_in_place(name_part);
+                trim_in_place(addr_part);
+
+                char normalized_name[256];
+                struct in_addr addr;
+                if (normalize_host_name(name_part, normalized_name, sizeof(normalized_name)) == 0 &&
+                    inet_pton(AF_INET, addr_part, &addr) == 1) {
+                    upstream_bootstrap_add_or_update(config, normalized_name, addr.s_addr);
                 }
             }
         }
@@ -301,6 +385,19 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
+    if (strcmp(key, "upstream_bootstrap_enabled") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0) {
+            config->upstream_bootstrap_enabled = parsed ? 1 : 0;
+        }
+        return;
+    }
+
+    if (strcmp(key, "upstream_bootstrap_a") == 0) {
+        split_upstream_bootstrap_a(config, value);
+        return;
+    }
+
     if (strcmp(key, "hosts_a") == 0) {
         split_hosts_a_overrides(config, value);
     }
@@ -398,6 +495,19 @@ static void apply_env_overrides(proxy_config_t *config) {
     if (value != NULL && *value != '\0') {
         split_hosts_a_overrides(config, value);
     }
+
+    value = getenv("UPSTREAM_BOOTSTRAP_ENABLED");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0) {
+            config->upstream_bootstrap_enabled = parsed ? 1 : 0;
+        }
+    }
+
+    value = getenv("UPSTREAM_BOOTSTRAP_A");
+    if (value != NULL && *value != '\0') {
+        split_upstream_bootstrap_a(config, value);
+    }
 }
 
 static void set_defaults(proxy_config_t *config) {
@@ -431,6 +541,8 @@ static void set_defaults(proxy_config_t *config) {
     config->tcp_max_queries_per_conn = 0;
     config->metrics_enabled = 1;
     config->metrics_port = 9090;
+    config->upstream_bootstrap_enabled = 1;
+    upstream_bootstrap_clear(config);
     hosts_clear(config);
 }
 
@@ -544,6 +656,20 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);
     fprintf(out, "  metrics_enabled=%d\n", config->metrics_enabled);
     fprintf(out, "  metrics_port=%d\n", config->metrics_port);
+    fprintf(out, "  upstream_bootstrap_enabled=%d\n", config->upstream_bootstrap_enabled);
+    fprintf(out, "  upstream_bootstrap_a=");
+    int wrote_bootstrap = 0;
+    for (int i = 0; i < MAX_UPSTREAM_BOOTSTRAP_A; i++) {
+        const upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[i];
+        if (!entry->in_use) {
+            continue;
+        }
+        struct in_addr addr;
+        addr.s_addr = entry->addr_v4_be;
+        fprintf(out, "%s%s=%s", wrote_bootstrap ? "," : "", entry->name, inet_ntoa(addr));
+        wrote_bootstrap = 1;
+    }
+    fprintf(out, "\n");
     fprintf(out, "  hosts_a=");
     int wrote_hosts = 0;
     for (int i = 0; i < MAX_HOSTS_A_OVERRIDES; i++) {
@@ -580,6 +706,36 @@ int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32
     for (size_t probe = 0; probe < MAX_HOSTS_A_OVERRIDES; probe++) {
         size_t idx = (start + probe) % MAX_HOSTS_A_OVERRIDES;
         const hosts_a_override_t *entry = &config->hosts_a_overrides[idx];
+        if (!entry->in_use) {
+            return 0;
+        }
+        if (entry->name_hash == hash && strcmp(entry->name, normalized) == 0) {
+            if (addr_v4_be_out != NULL) {
+                *addr_v4_be_out = entry->addr_v4_be;
+            }
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+int config_lookup_upstream_bootstrap_a(const proxy_config_t *config, const char *name, uint32_t *addr_v4_be_out) {
+    if (config == NULL || name == NULL || *name == '\0') {
+        return 0;
+    }
+
+    char normalized[256];
+    if (normalize_host_name(name, normalized, sizeof(normalized)) != 0) {
+        return 0;
+    }
+
+    uint32_t hash = hosts_name_hash(normalized);
+    size_t start = (size_t)(hash % MAX_UPSTREAM_BOOTSTRAP_A);
+
+    for (size_t probe = 0; probe < MAX_UPSTREAM_BOOTSTRAP_A; probe++) {
+        size_t idx = (start + probe) % MAX_UPSTREAM_BOOTSTRAP_A;
+        const upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[idx];
         if (!entry->in_use) {
             return 0;
         }

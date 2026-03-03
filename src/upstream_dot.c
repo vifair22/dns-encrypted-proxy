@@ -121,6 +121,51 @@ static int connect_with_timeout(const char *host, int port, int timeout_ms) {
     return fd;
 }
 
+static int connect_ipv4_with_timeout(uint32_t addr_v4_be, int port, int timeout_ms) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (set_nonblocking(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = addr_v4_be;
+    addr.sin_port = htons((uint16_t)port);
+
+    int rc = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
+    if (rc == 0) {
+        return fd;
+    }
+    if (errno != EINPROGRESS) {
+        close(fd);
+        return -1;
+    }
+
+    struct pollfd pfd = {0};
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    int error = 0;
+    socklen_t len = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0 || error != 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
 static void close_connection(dot_connection_t *conn) {
     if (conn == NULL) {
         return;
@@ -146,13 +191,19 @@ static int establish_tls_connection(
     dot_connection_t *conn,
     const char *host,
     int port,
-    int timeout_ms) {
+    int timeout_ms,
+    int use_bootstrap_v4,
+    uint32_t bootstrap_addr_v4_be) {
     
     /* Close existing connection if any */
     close_connection(conn);
     
     /* Connect TCP */
-    conn->fd = connect_with_timeout(host, port, timeout_ms);
+    if (use_bootstrap_v4) {
+        conn->fd = connect_ipv4_with_timeout(bootstrap_addr_v4_be, port, timeout_ms);
+    } else {
+        conn->fd = connect_with_timeout(host, port, timeout_ms);
+    }
     if (conn->fd < 0) {
         return -1;
     }
@@ -406,9 +457,20 @@ int upstream_dot_resolve(
     }
     
     if (need_connect) {
-        if (establish_tls_connection(client, conn, server->host, server->port, timeout_ms) != 0) {
-            pool_release(client, slot);
-            return -1;
+        if (establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0) != 0) {
+            if (!server->has_bootstrap_v4 ||
+                establish_tls_connection(
+                    client,
+                    conn,
+                    server->host,
+                    server->port,
+                    timeout_ms,
+                    1,
+                    server->bootstrap_addr_v4_be)
+                    != 0) {
+                pool_release(client, slot);
+                return -1;
+            }
         }
     }
     

@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     build-base \
     binutils \
     cmake \
+    git \
     pkgconfig \
     curl-dev \
     openssl-dev \
@@ -17,8 +18,12 @@ COPY CMakeLists.txt ./
 COPY src ./src
 COPY dns-encrypted-proxy.conf.example ./
 
+ARG C_LOG_CACHE_BUST=1
+RUN rm -rf /opt/c-log && echo "$C_LOG_CACHE_BUST" >/tmp/c_log_cache_bust && git clone --depth 1 https://git.airies.net/vifair22/c-log /opt/c-log
+
 RUN cmake -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
+    -DC_LOG_PATH=/opt/c-log \
     -DBUILD_TESTS=OFF \
     -DBUILD_BENCHMARKS=OFF \
     -DENABLE_UPSTREAM_DOQ=OFF \

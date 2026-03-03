@@ -1,6 +1,7 @@
 #include "dns_server.h"
 
 #include "dns_message.h"
+#include "logger.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -1017,13 +1018,31 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
         .timeout_ms = config->upstream_timeout_ms,
         .pool_size = config->upstream_pool_size,
         .max_failures_before_unhealthy = 3,
-        .unhealthy_backoff_ms = 10000
+        .unhealthy_backoff_ms = 10000,
+        .iterative_bootstrap_enabled = 1,
     };
     
     if (upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg) != 0) {
         dns_cache_destroy(&server->cache);
         return -1;
     }
+
+    int bootstrap_applied = 0;
+    if (config->upstream_bootstrap_enabled) {
+        for (int i = 0; i < MAX_UPSTREAM_BOOTSTRAP_A; i++) {
+            const upstream_bootstrap_a_t *entry = &config->upstream_bootstrap_a[i];
+            if (!entry->in_use) {
+                continue;
+            }
+            bootstrap_applied += upstream_client_set_bootstrap_ipv4(&server->upstream, entry->name, entry->addr_v4_be);
+        }
+    }
+
+    LOGF_INFO(
+        "Upstream bootstrap map entries=%d enabled=%d applied=%d (iterative fallback currently stubbed)",
+        config->upstream_bootstrap_a_count,
+        config->upstream_bootstrap_enabled,
+        bootstrap_applied);
     
     /* Initialize metrics */
     metrics_init(&server->metrics);

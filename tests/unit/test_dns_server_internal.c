@@ -394,6 +394,13 @@ void upstream_client_destroy(upstream_client_t *client) {
     g_stub_upstream_client_destroy_calls++;
 }
 
+int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *host, uint32_t addr_v4_be) {
+    (void)client;
+    (void)host;
+    (void)addr_v4_be;
+    return 0;
+}
+
 int upstream_resolve(
     upstream_client_t *client,
     const uint8_t *query,

@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "dns_server.h"
+#include "logger.h"
 #include "metrics.h"
 
 #include <signal.h>
@@ -23,7 +24,7 @@ int main(int argc, char **argv) {
 
     proxy_config_t config;
     if (config_load(&config, config_path) != 0) {
-        fprintf(stderr, "Failed to load configuration\n");
+        LOGF_ERROR("Failed to load configuration");
         return 1;
     }
 
@@ -34,23 +35,21 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     config_print(&config, stdout);
-    fprintf(stdout, "Starting DNS listener on %s:%d (UDP+TCP)\n", config.listen_addr, config.listen_port);
-    fflush(stdout);
+    LOGF_INFO("Starting DNS listener on %s:%d (UDP+TCP)", config.listen_addr, config.listen_port);
 
     proxy_server_t server;
     if (proxy_server_init(&server, &config, &g_stop) != 0) {
-        fprintf(stderr, "Failed to initialize server\n");
+        LOGF_ERROR("Failed to initialize server");
         return 1;
     }
 
     if (config.metrics_enabled) {
         if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, config.metrics_port) != 0) {
-            fprintf(stderr, "Failed to start metrics server on port %d\n", config.metrics_port);
+            LOGF_ERROR("Failed to start metrics server on port %d", config.metrics_port);
             proxy_server_destroy(&server);
             return 1;
         }
-        fprintf(stdout, "Metrics endpoint listening on 0.0.0.0:%d/metrics\n", config.metrics_port);
-        fflush(stdout);
+        LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics", config.metrics_port);
     }
 
     int rc = proxy_server_run(&server);

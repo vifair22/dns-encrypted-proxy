@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <string.h>
 #include <time.h>
 
@@ -70,6 +71,14 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static int upstream_iterative_bootstrap_stub(upstream_server_t *server) {
+    if (server == NULL) {
+        return -1;
+    }
+    server->iterative_stub_done = 1;
+    return -1;
 }
 
 #if UPSTREAM_DOT_ENABLED || UPSTREAM_DOQ_ENABLED
@@ -326,6 +335,9 @@ int upstream_client_init(
     if (client->config.unhealthy_backoff_ms <= 0) {
         client->config.unhealthy_backoff_ms = 10000;  /* 10 seconds */
     }
+    if (client->config.iterative_bootstrap_enabled != 0) {
+        client->config.iterative_bootstrap_enabled = 1;
+    }
     
     /*
      * Parse all configured URLs up front so runtime resolution path only
@@ -526,7 +538,11 @@ int upstream_resolve(
             *response_len_out = response_len;
             return 0;
         }
-        
+
+        if (client->config.iterative_bootstrap_enabled && !server->iterative_stub_done) {
+            (void)upstream_iterative_bootstrap_stub(server);
+        }
+
         upstream_server_record_failure(server, &client->config);
     }
     
@@ -552,11 +568,33 @@ int upstream_resolve(
             *response_len_out = response_len;
             return 0;
         }
-        
+
+        if (client->config.iterative_bootstrap_enabled && !server->iterative_stub_done) {
+            (void)upstream_iterative_bootstrap_stub(server);
+        }
+
         upstream_server_record_failure(server, &client->config);
     }
     
     return -1;
+}
+
+int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *host, uint32_t addr_v4_be) {
+    if (client == NULL || host == NULL || *host == '\0') {
+        return 0;
+    }
+
+    int applied = 0;
+    for (int i = 0; i < client->server_count; i++) {
+        upstream_server_t *server = &client->servers[i];
+        if (strcasecmp(server->host, host) == 0) {
+            server->bootstrap_addr_v4_be = addr_v4_be;
+            server->has_bootstrap_v4 = 1;
+            applied++;
+        }
+    }
+
+    return applied;
 }
 
 int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats_t *stats_out) {

@@ -11,6 +11,14 @@ option(ENABLE_UPSTREAM_DOH "Enable DoH upstream support" ON)
 option(ENABLE_UPSTREAM_DOT "Enable DoT upstream support" ON)
 option(ENABLE_UPSTREAM_DOQ "Enable DoQ upstream support" OFF)
 
+set(C_LOG_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../c-log" CACHE PATH "Path to c-log checkout")
+set(C_LOG_HEADER_PATH "${C_LOG_PATH}/log.h")
+if(NOT EXISTS "${C_LOG_HEADER_PATH}")
+    message(FATAL_ERROR "c-log header not found at ${C_LOG_HEADER_PATH}. Set -DC_LOG_PATH=<path-to-c-log>")
+endif()
+set(C_LOG_INCLUDE_DIR "${C_LOG_PATH}")
+message(STATUS "Using C-Log from ${C_LOG_INCLUDE_DIR}")
+
 if(NOT ENABLE_UPSTREAM_DOH AND NOT ENABLE_UPSTREAM_DOT AND NOT ENABLE_UPSTREAM_DOQ)
     message(FATAL_ERROR "At least one upstream provider must be enabled")
 endif()
@@ -36,6 +44,8 @@ function(apply_target_defaults target_name)
         UPSTREAM_DOH_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOH}>
         UPSTREAM_DOT_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOT}>
         UPSTREAM_DOQ_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOQ}>)
+
+    target_include_directories(${target_name} PRIVATE ${C_LOG_INCLUDE_DIR})
 
     if(ENABLE_COVERAGE AND COVERAGE_SUPPORTED)
         target_compile_options(${target_name} PRIVATE -O0 -g --coverage)

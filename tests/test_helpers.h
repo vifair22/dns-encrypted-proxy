@@ -63,6 +63,8 @@ static inline void clear_config_env_vars(void) {
     unsetenv("METRICS_PORT");
     unsetenv("METRICS_ENABLED");
     unsetenv("HOSTS_A");
+    unsetenv("UPSTREAM_BOOTSTRAP_ENABLED");
+    unsetenv("UPSTREAM_BOOTSTRAP_A");
     unsetenv("DNS_ENCRYPTED_PROXY_CONFIG");
 }
 

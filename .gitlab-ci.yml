@@ -15,6 +15,7 @@ test:
     - docker
   before_script:
     - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3 autoconf automake libtool git
+    - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
     - git clone --depth 1 -b v1.12.0 https://github.com/ngtcp2/ngtcp2 /tmp/ngtcp2
     - cd /tmp/ngtcp2
     - autoreconf -fi
@@ -38,6 +39,7 @@ test:
             bdir="build-matrix-ci/$combo"
             echo "==> Configure $combo"
             cmake -S . -B "$bdir" \
+              -DC_LOG_PATH=/tmp/c-log \
               -DBUILD_TESTS=ON \
               -DBUILD_BENCHMARKS=OFF \
               -DENABLE_UPSTREAM_DOH="$doh" \
@@ -65,8 +67,8 @@ build:
   script:
     - docker info
     - docker login -u gitlab-ci-token -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
-    - docker build --pull -t "$IMAGE:$TAG" .
-    - docker run -d --rm --name dns-encrypted-proxy-smoke "$IMAGE:$TAG" /app/dns-encrypted-proxy /app/dns-encrypted-proxy.conf.example
+    - docker build --pull --build-arg C_LOG_CACHE_BUST="$CI_PIPELINE_ID" -t "$IMAGE:$TAG" .
+    - docker run -d --rm --name dns-encrypted-proxy-smoke "$IMAGE:$TAG"
     - sleep 2
     - test -n "$(docker ps --filter name=dns-encrypted-proxy-smoke -q)"
     - docker stop dns-encrypted-proxy-smoke

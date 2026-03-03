@@ -2,7 +2,10 @@
 #include "dns_message.h"
 
 #include <curl/curl.h>
+
+#include <arpa/inet.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -172,7 +175,8 @@ static void pool_release(upstream_doh_client_t *client, int slot) {
 static int doh_post_with_handle(
     upstream_doh_client_t *client,
     CURL *curl,
-    const char *url,
+    const upstream_server_t *server,
+    int use_bootstrap_v4,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,
@@ -210,7 +214,7 @@ static int doh_post_with_handle(
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     }
 
-    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_URL, server->url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query);
@@ -220,6 +224,22 @@ static int doh_post_with_handle(
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "dns-encrypted-proxy/0.2");
 
+    struct curl_slist *resolve = NULL;
+    if (use_bootstrap_v4 && server->has_bootstrap_v4) {
+        struct in_addr addr;
+        addr.s_addr = server->bootstrap_addr_v4_be;
+        char ip_text[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &addr, ip_text, sizeof(ip_text)) != NULL) {
+            char resolve_entry[320];
+            if (snprintf(resolve_entry, sizeof(resolve_entry), "%s:%d:%s", server->host, server->port, ip_text) > 0) {
+                resolve = curl_slist_append(NULL, resolve_entry);
+                if (resolve != NULL) {
+                    curl_easy_setopt(curl, CURLOPT_RESOLVE, resolve);
+                }
+            }
+        }
+    }
+
     CURLcode rc = curl_easy_perform(curl);
     long status = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -227,6 +247,9 @@ static int doh_post_with_handle(
     (void)curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
 
     curl_slist_free_all(headers);
+    if (resolve != NULL) {
+        curl_slist_free_all(resolve);
+    }
 
     /* Empty body is treated as transport failure for resolver semantics. */
     if (rc != CURLE_OK || status != 200 || response.len == 0) {
@@ -371,9 +394,25 @@ int upstream_doh_resolve(
     
     int result = doh_post_with_handle(
         client,
-        curl, server->url, timeout_ms,
+        curl,
+        server,
+        0,
+        timeout_ms,
         query, query_len,
         &response, &response_len);
+
+    if (result != 0 && server->has_bootstrap_v4) {
+        result = doh_post_with_handle(
+            client,
+            curl,
+            server,
+            1,
+            timeout_ms,
+            query,
+            query_len,
+            &response,
+            &response_len);
+    }
     
     pool_release(client, slot);
     
