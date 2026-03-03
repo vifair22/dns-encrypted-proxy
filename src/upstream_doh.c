@@ -95,7 +95,11 @@ static const char *doh_failure_reason(CURLcode rc, long http_status, size_t resp
     return "unknown";
 }
 
-static void log_doh_attempt_failure(const char *phase, const upstream_server_t *server, const doh_attempt_error_t *err) {
+static void log_doh_attempt_failure_impl(
+    const char *caller_func,
+    const char *phase,
+    const upstream_server_t *server,
+    const doh_attempt_error_t *err) {
     if (phase == NULL || server == NULL || err == NULL) {
         return;
     }
@@ -107,7 +111,9 @@ static void log_doh_attempt_failure(const char *phase, const upstream_server_t *
     }
 
     const char *reason = doh_failure_reason(err->curl_rc, err->http_status, err->response_len);
-    LOGF_WARN(
+    logger_logf(
+        caller_func,
+        "WARN",
         "DoH %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=curl=%d(%s),http=%ld,body_len=%zu",
         phase,
         server->host,
@@ -119,6 +125,9 @@ static void log_doh_attempt_failure(const char *phase, const upstream_server_t *
         err->http_status,
         err->response_len);
 }
+
+#define LOG_DOH_ATTEMPT_FAILURE(phase, server, err) \
+    log_doh_attempt_failure_impl(__func__, phase, server, err)
 
 struct upstream_doh_client {
     CURL **pool_handles;
@@ -518,7 +527,7 @@ int upstream_doh_resolve(
         &attempt_err);
 
     if (result != 0) {
-        log_doh_attempt_failure("primary request", server, &attempt_err);
+        LOG_DOH_ATTEMPT_FAILURE("primary request", server, &attempt_err);
     }
 
     if (result != 0 && server->stage.has_stage1_cached_v4) {
@@ -535,7 +544,7 @@ int upstream_doh_resolve(
             &response_len,
             &attempt_err);
         if (result != 0) {
-            log_doh_attempt_failure("stage1 cached IPv4", server, &attempt_err);
+            LOG_DOH_ATTEMPT_FAILURE("stage1 cached IPv4", server, &attempt_err);
         }
     }
 
@@ -563,7 +572,7 @@ int upstream_doh_resolve(
         if (result == 0) {
             LOGF_INFO("DoH stage2 bootstrap IPv4 succeeded: host=%s", server->host);
         } else {
-            log_doh_attempt_failure("stage2 bootstrap IPv4", server, &attempt_err);
+            LOG_DOH_ATTEMPT_FAILURE("stage2 bootstrap IPv4", server, &attempt_err);
         }
     }
     

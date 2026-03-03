@@ -78,7 +78,8 @@ static const char *dot_normalize_reason(const char *detail_reason) {
     return detail_reason;
 }
 
-static void log_dot_attempt_failure(
+static void log_dot_attempt_failure_impl(
+    const char *caller_func,
     const upstream_server_t *server,
     const char *phase,
     const char *detail_reason,
@@ -91,7 +92,9 @@ static void log_dot_attempt_failure(
         format_ipv4(override_addr_v4_be, ip_text, sizeof(ip_text));
     }
     const char *reason = dot_normalize_reason(detail_reason);
-    LOGF_WARN(
+    logger_logf(
+        caller_func,
+        "WARN",
         "DoT %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=%s",
         phase,
         server->host,
@@ -100,6 +103,9 @@ static void log_dot_attempt_failure(
         used_override_v4 ? ip_text : "none",
         detail_reason != NULL ? detail_reason : "none");
 }
+
+#define LOG_DOT_ATTEMPT_FAILURE(server, phase, detail_reason, used_override_v4, override_addr_v4_be, timeout_ms) \
+    log_dot_attempt_failure_impl(__func__, server, phase, detail_reason, used_override_v4, override_addr_v4_be, timeout_ms)
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -532,7 +538,7 @@ int upstream_dot_resolve(
                 == 0) {
             connected = 1;
         } else if (server->stage.has_stage1_cached_v4) {
-            log_dot_attempt_failure(
+            LOG_DOT_ATTEMPT_FAILURE(
                 server,
                 "stage1 cached IPv4",
                 attempt_reason,
@@ -544,7 +550,7 @@ int upstream_dot_resolve(
         if (!connected && establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0, &attempt_reason) == 0) {
             connected = 1;
         } else if (!connected) {
-            log_dot_attempt_failure(server, "primary request", attempt_reason, 0, 0, timeout_ms);
+            LOG_DOT_ATTEMPT_FAILURE(server, "primary request", attempt_reason, 0, 0, timeout_ms);
         }
 
         if (!connected) {
@@ -568,7 +574,7 @@ int upstream_dot_resolve(
                 stage2_used = 1;
             } else {
                 if (server->stage.has_bootstrap_v4) {
-                    log_dot_attempt_failure(
+                    LOG_DOT_ATTEMPT_FAILURE(
                         server,
                         "stage2 bootstrap IPv4",
                         attempt_reason,

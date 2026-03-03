@@ -18,6 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <curl/curl.h>
+
 typedef struct {
     int protocol; /* 0=udp,1=tcp,2=udp-upgrade */
     size_t requests;
@@ -26,12 +28,17 @@ typedef struct {
     int timeout_ms;
     int upstream_delay_us;
     int upstream_answer_count;
+    int random_qname;
+    int direct_upstream;
     const char *proxy_bin;
 } bench_opts_t;
 
 typedef struct {
     int proxy_port;
+    int upstream_port;
     int protocol;
+    int random_qname;
+    int direct_upstream;
     int timeout_ms;
     atomic_size_t *next_idx;
     size_t requests;
@@ -58,10 +65,156 @@ static const uint8_t DNS_QUERY_EXAMPLE_A[] = {
     0x00, 0x01,
 };
 
+static int append_label(uint8_t *buf, size_t cap, size_t *off, const char *label, size_t label_len) {
+    if (buf == NULL || off == NULL || label == NULL || label_len == 0 || label_len > 63) {
+        return -1;
+    }
+    if (*off + 1 + label_len > cap) {
+        return -1;
+    }
+    buf[*off] = (uint8_t)label_len;
+    (*off)++;
+    memcpy(buf + *off, label, label_len);
+    *off += label_len;
+    return 0;
+}
+
+static int build_query_a(uint16_t dns_id, int random_qname, uint64_t nonce, uint8_t *out, size_t out_cap, size_t *out_len) {
+    if (out == NULL || out_len == NULL || out_cap < sizeof(DNS_QUERY_EXAMPLE_A)) {
+        return -1;
+    }
+
+    if (!random_qname) {
+        memcpy(out, DNS_QUERY_EXAMPLE_A, sizeof(DNS_QUERY_EXAMPLE_A));
+        out[0] = (uint8_t)((dns_id >> 8) & 0xFFu);
+        out[1] = (uint8_t)(dns_id & 0xFFu);
+        *out_len = sizeof(DNS_QUERY_EXAMPLE_A);
+        return 0;
+    }
+
+    size_t off = 0;
+    out[off++] = (uint8_t)((dns_id >> 8) & 0xFFu);
+    out[off++] = (uint8_t)(dns_id & 0xFFu);
+    out[off++] = 0x01;
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+    out[off++] = 0x01;
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+
+    char rand_label[17];
+    snprintf(rand_label, sizeof(rand_label), "%08" PRIx64, (uint64_t)(nonce & 0xFFFFFFFFULL));
+    if (append_label(out, out_cap, &off, rand_label, strlen(rand_label)) != 0 ||
+        append_label(out, out_cap, &off, "example", 7) != 0 ||
+        append_label(out, out_cap, &off, "com", 3) != 0) {
+        return -1;
+    }
+
+    if (off + 5 > out_cap) {
+        return -1;
+    }
+    out[off++] = 0x00;
+    out[off++] = 0x00;
+    out[off++] = 0x01;
+    out[off++] = 0x00;
+    out[off++] = 0x01;
+
+    *out_len = off;
+    return 0;
+}
+
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct {
+    uint8_t buf[4096];
+    size_t len;
+} direct_resp_t;
+
+static size_t curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t n = size * nmemb;
+    direct_resp_t *resp = (direct_resp_t *)userp;
+    if (resp == NULL || n == 0) {
+        return 0;
+    }
+    size_t remain = sizeof(resp->buf) - resp->len;
+    if (n > remain) {
+        n = remain;
+    }
+    if (n > 0) {
+        memcpy(resp->buf + resp->len, contents, n);
+        resp->len += n;
+    }
+    return size * nmemb;
+}
+
+static int send_one_direct_doh_query(
+    CURL *curl,
+    struct curl_slist *headers,
+    int upstream_port,
+    int timeout_ms,
+    uint16_t dns_id,
+    int random_qname,
+    uint64_t nonce,
+    uint64_t *lat_out_ns) {
+    if (curl == NULL || headers == NULL) {
+        return -1;
+    }
+
+    uint8_t query[512];
+    size_t query_len = 0;
+    if (build_query_a(dns_id, random_qname, nonce, query, sizeof(query), &query_len) != 0) {
+        return -1;
+    }
+
+    char url[128];
+    snprintf(url, sizeof(url), "https://127.0.0.1:%d/dns-query", upstream_port);
+
+    direct_resp_t resp;
+    resp.len = 0;
+
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, (const char *)query);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)query_len);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    uint64_t t0 = now_ns();
+    CURLcode rc = curl_easy_perform(curl);
+    uint64_t t1 = now_ns();
+    if (rc != CURLE_OK) {
+        return -1;
+    }
+
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    if (status != 200 || resp.len < 12) {
+        return -1;
+    }
+
+    uint16_t got_id = (uint16_t)(((uint16_t)resp.buf[0] << 8) | (uint16_t)resp.buf[1]);
+    if (got_id != dns_id) {
+        return -1;
+    }
+
+    if (lat_out_ns != NULL) {
+        *lat_out_ns = t1 - t0;
+    }
+    return 0;
 }
 
 static int reserve_local_port(void) {
@@ -121,7 +274,13 @@ static int wait_tcp_listen(int port, int timeout_ms) {
     return -1;
 }
 
-static int send_one_udp_query(int proxy_port, int timeout_ms, uint16_t dns_id, uint64_t *lat_out_ns) {
+static int send_one_udp_query(
+    int proxy_port,
+    int timeout_ms,
+    uint16_t dns_id,
+    int random_qname,
+    uint64_t nonce,
+    uint64_t *lat_out_ns) {
     /* Measures full client-observed UDP round trip: sendto -> recv. */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -139,14 +298,16 @@ static int send_one_udp_query(int proxy_port, int timeout_ms, uint16_t dns_id, u
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)proxy_port);
 
-    uint8_t query[sizeof(DNS_QUERY_EXAMPLE_A)];
-    memcpy(query, DNS_QUERY_EXAMPLE_A, sizeof(query));
-    query[0] = (uint8_t)((dns_id >> 8) & 0xFFu);
-    query[1] = (uint8_t)(dns_id & 0xFFu);
+    uint8_t query[512];
+    size_t query_len = 0;
+    if (build_query_a(dns_id, random_qname, nonce, query, sizeof(query), &query_len) != 0) {
+        close(fd);
+        return -1;
+    }
 
     uint64_t t0 = now_ns();
-    ssize_t sent = sendto(fd, query, sizeof(query), 0, (struct sockaddr *)&addr, sizeof(addr));
-    if (sent != (ssize_t)sizeof(query)) {
+    ssize_t sent = sendto(fd, query, query_len, 0, (struct sockaddr *)&addr, sizeof(addr));
+    if (sent != (ssize_t)query_len) {
         close(fd);
         return -1;
     }
@@ -194,7 +355,13 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-static int send_one_tcp_query(int proxy_port, int timeout_ms, uint16_t dns_id, uint64_t *lat_out_ns) {
+static int send_one_tcp_query(
+    int proxy_port,
+    int timeout_ms,
+    uint16_t dns_id,
+    int random_qname,
+    uint64_t nonce,
+    uint64_t *lat_out_ns) {
     /*
      * This mode intentionally opens a new TCP connection per query to model
      * short-lived clients and expose handshake/setup cost explicitly.
@@ -221,18 +388,20 @@ static int send_one_tcp_query(int proxy_port, int timeout_ms, uint16_t dns_id, u
         return -1;
     }
 
-    uint8_t query[sizeof(DNS_QUERY_EXAMPLE_A)];
-    memcpy(query, DNS_QUERY_EXAMPLE_A, sizeof(query));
-    query[0] = (uint8_t)((dns_id >> 8) & 0xFFu);
-    query[1] = (uint8_t)(dns_id & 0xFFu);
+    uint8_t query[512];
+    size_t query_len = 0;
+    if (build_query_a(dns_id, random_qname, nonce, query, sizeof(query), &query_len) != 0) {
+        close(fd);
+        return -1;
+    }
 
     uint8_t frame_hdr[2] = {
-        (uint8_t)((sizeof(query) >> 8) & 0xFFu),
-        (uint8_t)(sizeof(query) & 0xFFu),
+        (uint8_t)((query_len >> 8) & 0xFFu),
+        (uint8_t)(query_len & 0xFFu),
     };
 
     uint64_t t0 = now_ns();
-    if (send_all(fd, frame_hdr, sizeof(frame_hdr)) != 0 || send_all(fd, query, sizeof(query)) != 0) {
+    if (send_all(fd, frame_hdr, sizeof(frame_hdr)) != 0 || send_all(fd, query, query_len) != 0) {
         close(fd);
         return -1;
     }
@@ -274,7 +443,13 @@ static int send_one_tcp_query(int proxy_port, int timeout_ms, uint16_t dns_id, u
     return 0;
 }
 
-static int send_one_udp_upgrade_query(int proxy_port, int timeout_ms, uint16_t dns_id, uint64_t *lat_out_ns) {
+static int send_one_udp_upgrade_query(
+    int proxy_port,
+    int timeout_ms,
+    uint16_t dns_id,
+    int random_qname,
+    uint64_t nonce,
+    uint64_t *lat_out_ns) {
     /*
      * Upgrade path latency includes both phases:
      *  1) UDP query receiving TC=1
@@ -296,14 +471,16 @@ static int send_one_udp_upgrade_query(int proxy_port, int timeout_ms, uint16_t d
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)proxy_port);
 
-    uint8_t query[sizeof(DNS_QUERY_EXAMPLE_A)];
-    memcpy(query, DNS_QUERY_EXAMPLE_A, sizeof(query));
-    query[0] = (uint8_t)((dns_id >> 8) & 0xFFu);
-    query[1] = (uint8_t)(dns_id & 0xFFu);
+    uint8_t query[512];
+    size_t query_len = 0;
+    if (build_query_a(dns_id, random_qname, nonce, query, sizeof(query), &query_len) != 0) {
+        close(fd);
+        return -1;
+    }
 
     uint64_t t0 = now_ns();
-    ssize_t sent = sendto(fd, query, sizeof(query), 0, (struct sockaddr *)&addr, sizeof(addr));
-    if (sent != (ssize_t)sizeof(query)) {
+    ssize_t sent = sendto(fd, query, query_len, 0, (struct sockaddr *)&addr, sizeof(addr));
+    if (sent != (ssize_t)query_len) {
         close(fd);
         return -1;
     }
@@ -326,7 +503,7 @@ static int send_one_udp_upgrade_query(int proxy_port, int timeout_ms, uint16_t d
     }
 
     uint64_t tail = 0;
-    if (send_one_tcp_query(proxy_port, timeout_ms, dns_id, &tail) != 0) {
+    if (send_one_tcp_query(proxy_port, timeout_ms, dns_id, random_qname, nonce, &tail) != 0) {
         return -1;
     }
 
@@ -340,7 +517,7 @@ static int send_one_udp_upgrade_query(int proxy_port, int timeout_ms, uint16_t d
 static int wait_proxy_ready(int proxy_port, int timeout_ms) {
     uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
     while (now_ns() < deadline) {
-        if (send_one_udp_query(proxy_port, 250, 0xBEEF, NULL) == 0) {
+        if (send_one_udp_query(proxy_port, 250, 0xBEEF, 0, 0, NULL) == 0) {
             return 0;
         }
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
@@ -459,6 +636,22 @@ static uint64_t percentile_ns(const uint64_t *vals, size_t n, double pct) {
 
 static void *worker_main(void *arg) {
     worker_args_t *w = (worker_args_t *)arg;
+
+    CURL *direct_curl = NULL;
+    struct curl_slist *direct_headers = NULL;
+    if (w->direct_upstream) {
+        direct_curl = curl_easy_init();
+        if (direct_curl == NULL) {
+            return NULL;
+        }
+        direct_headers = curl_slist_append(direct_headers, "Content-Type: application/dns-message");
+        direct_headers = curl_slist_append(direct_headers, "Accept: application/dns-message");
+        if (direct_headers == NULL) {
+            curl_easy_cleanup(direct_curl);
+            return NULL;
+        }
+    }
+
     while (1) {
         size_t idx = atomic_fetch_add(w->next_idx, 1);
         if (idx >= w->requests) {
@@ -469,12 +662,22 @@ static void *worker_main(void *arg) {
         uint16_t id = (uint16_t)((idx % 65535u) + 1u);
         /* Keep worker logic protocol-neutral so load generation is consistent. */
         int rc = -1;
-        if (w->protocol == PROTO_UDP) {
-            rc = send_one_udp_query(w->proxy_port, w->timeout_ms, id, &lat);
+        if (w->direct_upstream) {
+            rc = send_one_direct_doh_query(
+                direct_curl,
+                direct_headers,
+                w->upstream_port,
+                w->timeout_ms,
+                id,
+                w->random_qname,
+                idx,
+                &lat);
+        } else if (w->protocol == PROTO_UDP) {
+            rc = send_one_udp_query(w->proxy_port, w->timeout_ms, id, w->random_qname, idx, &lat);
         } else if (w->protocol == PROTO_TCP) {
-            rc = send_one_tcp_query(w->proxy_port, w->timeout_ms, id, &lat);
+            rc = send_one_tcp_query(w->proxy_port, w->timeout_ms, id, w->random_qname, idx, &lat);
         } else {
-            rc = send_one_udp_upgrade_query(w->proxy_port, w->timeout_ms, id, &lat);
+            rc = send_one_udp_upgrade_query(w->proxy_port, w->timeout_ms, id, w->random_qname, idx, &lat);
         }
 
         if (rc == 0) {
@@ -485,12 +688,19 @@ static void *worker_main(void *arg) {
             atomic_fetch_add(w->fail_count, 1);
         }
     }
+
+    if (direct_headers != NULL) {
+        curl_slist_free_all(direct_headers);
+    }
+    if (direct_curl != NULL) {
+        curl_easy_cleanup(direct_curl);
+    }
     return NULL;
 }
 
 static void print_usage(const char *argv0) {
     printf(
-        "Usage: %s [--protocol udp|tcp|udp-upgrade] [--requests N] [--concurrency N] [--warmup N] [--timeout-ms N] [--upstream-delay-us N] [--upstream-answer-count N] [--proxy-bin PATH]\n",
+        "Usage: %s [--protocol udp|tcp|udp-upgrade] [--requests N] [--concurrency N] [--warmup N] [--timeout-ms N] [--upstream-delay-us N] [--upstream-answer-count N] [--random-qname] [--direct-upstream] [--proxy-bin PATH]\n",
         argv0);
 }
 
@@ -502,6 +712,8 @@ static int parse_opts(int argc, char **argv, bench_opts_t *opts) {
     opts->upstream_delay_us = 0;
     opts->upstream_answer_count = 1;
     opts->protocol = PROTO_UDP;
+    opts->random_qname = 0;
+    opts->direct_upstream = 0;
     opts->proxy_bin = "./build/dns-encrypted-proxy";
 
     for (int i = 1; i < argc; i++) {
@@ -531,6 +743,10 @@ static int parse_opts(int argc, char **argv, bench_opts_t *opts) {
             opts->upstream_delay_us = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--upstream-answer-count") == 0 && i + 1 < argc) {
             opts->upstream_answer_count = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--random-qname") == 0) {
+            opts->random_qname = 1;
+        } else if (strcmp(argv[i], "--direct-upstream") == 0) {
+            opts->direct_upstream = 1;
         } else if (strcmp(argv[i], "--proxy-bin") == 0 && i + 1 < argc) {
             opts->proxy_bin = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -546,6 +762,9 @@ static int parse_opts(int argc, char **argv, bench_opts_t *opts) {
     if (opts->requests == 0 || opts->concurrency == 0 || opts->timeout_ms <= 0 || opts->upstream_answer_count <= 0) {
         return -1;
     }
+    if (opts->direct_upstream && opts->protocol == PROTO_UDP_UPGRADE) {
+        return -1;
+    }
     if (opts->protocol == PROTO_UDP_UPGRADE && opts->upstream_answer_count < 40) {
         opts->upstream_answer_count = 40;
     }
@@ -559,51 +778,82 @@ int main(int argc, char **argv) {
         return p < 0 ? 2 : 0;
     }
 
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+        fprintf(stderr, "failed to initialize curl\n");
+        return 1;
+    }
+
     int upstream_port = reserve_local_port();
-    int proxy_port = reserve_local_port();
-    if (upstream_port <= 0 || proxy_port <= 0) {
+    int proxy_port = opts.direct_upstream ? 0 : reserve_local_port();
+    if (upstream_port <= 0 || (!opts.direct_upstream && proxy_port <= 0)) {
         fprintf(stderr, "failed to reserve ports\n");
+        curl_global_cleanup();
         return 1;
     }
 
     char cfg_path[] = "/tmp/dns_encrypted_proxy_bench_cfg_XXXXXX";
-    int cfg_fd = mkstemp(cfg_path);
-    if (cfg_fd < 0) {
-        perror("mkstemp");
-        return 1;
-    }
-    close(cfg_fd);
-    if (write_proxy_config(cfg_path, proxy_port, upstream_port) != 0) {
-        fprintf(stderr, "failed to write config\n");
-        unlink(cfg_path);
-        return 1;
+    if (!opts.direct_upstream) {
+        int cfg_fd = mkstemp(cfg_path);
+        if (cfg_fd < 0) {
+            perror("mkstemp");
+            curl_global_cleanup();
+            return 1;
+        }
+        close(cfg_fd);
+        if (write_proxy_config(cfg_path, proxy_port, upstream_port) != 0) {
+            fprintf(stderr, "failed to write config\n");
+            unlink(cfg_path);
+            curl_global_cleanup();
+            return 1;
+        }
     }
 
     pid_t upstream_pid = spawn_mock_upstream(upstream_port, opts.upstream_delay_us, opts.upstream_answer_count);
     if (upstream_pid <= 0 || wait_tcp_listen(upstream_port, 5000) != 0) {
         fprintf(stderr, "failed to start mock upstream\n");
         stop_process(upstream_pid);
-        unlink(cfg_path);
+        if (!opts.direct_upstream) {
+            unlink(cfg_path);
+        }
+        curl_global_cleanup();
         return 1;
     }
 
-    pid_t proxy_pid = spawn_proxy(opts.proxy_bin, cfg_path);
-    if (proxy_pid <= 0 || wait_proxy_ready(proxy_port, 8000) != 0) {
-        fprintf(stderr, "failed to start proxy\n");
-        stop_process(proxy_pid);
-        stop_process(upstream_pid);
-        unlink(cfg_path);
-        return 1;
+    pid_t proxy_pid = 0;
+    if (!opts.direct_upstream) {
+        proxy_pid = spawn_proxy(opts.proxy_bin, cfg_path);
+        if (proxy_pid <= 0 || wait_proxy_ready(proxy_port, 8000) != 0) {
+            fprintf(stderr, "failed to start proxy\n");
+            stop_process(proxy_pid);
+            stop_process(upstream_pid);
+            unlink(cfg_path);
+            curl_global_cleanup();
+            return 1;
+        }
     }
 
     for (size_t i = 0; i < opts.warmup; i++) {
         uint16_t id = (uint16_t)(0x9000u + (i % 1000u));
-        if (opts.protocol == PROTO_UDP) {
-            (void)send_one_udp_query(proxy_port, opts.timeout_ms, id, NULL);
+        if (opts.direct_upstream) {
+            CURL *curl = curl_easy_init();
+            struct curl_slist *headers = NULL;
+            headers = curl_slist_append(headers, "Content-Type: application/dns-message");
+            headers = curl_slist_append(headers, "Accept: application/dns-message");
+            if (curl != NULL && headers != NULL) {
+                (void)send_one_direct_doh_query(curl, headers, upstream_port, opts.timeout_ms, id, opts.random_qname, i, NULL);
+            }
+            if (headers != NULL) {
+                curl_slist_free_all(headers);
+            }
+            if (curl != NULL) {
+                curl_easy_cleanup(curl);
+            }
+        } else if (opts.protocol == PROTO_UDP) {
+            (void)send_one_udp_query(proxy_port, opts.timeout_ms, id, opts.random_qname, i, NULL);
         } else if (opts.protocol == PROTO_TCP) {
-            (void)send_one_tcp_query(proxy_port, opts.timeout_ms, id, NULL);
+            (void)send_one_tcp_query(proxy_port, opts.timeout_ms, id, opts.random_qname, i, NULL);
         } else {
-            (void)send_one_udp_upgrade_query(proxy_port, opts.timeout_ms, id, NULL);
+            (void)send_one_udp_upgrade_query(proxy_port, opts.timeout_ms, id, opts.random_qname, i, NULL);
         }
     }
 
@@ -617,7 +867,10 @@ int main(int argc, char **argv) {
         free(args);
         stop_process(proxy_pid);
         stop_process(upstream_pid);
-        unlink(cfg_path);
+        if (!opts.direct_upstream) {
+            unlink(cfg_path);
+        }
+        curl_global_cleanup();
         return 1;
     }
 
@@ -631,7 +884,10 @@ int main(int argc, char **argv) {
     uint64_t t0 = now_ns();
     for (size_t i = 0; i < opts.concurrency; i++) {
         args[i].proxy_port = proxy_port;
+        args[i].upstream_port = upstream_port;
         args[i].protocol = opts.protocol;
+        args[i].random_qname = opts.random_qname;
+        args[i].direct_upstream = opts.direct_upstream;
         args[i].timeout_ms = opts.timeout_ms;
         args[i].next_idx = &next_idx;
         args[i].requests = opts.requests;
@@ -672,11 +928,13 @@ int main(int argc, char **argv) {
     uint64_t p99 = percentile_ns(succ, si, 99.0);
     uint64_t pmax = si > 0 ? succ[si - 1] : 0;
 
-    const char *proto_name = opts.protocol == PROTO_UDP
-                                 ? "udp"
-                                 : (opts.protocol == PROTO_TCP ? "tcp" : "udp-upgrade");
+    const char *proto_name = opts.direct_upstream
+                                 ? "direct-doh"
+                                 : (opts.protocol == PROTO_UDP
+                                  ? "udp"
+                                  : (opts.protocol == PROTO_TCP ? "tcp" : "udp-upgrade"));
     printf("e2e_proxy_bench\n");
-    printf("  protocol=%s requests=%zu concurrency=%zu warmup=%zu timeout_ms=%d upstream_delay_us=%d upstream_answer_count=%d\n", proto_name, opts.requests, opts.concurrency, opts.warmup, opts.timeout_ms, opts.upstream_delay_us, opts.upstream_answer_count);
+    printf("  protocol=%s requests=%zu concurrency=%zu warmup=%zu timeout_ms=%d upstream_delay_us=%d upstream_answer_count=%d random_qname=%d\n", proto_name, opts.requests, opts.concurrency, opts.warmup, opts.timeout_ms, opts.upstream_delay_us, opts.upstream_answer_count, opts.random_qname);
     printf("  proxy_port=%d upstream_port=%d\n", proxy_port, upstream_port);
     printf("  completed=%zu failed=%zu error_rate=%.2f%%\n", ok, fail, opts.requests > 0 ? (100.0 * (double)fail / (double)opts.requests) : 0.0);
     printf("  duration=%.3fs throughput=%.0f req/s\n", sec, rps);
@@ -689,6 +947,9 @@ int main(int argc, char **argv) {
 
     stop_process(proxy_pid);
     stop_process(upstream_pid);
-    unlink(cfg_path);
+    if (!opts.direct_upstream) {
+        unlink(cfg_path);
+    }
+    curl_global_cleanup();
     return fail > 0 ? 3 : 0;
 }

@@ -734,12 +734,14 @@ static uint64_t stage_cooldown_remaining_ms(const upstream_server_t *server, int
     return 0;
 }
 
-static void log_stage_event(
+static void log_stage_event_impl(
+    const char *caller_func,
     const upstream_server_t *server,
     int stage_id,
     const char *stage,
     const char *action,
     const char *reason,
+    const char *detail,
     int timeout_ms) {
     uint64_t cooldown_ms = stage_cooldown_remaining_ms(server, stage_id);
     char ip_text[INET_ADDRSTRLEN];
@@ -748,17 +750,23 @@ static void log_stage_event(
         format_ipv4(server->stage.bootstrap_addr_v4_be, ip_text, sizeof(ip_text));
     }
 
-    LOGF_WARN(
-        "Upstream stage event: host=%s type=%s stage=%s action=%s reason=%s timeout_ms=%d cooldown_ms=%llu override_ip=%s",
+    logger_logf(
+        caller_func,
+        "WARN",
+        "Upstream stage event: host=%s type=%s stage=%s action=%s reason=%s detail=%s timeout_ms=%d cooldown_ms=%llu override_ip=%s",
         server->host,
         upstream_type_name(server->type),
         stage,
         action,
         reason != NULL ? reason : "none",
+        detail != NULL ? detail : "none",
         timeout_ms,
         (unsigned long long)cooldown_ms,
         ip_text[0] != '\0' ? ip_text : "none");
 }
+
+#define LOG_STAGE_EVENT(server, stage_id, stage, action, reason, detail, timeout_ms) \
+    log_stage_event_impl(__func__, server, stage_id, stage, action, reason, detail, timeout_ms)
 
 static int consume_retry_budget(int *budget, const upstream_server_t *server, const char *phase) {
     if (budget == NULL || server == NULL || phase == NULL) {
@@ -770,6 +778,22 @@ static int consume_retry_budget(int *budget, const upstream_server_t *server, co
     }
     (*budget)--;
     return 0;
+}
+
+static int should_try_stage2_after_stage1_failure(const upstream_server_t *server) {
+    uint64_t now = now_ms();
+    if (!server->stage.has_bootstrap_v4) {
+        return 1;
+    }
+    if (server->stage.bootstrap_expires_at_ms <= now) {
+        return 1;
+    }
+    return 0;
+}
+
+static int should_try_stage3_after_stage2_failure(const char *stage2_reason) {
+    upstream_reason_class_t reason_class = classify_stage_reason(stage2_reason);
+    return reason_class == UPSTREAM_REASON_CLASS_DNS || reason_class == UPSTREAM_REASON_CLASS_NETWORK;
 }
 
 static int resolve_server_with_fallback(
@@ -809,7 +833,20 @@ static int resolve_server_with_fallback(
 
     note_stage1_failure(client, server);
 
-    log_stage_event(server, 2, "stage2", "enter", "stage1_failed", client->config.timeout_ms);
+    if (!should_try_stage2_after_stage1_failure(server)) {
+        LOG_STAGE_EVENT(
+            server,
+            2,
+            "stage2",
+            "skipped",
+            "transport_path_presumed",
+            "bootstrap_fresh",
+            client->config.timeout_ms);
+        upstream_server_record_failure(server, &client->config);
+        return -1;
+    }
+
+    LOG_STAGE_EVENT(server, 2, "stage2", "enter", "stage1_failed", NULL, client->config.timeout_ms);
     client_counter_inc(&client->stage_metrics.stage2_attempts);
     const char *stage2_reason = NULL;
     if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms, &stage2_reason) == 0) {
@@ -823,18 +860,35 @@ static int resolve_server_with_fallback(
         }
         client_counter_inc(&client->stage_metrics.stage2_failures);
         note_stage_reason(client, 2, "transport_retry_failed");
-        log_stage_event(server, 2, "stage2", "retry_failed", stage2_reason, client->config.timeout_ms);
+        LOG_STAGE_EVENT(
+            server,
+            2,
+            "stage2",
+            "retry_failed",
+            "transport_retry_failed",
+            stage2_reason,
+            client->config.timeout_ms);
+        LOG_STAGE_EVENT(
+            server,
+            3,
+            "stage3",
+            "skipped",
+            "stage2_resolved_transport_failed",
+            stage2_reason,
+            client->config.timeout_ms);
+        upstream_server_record_failure(server, &client->config);
+        return -1;
     } else {
         client_counter_inc(&client->stage_metrics.stage2_failures);
         if (stage2_reason != NULL && strcmp(stage2_reason, "cooldown") == 0) {
             client_counter_inc(&client->stage_metrics.stage2_cooldowns);
         }
         note_stage_reason(client, 2, stage2_reason);
-        log_stage_event(server, 2, "stage2", "failed", stage2_reason, client->config.timeout_ms);
+        LOG_STAGE_EVENT(server, 2, "stage2", "failed", stage2_reason, NULL, client->config.timeout_ms);
     }
 
-    if (client->config.iterative_bootstrap_enabled) {
-        log_stage_event(server, 3, "stage3", "enter", "stage2_failed", client->config.timeout_ms);
+    if (client->config.iterative_bootstrap_enabled && should_try_stage3_after_stage2_failure(stage2_reason)) {
+        LOG_STAGE_EVENT(server, 3, "stage3", "enter", "stage2_failed", stage2_reason, client->config.timeout_ms);
         client_counter_inc(&client->stage_metrics.stage3_attempts);
 
         const char *stage3_reason = NULL;
@@ -850,15 +904,31 @@ static int resolve_server_with_fallback(
             }
             client_counter_inc(&client->stage_metrics.stage3_failures);
             note_stage_reason(client, 3, "transport_retry_failed");
-            log_stage_event(server, 3, "stage3", "retry_failed", stage3_reason, client->config.timeout_ms);
+            LOG_STAGE_EVENT(
+                server,
+                3,
+                "stage3",
+                "retry_failed",
+                "transport_retry_failed",
+                stage3_reason,
+                client->config.timeout_ms);
         } else {
             client_counter_inc(&client->stage_metrics.stage3_failures);
             if (stage3_reason != NULL && strcmp(stage3_reason, "cooldown") == 0) {
                 client_counter_inc(&client->stage_metrics.stage3_cooldowns);
             }
             note_stage_reason(client, 3, stage3_reason);
-            log_stage_event(server, 3, "stage3", "failed", stage3_reason, client->config.timeout_ms);
+            LOG_STAGE_EVENT(server, 3, "stage3", "failed", stage3_reason, NULL, client->config.timeout_ms);
         }
+    } else if (client->config.iterative_bootstrap_enabled) {
+        LOG_STAGE_EVENT(
+            server,
+            3,
+            "stage3",
+            "skipped",
+            "non_lookup_stage2_failure",
+            stage2_reason,
+            client->config.timeout_ms);
     }
 
     upstream_server_record_failure(server, &client->config);

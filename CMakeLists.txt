@@ -165,7 +165,7 @@ if(BUILD_BENCHMARKS)
     apply_target_defaults(cache_bench)
 
     add_executable(e2e_proxy_bench tools/e2e_proxy_bench.c)
-    target_link_libraries(e2e_proxy_bench PRIVATE Threads::Threads)
+    target_link_libraries(e2e_proxy_bench PRIVATE Threads::Threads CURL::libcurl)
     apply_target_defaults(e2e_proxy_bench)
 endif()
 

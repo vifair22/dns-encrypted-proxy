@@ -92,7 +92,8 @@ static const char *doq_normalize_reason(const char *detail_reason) {
     return detail_reason;
 }
 
-static void log_doq_attempt_failure(
+static void log_doq_attempt_failure_impl(
+    const char *caller_func,
     const upstream_server_t *server,
     const char *phase,
     const char *detail_reason,
@@ -106,7 +107,9 @@ static void log_doq_attempt_failure(
     }
 
     const char *reason = doq_normalize_reason(detail_reason);
-    LOGF_WARN(
+    logger_logf(
+        caller_func,
+        "WARN",
         "DoQ %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=%s",
         phase,
         server->host,
@@ -115,6 +118,9 @@ static void log_doq_attempt_failure(
         used_override_v4 ? ip_text : "none",
         detail_reason != NULL ? detail_reason : "none");
 }
+
+#define LOG_DOQ_ATTEMPT_FAILURE(server, phase, detail_reason, used_override_v4, override_addr_v4_be, timeout_ms) \
+    log_doq_attempt_failure_impl(__func__, server, phase, detail_reason, used_override_v4, override_addr_v4_be, timeout_ms)
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -907,7 +913,7 @@ int upstream_doq_ngtcp2_resolve(
                 close(fd);
                 if (result != 0) {
                     primary_reason = "quic_exchange_failed";
-                    log_doq_attempt_failure(
+                    LOG_DOQ_ATTEMPT_FAILURE(
                         server,
                         "stage1 cached IPv4",
                         primary_reason,
@@ -917,7 +923,7 @@ int upstream_doq_ngtcp2_resolve(
                 }
             } else {
                 primary_reason = "udp_connect_failed";
-                log_doq_attempt_failure(
+                LOG_DOQ_ATTEMPT_FAILURE(
                     server,
                     "stage1 cached IPv4",
                     primary_reason,
@@ -937,7 +943,7 @@ int upstream_doq_ngtcp2_resolve(
     struct addrinfo *res = NULL;
     if (result != 0 && (getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL)) {
         primary_reason = "getaddrinfo_failed";
-        log_doq_attempt_failure(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
+        LOG_DOQ_ATTEMPT_FAILURE(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
         free(stream_data);
         return -1;
     }
@@ -978,7 +984,7 @@ int upstream_doq_ngtcp2_resolve(
     }
 
     if (result != 0) {
-        log_doq_attempt_failure(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
+        LOG_DOQ_ATTEMPT_FAILURE(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
     }
 
     if (result != 0 && server->stage.has_bootstrap_v4) {
@@ -1022,7 +1028,7 @@ int upstream_doq_ngtcp2_resolve(
                 if (result == 0) {
                     LOGF_INFO("DoQ stage2 bootstrap IPv4 succeeded: host=%s", server->host);
                 } else {
-                    log_doq_attempt_failure(
+                    LOG_DOQ_ATTEMPT_FAILURE(
                         server,
                         "stage2 bootstrap IPv4",
                         "quic_exchange_failed",
@@ -1031,7 +1037,7 @@ int upstream_doq_ngtcp2_resolve(
                         remaining_ms);
                 }
             } else {
-                log_doq_attempt_failure(
+                LOG_DOQ_ATTEMPT_FAILURE(
                     server,
                     "stage2 bootstrap IPv4",
                     "udp_connect_failed",
