@@ -543,6 +543,12 @@ static void set_defaults(proxy_config_t *config) {
     config->metrics_port = 9090;
     config->upstream_bootstrap_enabled = 1;
     upstream_bootstrap_clear(config);
+    {
+        struct in_addr addr;
+        if (inet_pton(AF_INET, "8.8.8.8", &addr) == 1) {
+            upstream_bootstrap_add_or_update(config, "dns.google", addr.s_addr);
+        }
+    }
     hosts_clear(config);
 }
 

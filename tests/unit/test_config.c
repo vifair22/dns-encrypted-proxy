@@ -42,7 +42,14 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.metrics_enabled, 1);
     assert_int_equal(config.metrics_port, 9090);
     assert_int_equal(config.upstream_bootstrap_enabled, 1);
-    assert_int_equal(config.upstream_bootstrap_a_count, 0);
+    assert_int_equal(config.upstream_bootstrap_a_count, 1);
+    {
+        uint32_t addr = 0;
+        struct in_addr expected;
+        assert_int_equal(config_lookup_upstream_bootstrap_a(&config, "dns.google", &addr), 1);
+        assert_int_equal(inet_pton(AF_INET, "8.8.8.8", &expected), 1);
+        assert_int_equal(addr, expected.s_addr);
+    }
     assert_int_equal(config.hosts_a_override_count, 0);
     assert_int_equal(config.upstream_count, 2);
 #if UPSTREAM_DOH_ENABLED
