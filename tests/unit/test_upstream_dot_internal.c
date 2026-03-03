@@ -366,6 +366,12 @@ int dns_validate_response_for_query(const uint8_t *query, size_t query_len, cons
     return g_dns_validate_rc;
 }
 
+void logger_logf(const char *func, const char *level, const char *fmt, ...) {
+    (void)func;
+    (void)level;
+    (void)fmt;
+}
+
 #define getaddrinfo dot_test_getaddrinfo
 #define freeaddrinfo dot_test_freeaddrinfo
 #define socket dot_test_socket

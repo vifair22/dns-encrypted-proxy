@@ -8,6 +8,12 @@
 
 #include <string.h>
 
+void logger_logf(const char *func, const char *level, const char *fmt, ...) {
+    (void)func;
+    (void)level;
+    (void)fmt;
+}
+
 #undef UPSTREAM_DOQ_ENABLED
 #define UPSTREAM_DOQ_ENABLED 1
 #include "../../src/upstream_doq_ngtcp2.c"

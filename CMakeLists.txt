@@ -114,6 +114,7 @@ set(DNS_ENCRYPTED_PROXY_SOURCES
     src/config.c
     src/cache.c
     src/dns_message.c
+    src/logger.c
     src/iterative_resolver.c
     src/upstream_bootstrap.c
     src/upstream.c

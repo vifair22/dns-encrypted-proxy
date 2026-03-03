@@ -7,6 +7,7 @@
 
 #define UPSTREAM_MAX_SERVERS 8
 #define UPSTREAM_MAX_URL_LEN 512
+#define UPSTREAM_MAX_BOOTSTRAP_RESOLVERS 8
 
 /*
  * Upstream server types
@@ -38,7 +39,12 @@ typedef struct {
     char host[256];                   /* Parsed hostname */
     int port;                         /* Parsed port (853 default for DoT) */
     uint32_t bootstrap_addr_v4_be;    /* Optional IPv4 bootstrap override (network byte order) */
+    uint64_t bootstrap_expires_at_ms;
     int has_bootstrap_v4;
+    uint32_t stage1_cached_addr_v4_be;    /* Cached local-resolver IPv4 for stage1 fast path */
+    uint64_t stage1_cache_expires_at_ms;  /* Monotonic expiry for cached stage1 address */
+    int has_stage1_cached_v4;
+    uint32_t stage1_cached_failures;
     uint64_t iterative_last_attempt_ms;
     upstream_health_t health;
 } upstream_server_t;
@@ -77,7 +83,17 @@ typedef struct {
     
     /* Round-robin state */
     pthread_mutex_t rr_mutex;
+    pthread_mutex_t stage1_cache_mutex;
     uint64_t next_index;
+
+    int bootstrap_resolver_count;
+    char bootstrap_resolvers[UPSTREAM_MAX_BOOTSTRAP_RESOLVERS][64];
+
+    /* Stage1 cache runtime counters */
+    uint64_t stage1_cache_hits;
+    uint64_t stage1_cache_misses;
+    uint64_t stage1_cache_refreshes;
+    uint64_t stage1_cache_invalidations;
 } upstream_client_t;
 
 typedef struct {
@@ -95,6 +111,11 @@ typedef struct {
     int doq_pool_capacity;
     int doq_pool_in_use;
     int doq_connections_alive;
+
+    uint64_t stage1_cache_hits;
+    uint64_t stage1_cache_misses;
+    uint64_t stage1_cache_refreshes;
+    uint64_t stage1_cache_invalidations;
 } upstream_runtime_stats_t;
 
 /*

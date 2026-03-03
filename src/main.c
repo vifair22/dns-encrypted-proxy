@@ -28,6 +28,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    logger_set_level(config.log_level);
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;

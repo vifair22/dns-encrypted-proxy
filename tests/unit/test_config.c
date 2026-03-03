@@ -41,15 +41,10 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.tcp_max_queries_per_conn, 0);
     assert_int_equal(config.metrics_enabled, 1);
     assert_int_equal(config.metrics_port, 9090);
-    assert_int_equal(config.upstream_bootstrap_enabled, 1);
-    assert_int_equal(config.upstream_bootstrap_a_count, 1);
-    {
-        uint32_t addr = 0;
-        struct in_addr expected;
-        assert_int_equal(config_lookup_upstream_bootstrap_a(&config, "dns.google", &addr), 1);
-        assert_int_equal(inet_pton(AF_INET, "8.8.8.8", &expected), 1);
-        assert_int_equal(addr, expected.s_addr);
-    }
+    assert_string_equal(config.log_level, "INFO");
+    assert_int_equal(config.bootstrap_resolver_count, 2);
+    assert_string_equal(config.bootstrap_resolvers[0], "8.8.8.8");
+    assert_string_equal(config.bootstrap_resolvers[1], "1.1.1.1");
     assert_int_equal(config.hosts_a_override_count, 0);
     assert_int_equal(config.upstream_count, 2);
 #if UPSTREAM_DOH_ENABLED
@@ -86,7 +81,8 @@ static void test_config_file_parse(void **state) {
         "tcp_max_clients=512\n"
         "tcp_max_queries_per_conn=100\n"
         "metrics_enabled=0\n"
-        "metrics_port=8080\n";
+        "metrics_port=8080\n"
+        "log_level=DEBUG\n";
     
     char *temp_file = create_temp_file(config_content);
     assert_non_null(temp_file);
@@ -105,6 +101,7 @@ static void test_config_file_parse(void **state) {
     assert_int_equal(config.tcp_max_queries_per_conn, 100);
     assert_int_equal(config.metrics_enabled, 0);
     assert_int_equal(config.metrics_port, 8080);
+    assert_string_equal(config.log_level, "DEBUG");
     assert_int_equal(config.upstream_count, 1);
     assert_string_equal(config.upstream_urls[0], "https://custom.dns/query");
     
@@ -132,6 +129,7 @@ static void test_config_env_override(void **state) {
     setenv("LISTEN_ADDR", "10.0.0.1", 1);
     setenv("LISTEN_PORT", "8053", 1);
     setenv("CACHE_CAPACITY", "4096", 1);
+    setenv("LOG_LEVEL", "ERROR", 1);
     
     proxy_config_t config;
     int result = config_load(&config, temp_file);
@@ -141,6 +139,7 @@ static void test_config_env_override(void **state) {
     assert_string_equal(config.listen_addr, "10.0.0.1");
     assert_int_equal(config.listen_port, 8053);
     assert_int_equal(config.cache_capacity, 4096);
+    assert_string_equal(config.log_level, "ERROR");
     
     remove_temp_file(temp_file);
     clear_config_env_vars();
@@ -325,6 +324,7 @@ static void test_config_all_env_overrides_and_empty_tokens(void **state) {
     setenv("TCP_MAX_QUERIES_PER_CONN", "7", 1);
     setenv("METRICS_PORT", "9191", 1);
     setenv("METRICS_ENABLED", "0", 1);
+    setenv("LOG_LEVEL", "WARN", 1);
 
     proxy_config_t config;
     int result = config_load(&config, "/nonexistent/path/config.conf");
@@ -343,6 +343,7 @@ static void test_config_all_env_overrides_and_empty_tokens(void **state) {
     assert_int_equal(config.tcp_max_queries_per_conn, 7);
     assert_int_equal(config.metrics_port, 9191);
     assert_int_equal(config.metrics_enabled, 0);
+    assert_string_equal(config.log_level, "WARN");
 
     clear_config_env_vars();
 }
@@ -499,37 +500,27 @@ static void test_config_hosts_a_duplicate_and_capacity(void **state) {
     clear_config_env_vars();
 }
 
-static void test_config_upstream_bootstrap_parse_lookup_and_disable(void **state) {
+static void test_config_bootstrap_resolvers_parse_and_override(void **state) {
     (void)state;
 
     clear_config_env_vars();
 
     const char *config_content =
-        "upstream_bootstrap_enabled=1\n"
-        "upstream_bootstrap_a=cloudflare-dns.com=1.1.1.1,dns.google=8.8.8.8\n";
+        "bootstrap_resolvers=9.9.9.9,1.0.0.1\n";
 
     char *temp_file = create_temp_file(config_content);
     assert_non_null(temp_file);
 
     proxy_config_t config;
     assert_int_equal(config_load(&config, temp_file), 0);
-    assert_int_equal(config.upstream_bootstrap_enabled, 1);
-    assert_int_equal(config.upstream_bootstrap_a_count, 2);
+    assert_int_equal(config.bootstrap_resolver_count, 2);
+    assert_string_equal(config.bootstrap_resolvers[0], "9.9.9.9");
+    assert_string_equal(config.bootstrap_resolvers[1], "1.0.0.1");
 
-    uint32_t addr = 0;
-    struct in_addr expected;
-    assert_int_equal(config_lookup_upstream_bootstrap_a(&config, "CLOUDFLARE-DNS.COM", &addr), 1);
-    assert_int_equal(inet_pton(AF_INET, "1.1.1.1", &expected), 1);
-    assert_int_equal(addr, expected.s_addr);
-
-    setenv("UPSTREAM_BOOTSTRAP_ENABLED", "0", 1);
-    setenv("UPSTREAM_BOOTSTRAP_A", "dns.google=9.9.9.9", 1);
+    setenv("BOOTSTRAP_RESOLVERS", "8.8.4.4", 1);
     assert_int_equal(config_load(&config, temp_file), 0);
-    assert_int_equal(config.upstream_bootstrap_enabled, 0);
-    assert_int_equal(config.upstream_bootstrap_a_count, 1);
-    assert_int_equal(config_lookup_upstream_bootstrap_a(&config, "dns.google", &addr), 1);
-    assert_int_equal(inet_pton(AF_INET, "9.9.9.9", &expected), 1);
-    assert_int_equal(addr, expected.s_addr);
+    assert_int_equal(config.bootstrap_resolver_count, 1);
+    assert_string_equal(config.bootstrap_resolvers[0], "8.8.4.4");
 
     remove_temp_file(temp_file);
     clear_config_env_vars();
@@ -552,7 +543,7 @@ int main(void) {
         cmocka_unit_test(test_config_validation_failures_from_env),
         cmocka_unit_test(test_config_hosts_a_parse_and_lookup),
         cmocka_unit_test(test_config_hosts_a_duplicate_and_capacity),
-        cmocka_unit_test(test_config_upstream_bootstrap_parse_lookup_and_disable),
+        cmocka_unit_test(test_config_bootstrap_resolvers_parse_and_override),
     };
     
     return cmocka_run_group_tests(tests, NULL, NULL);

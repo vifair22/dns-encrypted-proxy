@@ -12,6 +12,7 @@
 #include <pthread.h>
 
 #include "upstream.h"
+#include "upstream_bootstrap.h"
 
 static int g_mutex_init_fail = 0;
 static uint64_t g_now_ms = 0;
@@ -251,6 +252,35 @@ int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms) {
     (void)server;
     (void)timeout_ms;
     return -1;
+}
+
+int upstream_bootstrap_try_stage2(upstream_client_t *client, upstream_server_t *server, int timeout_ms) {
+    (void)client;
+    (void)server;
+    (void)timeout_ms;
+    return -1;
+}
+
+int upstream_bootstrap_stage1_hydrate(upstream_client_t *client, upstream_server_t *server, int timeout_ms) {
+    (void)client;
+    (void)server;
+    (void)timeout_ms;
+    return -1;
+}
+
+upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server_t *server) {
+    (void)server;
+    return UPSTREAM_STAGE1_CACHE_MISS;
+}
+
+void upstream_bootstrap_stage1_invalidate(upstream_server_t *server) {
+    (void)server;
+}
+
+void logger_logf(const char *func, const char *level, const char *fmt, ...) {
+    (void)func;
+    (void)level;
+    (void)fmt;
 }
 
 #define pthread_mutex_init upstream_wrap_pthread_mutex_init

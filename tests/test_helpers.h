@@ -62,9 +62,9 @@ static inline void clear_config_env_vars(void) {
     unsetenv("TCP_MAX_QUERIES_PER_CONN");
     unsetenv("METRICS_PORT");
     unsetenv("METRICS_ENABLED");
+    unsetenv("LOG_LEVEL");
     unsetenv("HOSTS_A");
-    unsetenv("UPSTREAM_BOOTSTRAP_ENABLED");
-    unsetenv("UPSTREAM_BOOTSTRAP_A");
+    unsetenv("BOOTSTRAP_RESOLVERS");
     unsetenv("DNS_ENCRYPTED_PROXY_CONFIG");
 }
 

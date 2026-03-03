@@ -401,19 +401,9 @@ int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *ho
     return 0;
 }
 
-int upstream_bootstrap_apply_from_config(
-    upstream_client_t *client,
-    const proxy_config_t *config,
-    int *applied_out,
-    int *unmatched_out) {
+int upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t *config) {
     (void)client;
     (void)config;
-    if (applied_out != NULL) {
-        *applied_out = 0;
-    }
-    if (unmatched_out != NULL) {
-        *unmatched_out = 0;
-    }
     return 0;
 }
 
@@ -445,6 +435,12 @@ void metrics_init(proxy_metrics_t *m) {
     if (m != NULL) {
         memset(m, 0, sizeof(*m));
     }
+}
+
+void logger_logf(const char *func, const char *level, const char *fmt, ...) {
+    (void)func;
+    (void)level;
+    (void)fmt;
 }
 
 int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32_t *addr_v4_be_out) {

@@ -816,6 +816,47 @@ int upstream_doq_ngtcp2_resolve(
         return -1;
     }
 
+    int result = -1;
+    int total_timeout_ms = timeout_ms > 0 ? timeout_ms : 1000;
+    uint64_t overall_deadline = now_ns() + (uint64_t)total_timeout_ms * 1000000ULL;
+
+    if (server->has_stage1_cached_v4) {
+        uint64_t now = now_ns();
+        if (now < overall_deadline) {
+            int remaining_ms = (int)((overall_deadline - now) / 1000000ULL);
+            if (remaining_ms <= 0) {
+                remaining_ms = 1;
+            }
+
+            struct sockaddr_in cached;
+            memset(&cached, 0, sizeof(cached));
+            cached.sin_family = AF_INET;
+            cached.sin_port = htons((uint16_t)server->port);
+            cached.sin_addr.s_addr = server->stage1_cached_addr_v4_be;
+
+            struct addrinfo ai;
+            memset(&ai, 0, sizeof(ai));
+            ai.ai_family = AF_INET;
+            ai.ai_socktype = SOCK_DGRAM;
+            ai.ai_protocol = IPPROTO_UDP;
+            ai.ai_addr = (struct sockaddr *)&cached;
+            ai.ai_addrlen = sizeof(cached);
+
+            int fd = connect_udp_with_timeout(&ai, remaining_ms);
+            if (fd >= 0) {
+                result = doq_ngtcp2_exchange_on_fd(
+                    fd,
+                    server,
+                    remaining_ms,
+                    stream_data,
+                    stream_data_len,
+                    response_out,
+                    response_len_out);
+                close(fd);
+            }
+        }
+    }
+
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -823,15 +864,15 @@ int upstream_doq_ngtcp2_resolve(
     hints.ai_protocol = IPPROTO_UDP;
 
     struct addrinfo *res = NULL;
-    if (getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL) {
+    if (result != 0 && (getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL)) {
         free(stream_data);
         return -1;
     }
 
-    int result = -1;
-    int total_timeout_ms = timeout_ms > 0 ? timeout_ms : 1000;
-    uint64_t overall_deadline = now_ns() + (uint64_t)total_timeout_ms * 1000000ULL;
     for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        if (result == 0) {
+            break;
+        }
         uint64_t now = now_ns();
         if (now >= overall_deadline) {
             break;
@@ -908,7 +949,9 @@ int upstream_doq_ngtcp2_resolve(
         }
     }
 
-    freeaddrinfo(res);
+    if (res != NULL) {
+        freeaddrinfo(res);
+    }
     free(stream_data);
     return result;
 }

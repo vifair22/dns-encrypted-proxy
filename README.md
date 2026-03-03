@@ -106,21 +106,23 @@ Main config keys:
 - `listen_addr`, `listen_port`
 - `upstreams` (comma-separated `https://...`, `tls://host[:port]`, and/or `quic://host[:port]`)
 - `upstream_timeout_ms`, `upstream_pool_size`
-- `upstream_bootstrap_enabled`, `upstream_bootstrap_a` (optional hostname->IPv4 bootstrap map for upstream dialing fallback)
+- `bootstrap_resolvers` (comma-separated IPv4 recursive resolvers used for stage2 bootstrap)
 - `cache_capacity`
 - `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`
 - `metrics_enabled`, `metrics_port`
+- `log_level` (`DEBUG`, `INFO`, `WARN`, `ERROR`)
 
 Environment override support includes:
 
 - `DNS_ENCRYPTED_PROXY_CONFIG`, `LISTEN_ADDR`, `LISTEN_PORT`
 - `UPSTREAMS`, `UPSTREAM_TIMEOUT_MS`, `UPSTREAM_POOL_SIZE`
-- `UPSTREAM_BOOTSTRAP_ENABLED`, `UPSTREAM_BOOTSTRAP_A`
+- `BOOTSTRAP_RESOLVERS`
 - `CACHE_CAPACITY`
 - `HOSTS_A`
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
 - `METRICS_ENABLED`, `METRICS_PORT`
+- `LOG_LEVEL`
 
 `hosts_a` behavior:
 
@@ -128,10 +130,11 @@ Environment override support includes:
 - Returns a local synthesized DNS answer with fixed TTL `60`.
 - Intended as a fast hosts-style override path for internal names.
 
-`upstream_bootstrap_a` behavior:
+`bootstrap_resolvers` behavior:
 
-- Upstream dial flow is local resolver first; if that fails, configured bootstrap IPv4 is attempted.
-- Set `upstream_bootstrap_enabled=0` to disable step 2; resolver still attempts iterative stage-3 bootstrap.
+- Stage1 uses local resolver first.
+- If stage1 cannot establish a working upstream path, stage2 queries these recursive resolvers for upstream host A records (with TTL).
+- Stage3 iterative bootstrap resolver is used only if stage2 fails.
 
 ## Metrics
 

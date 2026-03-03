@@ -368,11 +368,21 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h3\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h2\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h1\"} %llu\n"
-            "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n",
+            "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n"
+            "# HELP dns_encrypted_proxy_upstream_stage1_cache_total Upstream stage1 resolver cache counters.\n"
+            "# TYPE dns_encrypted_proxy_upstream_stage1_cache_total counter\n"
+            "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"hit\"} %llu\n"
+            "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"miss\"} %llu\n"
+            "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"refresh\"} %llu\n"
+            "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"invalidate\"} %llu\n",
             (unsigned long long)runtime_stats.doh_http3_responses_total,
             (unsigned long long)runtime_stats.doh_http2_responses_total,
             (unsigned long long)runtime_stats.doh_http1_responses_total,
-            (unsigned long long)runtime_stats.doh_http_other_responses_total) != 0) {
+            (unsigned long long)runtime_stats.doh_http_other_responses_total,
+            (unsigned long long)runtime_stats.stage1_cache_hits,
+            (unsigned long long)runtime_stats.stage1_cache_misses,
+            (unsigned long long)runtime_stats.stage1_cache_refreshes,
+            (unsigned long long)runtime_stats.stage1_cache_invalidations) != 0) {
         return -1;
     }
 

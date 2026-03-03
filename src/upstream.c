@@ -88,6 +88,10 @@ static const char *upstream_type_name(upstream_type_t type) {
     }
 }
 
+static void client_counter_inc(uint64_t *counter) {
+    __atomic_fetch_add(counter, 1ULL, __ATOMIC_RELAXED);
+}
+
 #if UPSTREAM_DOT_ENABLED || UPSTREAM_DOQ_ENABLED
 static int parse_port_strict(const char *port_text, int *port_out) {
     if (port_text == NULL || port_out == NULL || *port_text == '\0') {
@@ -300,6 +304,7 @@ void upstream_server_record_success(upstream_server_t *server) {
     
     server->health.healthy = 1;
     server->health.consecutive_failures = 0;
+    server->stage1_cached_failures = 0;
     server->health.last_success_time = now_ms();
     server->health.total_queries++;
 
@@ -384,6 +389,11 @@ int upstream_client_init(
     if (pthread_mutex_init(&client->rr_mutex, NULL) != 0) {
         return -1;
     }
+
+    if (pthread_mutex_init(&client->stage1_cache_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&client->rr_mutex);
+        return -1;
+    }
     
     /*
      * Lazily initialize DoH/DoT/DoQ clients so startup remains lightweight when a
@@ -421,6 +431,7 @@ void upstream_client_destroy(upstream_client_t *client) {
 #endif
     
     pthread_mutex_destroy(&client->rr_mutex);
+    pthread_mutex_destroy(&client->stage1_cache_mutex);
     memset(client, 0, sizeof(*client));
 }
 
@@ -559,10 +570,33 @@ int upstream_resolve(
         uint8_t *response = NULL;
         size_t response_len = 0;
 
+        pthread_mutex_lock(&client->stage1_cache_mutex);
+        upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(server);
+        pthread_mutex_unlock(&client->stage1_cache_mutex);
+        if (stage1_cache == UPSTREAM_STAGE1_CACHE_HIT) {
+            client_counter_inc(&client->stage1_cache_hits);
+        } else if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
+            client_counter_inc(&client->stage1_cache_refreshes);
+        } else {
+            client_counter_inc(&client->stage1_cache_misses);
+        }
+
         /* Stage 1 first on purpose: local DNS tracks provider IP changes. */
-        LOGF_INFO("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
+        LOGF_DEBUG("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
         
         if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+            if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
+                int hydrate_timeout_ms = client->config.timeout_ms / 4;
+                if (hydrate_timeout_ms < 100) {
+                    hydrate_timeout_ms = 100;
+                }
+                if (hydrate_timeout_ms > 500) {
+                    hydrate_timeout_ms = 500;
+                }
+                if (upstream_bootstrap_stage1_hydrate(client, server, hydrate_timeout_ms) == 0) {
+                    LOGF_DEBUG("Stage1 cache hydrated with DNS TTL: host=%s", server->host);
+                }
+            }
             upstream_server_record_success(server);
             *response_out = response;
             *response_len_out = response_len;
@@ -572,12 +606,31 @@ int upstream_resolve(
         /* Keep this per-attempt so failover behavior is visible in prod logs. */
         LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
 
-        if (client->config.iterative_bootstrap_enabled) {
-            if (server->has_bootstrap_v4) {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 bootstrap failure", server->host);
-            } else {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s stage2 bootstrap unavailable/disabled", server->host);
+        pthread_mutex_lock(&client->stage1_cache_mutex);
+        if (server->has_stage1_cached_v4) {
+            server->stage1_cached_failures++;
+            if (server->stage1_cached_failures >= 2) {
+                upstream_bootstrap_stage1_invalidate(server);
+                client_counter_inc(&client->stage1_cache_invalidations);
             }
+        }
+        pthread_mutex_unlock(&client->stage1_cache_mutex);
+
+        LOGF_WARN("Upstream fallback stage2 recursive bootstrap: host=%s", server->host);
+        if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms) == 0) {
+            if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+                upstream_server_record_success(server);
+                *response_out = response;
+                *response_len_out = response_len;
+                return 0;
+            }
+            LOGF_WARN("Upstream stage2 bootstrap retry failed: host=%s", server->host);
+        } else {
+            LOGF_WARN("Upstream stage2 recursive bootstrap failed: host=%s", server->host);
+        }
+
+        if (client->config.iterative_bootstrap_enabled) {
+            LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 failure", server->host);
 
             if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms) == 0) {
                 LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
@@ -612,14 +665,37 @@ int upstream_resolve(
         uint8_t *response = NULL;
         size_t response_len = 0;
 
+        pthread_mutex_lock(&client->stage1_cache_mutex);
+        upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(server);
+        pthread_mutex_unlock(&client->stage1_cache_mutex);
+        if (stage1_cache == UPSTREAM_STAGE1_CACHE_HIT) {
+            client_counter_inc(&client->stage1_cache_hits);
+        } else if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
+            client_counter_inc(&client->stage1_cache_refreshes);
+        } else {
+            client_counter_inc(&client->stage1_cache_misses);
+        }
+
         /*
          * Pass 2 is a bounded "last chance" probe for currently unhealthy
          * entries. This avoids permanent brownout after stale health state while
          * keeping normal success path in pass 1 fast.
          */
-        LOGF_INFO("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
+        LOGF_DEBUG("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
         
         if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+            if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
+                int hydrate_timeout_ms = client->config.timeout_ms / 4;
+                if (hydrate_timeout_ms < 100) {
+                    hydrate_timeout_ms = 100;
+                }
+                if (hydrate_timeout_ms > 500) {
+                    hydrate_timeout_ms = 500;
+                }
+                if (upstream_bootstrap_stage1_hydrate(client, server, hydrate_timeout_ms) == 0) {
+                    LOGF_DEBUG("Stage1 cache hydrated with DNS TTL: host=%s", server->host);
+                }
+            }
             upstream_server_record_success(server);
             *response_out = response;
             *response_len_out = response_len;
@@ -628,12 +704,31 @@ int upstream_resolve(
 
         LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
 
-        if (client->config.iterative_bootstrap_enabled) {
-            if (server->has_bootstrap_v4) {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 bootstrap failure", server->host);
-            } else {
-                LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s stage2 bootstrap unavailable/disabled", server->host);
+        pthread_mutex_lock(&client->stage1_cache_mutex);
+        if (server->has_stage1_cached_v4) {
+            server->stage1_cached_failures++;
+            if (server->stage1_cached_failures >= 2) {
+                upstream_bootstrap_stage1_invalidate(server);
+                client_counter_inc(&client->stage1_cache_invalidations);
             }
+        }
+        pthread_mutex_unlock(&client->stage1_cache_mutex);
+
+        LOGF_WARN("Upstream fallback stage2 recursive bootstrap: host=%s", server->host);
+        if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms) == 0) {
+            if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+                upstream_server_record_success(server);
+                *response_out = response;
+                *response_len_out = response_len;
+                return 0;
+            }
+            LOGF_WARN("Upstream stage2 bootstrap retry failed: host=%s", server->host);
+        } else {
+            LOGF_WARN("Upstream stage2 recursive bootstrap failed: host=%s", server->host);
+        }
+
+        if (client->config.iterative_bootstrap_enabled) {
+            LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 failure", server->host);
 
             if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms) == 0) {
                 LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
@@ -682,6 +777,11 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
     if (client == NULL) {
         return -1;
     }
+
+    stats_out->stage1_cache_hits = __atomic_load_n(&client->stage1_cache_hits, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_misses = __atomic_load_n(&client->stage1_cache_misses, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_refreshes = __atomic_load_n(&client->stage1_cache_refreshes, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_invalidations = __atomic_load_n(&client->stage1_cache_invalidations, __ATOMIC_RELAXED);
 
 #if UPSTREAM_DOH_ENABLED
     if (client->doh_client != NULL) {

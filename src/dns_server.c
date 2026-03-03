@@ -1053,26 +1053,13 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
         return -1;
     }
 
-    int bootstrap_applied = 0;
-    int bootstrap_unmatched = 0;
-    (void)upstream_bootstrap_apply_from_config(
-        &server->upstream,
-        config,
-        &bootstrap_applied,
-        &bootstrap_unmatched);
+    (void)upstream_bootstrap_configure(&server->upstream, config);
 
     LOGF_INFO("Upstream fallback configuration:");
     LOGF_INFO(
-        "  stage2 bootstrap IPv4: enabled=%d entries=%d applied=%d unmatched=%d",
-        config->upstream_bootstrap_enabled,
-        config->upstream_bootstrap_a_count,
-        bootstrap_applied,
-        bootstrap_unmatched);
+        "  stage2 bootstrap resolvers: count=%d",
+        config->bootstrap_resolver_count);
     LOGF_INFO("  stage3 iterative resolver: enabled=%d", upstream_cfg.iterative_bootstrap_enabled);
-
-    if (config->upstream_bootstrap_enabled && bootstrap_unmatched > 0) {
-        LOGF_WARN("Some upstream bootstrap entries did not match configured upstream hosts");
-    }
     
     /* Initialize metrics */
     metrics_init(&server->metrics);

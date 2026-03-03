@@ -458,7 +458,27 @@ int upstream_dot_resolve(
     }
     
     if (need_connect) {
-        if (establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0) != 0) {
+        int connected = 0;
+        int stage2_used = 0;
+
+        if (server->has_stage1_cached_v4 &&
+            establish_tls_connection(
+                client,
+                conn,
+                server->host,
+                server->port,
+                timeout_ms,
+                1,
+                server->stage1_cached_addr_v4_be)
+                == 0) {
+            connected = 1;
+        }
+
+        if (!connected && establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0) == 0) {
+            connected = 1;
+        }
+
+        if (!connected) {
             /*
              * Stage-2 fallback: connect socket to pinned IPv4 only for dial,
              * but keep TLS hostname checks against server->host for security.
@@ -473,13 +493,19 @@ int upstream_dot_resolve(
                     timeout_ms,
                     1,
                     server->bootstrap_addr_v4_be)
-                    != 0) {
+                    == 0) {
+                connected = 1;
+                stage2_used = 1;
+            } else {
                 if (server->has_bootstrap_v4) {
                     LOGF_WARN("DoT stage2 bootstrap IPv4 failed: host=%s", server->host);
                 }
                 pool_release(client, slot);
                 return -1;
             }
+        }
+
+        if (stage2_used) {
             LOGF_INFO("DoT stage2 bootstrap IPv4 succeeded: host=%s", server->host);
         }
     }

@@ -177,7 +177,8 @@ static int doh_post_with_handle(
     upstream_doh_client_t *client,
     CURL *curl,
     const upstream_server_t *server,
-    int use_bootstrap_v4,
+    int use_override_v4,
+    uint32_t override_addr_v4_be,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,
@@ -226,9 +227,9 @@ static int doh_post_with_handle(
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "dns-encrypted-proxy/0.2");
 
     struct curl_slist *resolve = NULL;
-    if (use_bootstrap_v4 && server->has_bootstrap_v4) {
+    if (use_override_v4) {
         struct in_addr addr;
-        addr.s_addr = server->bootstrap_addr_v4_be;
+        addr.s_addr = override_addr_v4_be;
         char ip_text[INET_ADDRSTRLEN];
         if (inet_ntop(AF_INET, &addr, ip_text, sizeof(ip_text)) != NULL) {
             char resolve_entry[320];
@@ -398,9 +399,24 @@ int upstream_doh_resolve(
         curl,
         server,
         0,
+        0,
         timeout_ms,
         query, query_len,
         &response, &response_len);
+
+    if (result != 0 && server->has_stage1_cached_v4) {
+        result = doh_post_with_handle(
+            client,
+            curl,
+            server,
+            1,
+            server->stage1_cached_addr_v4_be,
+            timeout_ms,
+            query,
+            query_len,
+            &response,
+            &response_len);
+    }
 
     if (result != 0 && server->has_bootstrap_v4) {
         /*
@@ -416,6 +432,7 @@ int upstream_doh_resolve(
             curl,
             server,
             1,
+            server->bootstrap_addr_v4_be,
             timeout_ms,
             query,
             query_len,
