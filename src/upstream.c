@@ -474,6 +474,7 @@ static int resolve_with_server(
     size_t *response_len_out) {
     
     int result = -1;
+    server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
     
     /* Central protocol dispatch keeps upstream selection policy transport-agnostic. */
     switch (server->type) {
@@ -782,11 +783,19 @@ static int consume_retry_budget(int *budget, const upstream_server_t *server, co
 
 static int should_try_stage2_after_stage1_failure(const upstream_server_t *server) {
     uint64_t now = now_ms();
+    if (server->stage.transport_retry_suppress_until_ms != 0 && now < server->stage.transport_retry_suppress_until_ms) {
+        return 0;
+    }
     if (!server->stage.has_bootstrap_v4) {
         return 1;
     }
     if (server->stage.bootstrap_expires_at_ms <= now) {
         return 1;
+    }
+    if (server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_TRANSPORT ||
+        server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_TIMEOUT ||
+        server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_TLS) {
+        return 0;
     }
     return 0;
 }
@@ -794,6 +803,24 @@ static int should_try_stage2_after_stage1_failure(const upstream_server_t *serve
 static int should_try_stage3_after_stage2_failure(const char *stage2_reason) {
     upstream_reason_class_t reason_class = classify_stage_reason(stage2_reason);
     return reason_class == UPSTREAM_REASON_CLASS_DNS || reason_class == UPSTREAM_REASON_CLASS_NETWORK;
+}
+
+static const char *failure_class_name(int cls) {
+    switch ((upstream_failure_class_t)cls) {
+        case UPSTREAM_FAILURE_CLASS_DNS:
+            return "dns";
+        case UPSTREAM_FAILURE_CLASS_NETWORK:
+            return "network";
+        case UPSTREAM_FAILURE_CLASS_TRANSPORT:
+            return "transport";
+        case UPSTREAM_FAILURE_CLASS_TIMEOUT:
+            return "timeout";
+        case UPSTREAM_FAILURE_CLASS_TLS:
+            return "tls";
+        case UPSTREAM_FAILURE_CLASS_UNKNOWN:
+        default:
+            return "unknown";
+    }
 }
 
 static int resolve_server_with_fallback(
@@ -834,13 +861,18 @@ static int resolve_server_with_fallback(
     note_stage1_failure(client, server);
 
     if (!should_try_stage2_after_stage1_failure(server)) {
+        uint64_t now = now_ms();
+        uint64_t suppress_remaining_ms =
+            server->stage.transport_retry_suppress_until_ms > now
+                ? (server->stage.transport_retry_suppress_until_ms - now)
+                : 0;
         LOG_STAGE_EVENT(
             server,
             2,
             "stage2",
             "skipped",
             "transport_path_presumed",
-            "bootstrap_fresh",
+            suppress_remaining_ms > 0 ? "transport_suppress_active" : failure_class_name(server->stage.last_failure_class),
             client->config.timeout_ms);
         upstream_server_record_failure(server, &client->config);
         return -1;

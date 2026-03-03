@@ -27,6 +27,10 @@ static int g_stage2_rc = -1;
 static int g_stage3_rc = -1;
 static const char *g_stage2_reason = "stub_stage2_failed";
 static const char *g_stage3_reason = "stub_stage3_failed";
+static int g_stage2_calls = 0;
+static int g_stage3_calls = 0;
+static int g_doh_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+static uint64_t g_doh_transport_suppress_ms = 0;
 static uint8_t g_resp_buf[16];
 static size_t g_resp_len = 0;
 static int g_doh_destroy_calls = 0;
@@ -57,6 +61,10 @@ static void reset_stubs(void) {
     g_stage3_rc = -1;
     g_stage2_reason = "stub_stage2_failed";
     g_stage3_reason = "stub_stage3_failed";
+    g_stage2_calls = 0;
+    g_stage3_calls = 0;
+    g_doh_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    g_doh_transport_suppress_ms = 0;
     g_resp_len = 0;
     g_doh_destroy_calls = 0;
     g_dot_destroy_calls = 0;
@@ -124,6 +132,11 @@ int upstream_doh_resolve(
     (void)query;
     (void)query_len;
     if (g_doh_resolve_rc != 0 || g_resp_len == 0) {
+        upstream_server_t *mutable_server = (upstream_server_t *)server;
+        mutable_server->stage.last_failure_class = g_doh_failure_class;
+        if (g_doh_transport_suppress_ms > 0) {
+            mutable_server->stage.transport_retry_suppress_until_ms = g_now_ms + g_doh_transport_suppress_ms;
+        }
         return -1;
     }
     *response_out = malloc(g_resp_len);
@@ -259,6 +272,7 @@ int iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_
 int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms, const char **reason_out) {
     (void)server;
     (void)timeout_ms;
+    g_stage3_calls++;
     if (reason_out != NULL) {
         *reason_out = g_stage3_reason;
     }
@@ -269,6 +283,7 @@ int upstream_bootstrap_try_stage2(upstream_client_t *client, upstream_server_t *
     (void)client;
     (void)server;
     (void)timeout_ms;
+    g_stage2_calls++;
     if (reason_out != NULL) {
         *reason_out = g_stage2_reason;
     }
@@ -609,6 +624,47 @@ static void test_upstream_stage_metrics_matrix(void **state) {
     }
 }
 
+static void test_upstream_transport_timeout_skips_stage_traversal(void **state) {
+    (void)state;
+    reset_stubs();
+
+    g_doh_resolve_rc = -1;
+    g_doh_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+    g_doh_transport_suppress_ms = 5000;
+    g_now_ms = 1000;
+
+    upstream_config_t cfg = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 10,
+        .unhealthy_backoff_ms = 1000,
+        .iterative_bootstrap_enabled = 1,
+    };
+    const char *urls[] = {PRIMARY_TEST_URL};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    client.servers[0].stage.has_bootstrap_v4 = 1;
+    client.servers[0].stage.bootstrap_addr_v4_be = 0x01010101u;
+    client.servers[0].stage.bootstrap_expires_at_ms = g_now_ms + 60000;
+
+    uint8_t q[] = {0x12, 0x34};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, &out_len), -1);
+    free(out);
+
+    assert_int_equal(g_stage2_calls, 0);
+    assert_int_equal(g_stage3_calls, 0);
+
+    upstream_runtime_stats_t stats;
+    assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+    assert_int_equal(stats.stage2_attempts, 0);
+    assert_int_equal(stats.stage3_attempts, 0);
+
+    upstream_client_destroy(&client);
+}
+
 static void test_upstream_guard_and_limit_edges(void **state) {
     (void)state;
     reset_stubs();
@@ -660,6 +716,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_internal_init_and_switch_edges),
         cmocka_unit_test(test_upstream_parse_and_stats_edges),
         cmocka_unit_test(test_upstream_stage_metrics_matrix),
+        cmocka_unit_test(test_upstream_transport_timeout_skips_stage_traversal),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
     };
 

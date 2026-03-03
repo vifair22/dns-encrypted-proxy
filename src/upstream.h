@@ -30,6 +30,15 @@ typedef struct {
     uint64_t total_failures;        /* Total failures for this server */
 } upstream_health_t;
 
+typedef enum {
+    UPSTREAM_FAILURE_CLASS_UNKNOWN = 0,
+    UPSTREAM_FAILURE_CLASS_DNS = 1,
+    UPSTREAM_FAILURE_CLASS_NETWORK = 2,
+    UPSTREAM_FAILURE_CLASS_TRANSPORT = 3,
+    UPSTREAM_FAILURE_CLASS_TIMEOUT = 4,
+    UPSTREAM_FAILURE_CLASS_TLS = 5,
+} upstream_failure_class_t;
+
 typedef struct {
     uint32_t bootstrap_addr_v4_be;
     uint64_t bootstrap_expires_at_ms;
@@ -43,6 +52,9 @@ typedef struct {
     uint32_t stage1_cached_failures;
 
     uint64_t iterative_last_attempt_ms;
+
+    int last_failure_class;
+    uint64_t transport_retry_suppress_until_ms;
 } upstream_stage_state_t;
 
 typedef struct {

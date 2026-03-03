@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "upstream.h"
 #include "dns_message.h"
 #include "logger.h"
@@ -10,6 +12,16 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
+
+#define DOH_MIN_ATTEMPT_TIMEOUT_MS 200
+#define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
 
 /*
  * DoH client implementation
@@ -93,6 +105,55 @@ static const char *doh_failure_reason(CURLcode rc, long http_status, size_t resp
         return "empty_response";
     }
     return "unknown";
+}
+
+static upstream_failure_class_t doh_failure_class(CURLcode rc, long http_status, size_t response_len) {
+    const char *reason = doh_failure_reason(rc, http_status, response_len);
+    if (strcmp(reason, "timeout") == 0) {
+        return UPSTREAM_FAILURE_CLASS_TIMEOUT;
+    }
+    if (strcmp(reason, "dns_resolve_failed") == 0) {
+        return UPSTREAM_FAILURE_CLASS_DNS;
+    }
+    if (strcmp(reason, "tls_handshake_failed") == 0) {
+        return UPSTREAM_FAILURE_CLASS_TLS;
+    }
+    if (strcmp(reason, "transport_connect_failed") == 0 ||
+        strcmp(reason, "transport_io_failed") == 0 ||
+        strcmp(reason, "transport_failed") == 0 ||
+        strcmp(reason, "upstream_http_status") == 0 ||
+        strcmp(reason, "empty_response") == 0) {
+        return UPSTREAM_FAILURE_CLASS_TRANSPORT;
+    }
+    return UPSTREAM_FAILURE_CLASS_UNKNOWN;
+}
+
+static int failure_class_is_transport_like(upstream_failure_class_t cls) {
+    return cls == UPSTREAM_FAILURE_CLASS_TRANSPORT ||
+           cls == UPSTREAM_FAILURE_CLASS_TIMEOUT ||
+           cls == UPSTREAM_FAILURE_CLASS_TLS;
+}
+
+static int next_attempt_timeout_ms(uint64_t deadline_ms, int attempts_left) {
+    if (attempts_left <= 0) {
+        return -1;
+    }
+    uint64_t now = now_ms();
+    if (now >= deadline_ms) {
+        return -1;
+    }
+    uint64_t remaining = deadline_ms - now;
+    int t = (int)(remaining / (uint64_t)attempts_left);
+    if (t < DOH_MIN_ATTEMPT_TIMEOUT_MS && remaining >= DOH_MIN_ATTEMPT_TIMEOUT_MS) {
+        t = DOH_MIN_ATTEMPT_TIMEOUT_MS;
+    }
+    if ((uint64_t)t > remaining) {
+        t = (int)remaining;
+    }
+    if (t <= 0) {
+        t = 1;
+    }
+    return t;
 }
 
 static void log_doh_attempt_failure_impl(
@@ -504,7 +565,10 @@ int upstream_doh_resolve(
     
     *response_out = NULL;
     *response_len_out = 0;
-    
+
+    upstream_server_t *mutable_server = (upstream_server_t *)server;
+    mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+
     CURL *curl = NULL;
     int slot = -1;
     if (pool_acquire(client, &curl, &slot) != 0) {
@@ -514,37 +578,83 @@ int upstream_doh_resolve(
     uint8_t *response = NULL;
     size_t response_len = 0;
     doh_attempt_error_t attempt_err;
-    
+
+    int attempts_left = 1;
+    if (server->stage.has_stage1_cached_v4) {
+        attempts_left++;
+    }
+    if (server->stage.has_bootstrap_v4) {
+        attempts_left++;
+    }
+    int total_budget_ms = timeout_ms > 0 ? timeout_ms : 1000;
+    uint64_t deadline_ms = now_ms() + (uint64_t)total_budget_ms;
+    upstream_failure_class_t primary_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+
+    int attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left);
+    if (attempt_timeout_ms < 0) {
+        pool_release(client, slot);
+        mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+        return -1;
+    }
     int result = doh_post_with_handle(
         client,
         curl,
         server,
         0,
         0,
-        timeout_ms,
+        attempt_timeout_ms,
         query, query_len,
         &response, &response_len,
         &attempt_err);
+    attempts_left--;
 
     if (result != 0) {
         LOG_DOH_ATTEMPT_FAILURE("primary request", server, &attempt_err);
+        primary_failure_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
+        mutable_server->stage.last_failure_class = (int)primary_failure_class;
+
+        uint64_t now = now_ms();
+        if (failure_class_is_transport_like(primary_failure_class)) {
+            mutable_server->stage.transport_retry_suppress_until_ms = now + DOH_TRANSPORT_SUPPRESS_MS;
+        }
+
+        if (failure_class_is_transport_like(primary_failure_class) &&
+            server->stage.has_bootstrap_v4 &&
+            server->stage.bootstrap_expires_at_ms > now) {
+            LOGF_WARN(
+                "DoH retry chain skipped after primary transport-class failure: host=%s class=%d reason=%s budget_ms=%d",
+                server->host,
+                (int)primary_failure_class,
+                doh_failure_reason(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len),
+                total_budget_ms);
+            pool_release(client, slot);
+            return -1;
+        }
     }
 
     if (result != 0 && server->stage.has_stage1_cached_v4) {
+        attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
+        if (attempt_timeout_ms < 0) {
+            pool_release(client, slot);
+            return -1;
+        }
         result = doh_post_with_handle(
             client,
             curl,
             server,
             1,
             server->stage.stage1_cached_addr_v4_be,
-            timeout_ms,
+            attempt_timeout_ms,
             query,
             query_len,
             &response,
             &response_len,
             &attempt_err);
+        attempts_left--;
         if (result != 0) {
             LOG_DOH_ATTEMPT_FAILURE("stage1 cached IPv4", server, &attempt_err);
+            mutable_server->stage.last_failure_class =
+                (int)doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
         }
     }
 
@@ -557,13 +667,18 @@ int upstream_doh_resolve(
          * rotate or rebalance endpoints.
          */
         LOGF_WARN("DoH stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
+        attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
+        if (attempt_timeout_ms < 0) {
+            pool_release(client, slot);
+            return -1;
+        }
         result = doh_post_with_handle(
             client,
             curl,
             server,
             1,
             server->stage.bootstrap_addr_v4_be,
-            timeout_ms,
+            attempt_timeout_ms,
             query,
             query_len,
             &response,
@@ -573,6 +688,8 @@ int upstream_doh_resolve(
             LOGF_INFO("DoH stage2 bootstrap IPv4 succeeded: host=%s", server->host);
         } else {
             LOG_DOH_ATTEMPT_FAILURE("stage2 bootstrap IPv4", server, &attempt_err);
+            mutable_server->stage.last_failure_class =
+                (int)doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
         }
     }
     
@@ -587,6 +704,9 @@ int upstream_doh_resolve(
         free(response);
         return -1;
     }
+
+    mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    mutable_server->stage.transport_retry_suppress_until_ms = 0;
     
     *response_out = response;
     *response_len_out = response_len;
