@@ -65,6 +65,57 @@ static void write_u16(uint8_t *ptr, uint16_t value) {
     ptr[1] = (uint8_t)(value & 0xFFu);
 }
 
+static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    struct in_addr addr;
+    addr.s_addr = addr_v4_be;
+    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+        out[0] = '\0';
+    }
+}
+
+static const char *doq_normalize_reason(const char *detail_reason) {
+    if (detail_reason == NULL) {
+        return "unknown";
+    }
+    if (strcmp(detail_reason, "getaddrinfo_failed") == 0) {
+        return "dns_resolve_failed";
+    }
+    if (strcmp(detail_reason, "udp_connect_failed") == 0) {
+        return "transport_connect_failed";
+    }
+    if (strcmp(detail_reason, "quic_exchange_failed") == 0) {
+        return "protocol_exchange_failed";
+    }
+    return detail_reason;
+}
+
+static void log_doq_attempt_failure(
+    const upstream_server_t *server,
+    const char *phase,
+    const char *detail_reason,
+    int used_override_v4,
+    uint32_t override_addr_v4_be,
+    int timeout_ms) {
+    char ip_text[INET_ADDRSTRLEN];
+    ip_text[0] = '\0';
+    if (used_override_v4) {
+        format_ipv4(override_addr_v4_be, ip_text, sizeof(ip_text));
+    }
+
+    const char *reason = doq_normalize_reason(detail_reason);
+    LOGF_WARN(
+        "DoQ %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=%s",
+        phase,
+        server->host,
+        reason,
+        timeout_ms,
+        used_override_v4 ? ip_text : "none",
+        detail_reason != NULL ? detail_reason : "none");
+}
+
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -817,10 +868,11 @@ int upstream_doq_ngtcp2_resolve(
     }
 
     int result = -1;
+    const char *primary_reason = "not_attempted";
     int total_timeout_ms = timeout_ms > 0 ? timeout_ms : 1000;
     uint64_t overall_deadline = now_ns() + (uint64_t)total_timeout_ms * 1000000ULL;
 
-    if (server->has_stage1_cached_v4) {
+    if (server->stage.has_stage1_cached_v4) {
         uint64_t now = now_ns();
         if (now < overall_deadline) {
             int remaining_ms = (int)((overall_deadline - now) / 1000000ULL);
@@ -832,7 +884,7 @@ int upstream_doq_ngtcp2_resolve(
             memset(&cached, 0, sizeof(cached));
             cached.sin_family = AF_INET;
             cached.sin_port = htons((uint16_t)server->port);
-            cached.sin_addr.s_addr = server->stage1_cached_addr_v4_be;
+            cached.sin_addr.s_addr = server->stage.stage1_cached_addr_v4_be;
 
             struct addrinfo ai;
             memset(&ai, 0, sizeof(ai));
@@ -853,6 +905,25 @@ int upstream_doq_ngtcp2_resolve(
                     response_out,
                     response_len_out);
                 close(fd);
+                if (result != 0) {
+                    primary_reason = "quic_exchange_failed";
+                    log_doq_attempt_failure(
+                        server,
+                        "stage1 cached IPv4",
+                        primary_reason,
+                        1,
+                        server->stage.stage1_cached_addr_v4_be,
+                        remaining_ms);
+                }
+            } else {
+                primary_reason = "udp_connect_failed";
+                log_doq_attempt_failure(
+                    server,
+                    "stage1 cached IPv4",
+                    primary_reason,
+                    1,
+                    server->stage.stage1_cached_addr_v4_be,
+                    remaining_ms);
             }
         }
     }
@@ -865,6 +936,8 @@ int upstream_doq_ngtcp2_resolve(
 
     struct addrinfo *res = NULL;
     if (result != 0 && (getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL)) {
+        primary_reason = "getaddrinfo_failed";
+        log_doq_attempt_failure(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
         free(stream_data);
         return -1;
     }
@@ -885,6 +958,7 @@ int upstream_doq_ngtcp2_resolve(
 
         int fd = connect_udp_with_timeout(ai, remaining_ms);
         if (fd < 0) {
+            primary_reason = "udp_connect_failed";
             continue;
         }
 
@@ -900,9 +974,14 @@ int upstream_doq_ngtcp2_resolve(
         if (result == 0) {
             break;
         }
+        primary_reason = "quic_exchange_failed";
     }
 
-    if (result != 0 && server->has_bootstrap_v4) {
+    if (result != 0) {
+        log_doq_attempt_failure(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
+    }
+
+    if (result != 0 && server->stage.has_bootstrap_v4) {
         /*
          * Stage-2 DoQ bootstrap path: retry against explicit IPv4 endpoint
          * within the remaining overall timeout budget for this query.
@@ -919,7 +998,7 @@ int upstream_doq_ngtcp2_resolve(
             memset(&addr4, 0, sizeof(addr4));
             addr4.sin_family = AF_INET;
             addr4.sin_port = htons((uint16_t)server->port);
-            addr4.sin_addr.s_addr = server->bootstrap_addr_v4_be;
+            addr4.sin_addr.s_addr = server->stage.bootstrap_addr_v4_be;
 
             struct addrinfo ai;
             memset(&ai, 0, sizeof(ai));
@@ -943,8 +1022,22 @@ int upstream_doq_ngtcp2_resolve(
                 if (result == 0) {
                     LOGF_INFO("DoQ stage2 bootstrap IPv4 succeeded: host=%s", server->host);
                 } else {
-                    LOGF_WARN("DoQ stage2 bootstrap IPv4 failed: host=%s", server->host);
+                    log_doq_attempt_failure(
+                        server,
+                        "stage2 bootstrap IPv4",
+                        "quic_exchange_failed",
+                        1,
+                        server->stage.bootstrap_addr_v4_be,
+                        remaining_ms);
                 }
+            } else {
+                log_doq_attempt_failure(
+                    server,
+                    "stage2 bootstrap IPv4",
+                    "udp_connect_failed",
+                    1,
+                    server->stage.bootstrap_addr_v4_be,
+                    remaining_ms);
             }
         }
     }

@@ -173,9 +173,17 @@ static void test_stage2_no_resolvers(void **state) {
     memset(&s, 0, sizeof(s));
     strcpy(s.host, "dns.google");
 
-    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 100), -1);
-    assert_int_equal(upstream_bootstrap_try_stage2(NULL, &s, 100), -1);
-    assert_int_equal(upstream_bootstrap_try_stage2(&client, NULL, 100), -1);
+    const char *reason = NULL;
+    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 100, &reason), -1);
+    assert_string_equal(reason, "no_bootstrap_resolvers");
+    assert_true(s.stage.stage2_next_retry_ms > now_ms());
+
+    reason = NULL;
+    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 100, &reason), -1);
+    assert_string_equal(reason, "cooldown");
+
+    assert_int_equal(upstream_bootstrap_try_stage2(NULL, &s, 100, NULL), -1);
+    assert_int_equal(upstream_bootstrap_try_stage2(&client, NULL, 100, NULL), -1);
 }
 
 static void test_stage2_success_and_ttl_clamp(void **state) {
@@ -205,17 +213,17 @@ static void test_stage2_success_and_ttl_clamp(void **state) {
     }
 
     uint64_t before = now_ms();
-    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 500), 0);
+    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 500, NULL), 0);
     pthread_join(t, NULL);
 
-    assert_int_equal(s.has_bootstrap_v4, 1);
-    assert_int_equal(s.bootstrap_addr_v4_be, a.s_addr);
-    assert_true(s.bootstrap_expires_at_ms >= before + STAGE2_CACHE_TTL_MIN_MS);
+    assert_int_equal(s.stage.has_bootstrap_v4, 1);
+    assert_int_equal(s.stage.bootstrap_addr_v4_be, a.s_addr);
+    assert_true(s.stage.bootstrap_expires_at_ms >= before + STAGE2_CACHE_TTL_MIN_MS);
 
     assert_int_equal(inet_pton(AF_INET, "4.4.8.8", &a), 1);
     ctx.answer_ip_be = a.s_addr;
     ctx.answer_ttl = 9999999;
-    s.bootstrap_expires_at_ms = 0;
+    s.stage.bootstrap_expires_at_ms = 0;
 
     ctx.ready = 0;
     assert_int_equal(pthread_create(&t, NULL, dns_server_once, &ctx), 0);
@@ -223,11 +231,11 @@ static void test_stage2_success_and_ttl_clamp(void **state) {
         sleep_ms(10);
     }
     before = now_ms();
-    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 500), 0);
+    assert_int_equal(upstream_bootstrap_try_stage2(&client, &s, 500, NULL), 0);
     pthread_join(t, NULL);
 
-    assert_int_equal(s.bootstrap_addr_v4_be, a.s_addr);
-    assert_true(s.bootstrap_expires_at_ms <= before + STAGE2_CACHE_TTL_MAX_MS + 20);
+    assert_int_equal(s.stage.bootstrap_addr_v4_be, a.s_addr);
+    assert_true(s.stage.bootstrap_expires_at_ms <= before + STAGE2_CACHE_TTL_MAX_MS + 20);
 }
 
 static void test_stage1_hydrate_success(void **state) {
@@ -242,8 +250,8 @@ static void test_stage1_hydrate_success(void **state) {
     upstream_server_t s;
     memset(&s, 0, sizeof(s));
     strcpy(s.host, "cloudflare-dns.com");
-    s.has_stage1_cached_v4 = 1;
-    s.stage1_cached_addr_v4_be = htonl(0x01010101u);
+    s.stage.has_stage1_cached_v4 = 1;
+    s.stage.stage1_cached_addr_v4_be = htonl(0x01010101u);
 
     dns_server_ctx_t ctx;
     struct in_addr a;
@@ -261,12 +269,12 @@ static void test_stage1_hydrate_success(void **state) {
     assert_int_equal(upstream_bootstrap_stage1_hydrate(&client, &s, 500), 0);
     pthread_join(t, NULL);
 
-    assert_int_equal(s.has_stage1_cached_v4, 1);
-    assert_int_equal(s.stage1_cached_addr_v4_be, a.s_addr);
-    assert_int_equal(s.has_bootstrap_v4, 1);
-    assert_int_equal(s.bootstrap_addr_v4_be, a.s_addr);
-    assert_true(s.stage1_cache_expires_at_ms != 0);
-    assert_true(s.bootstrap_expires_at_ms != 0);
+    assert_int_equal(s.stage.has_stage1_cached_v4, 1);
+    assert_int_equal(s.stage.stage1_cached_addr_v4_be, a.s_addr);
+    assert_int_equal(s.stage.has_bootstrap_v4, 1);
+    assert_int_equal(s.stage.bootstrap_addr_v4_be, a.s_addr);
+    assert_true(s.stage.stage1_cache_expires_at_ms != 0);
+    assert_true(s.stage.bootstrap_expires_at_ms != 0);
 }
 
 static void test_stage3_success_failure_and_cooldown(void **state) {
@@ -282,19 +290,19 @@ static void test_stage3_success_failure_and_cooldown(void **state) {
     g_iter_rc = 0;
     g_iter_addr = a.s_addr;
 
-    assert_int_equal(upstream_bootstrap_try_stage3(&s, 1000), 0);
-    assert_int_equal(s.has_bootstrap_v4, 1);
-    assert_int_equal(s.bootstrap_addr_v4_be, a.s_addr);
+    assert_int_equal(upstream_bootstrap_try_stage3(&s, 1000, NULL), 0);
+    assert_int_equal(s.stage.has_bootstrap_v4, 1);
+    assert_int_equal(s.stage.bootstrap_addr_v4_be, a.s_addr);
 
     /* Immediate second attempt is cooldown-limited. */
-    assert_int_equal(upstream_bootstrap_try_stage3(&s, 1000), -1);
+    assert_int_equal(upstream_bootstrap_try_stage3(&s, 1000, NULL), -1);
 
     /* Force retry window and failure branch. */
-    s.iterative_last_attempt_ms = 0;
+    s.stage.iterative_last_attempt_ms = 0;
     g_iter_rc = -1;
-    assert_int_equal(upstream_bootstrap_try_stage3(&s, 1000), -1);
+    assert_int_equal(upstream_bootstrap_try_stage3(&s, 1000, NULL), -1);
 
-    assert_int_equal(upstream_bootstrap_try_stage3(NULL, 1000), -1);
+    assert_int_equal(upstream_bootstrap_try_stage3(NULL, 1000, NULL), -1);
 }
 
 int main(void) {

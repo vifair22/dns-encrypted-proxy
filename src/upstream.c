@@ -4,12 +4,15 @@
 #include "upstream_bootstrap.h"
 #include "logger.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <string.h>
 #include <time.h>
+
+#define UPSTREAM_MAX_STAGE_ATTEMPTS_PER_QUERY 12
 
 /* Forward declarations for protocol-specific functions */
 #if UPSTREAM_DOH_ENABLED
@@ -304,7 +307,7 @@ void upstream_server_record_success(upstream_server_t *server) {
     
     server->health.healthy = 1;
     server->health.consecutive_failures = 0;
-    server->stage1_cached_failures = 0;
+    server->stage.stage1_cached_failures = 0;
     server->health.last_success_time = now_ms();
     server->health.total_queries++;
 
@@ -528,6 +531,340 @@ static int resolve_with_server(
     return result;
 }
 
+static int stage1_hydrate_timeout_ms(const upstream_client_t *client) {
+    int hydrate_timeout_ms = client->config.timeout_ms / 4;
+    if (hydrate_timeout_ms < 100) {
+        hydrate_timeout_ms = 100;
+    }
+    if (hydrate_timeout_ms > 500) {
+        hydrate_timeout_ms = 500;
+    }
+    return hydrate_timeout_ms;
+}
+
+static upstream_stage1_cache_result_t prepare_stage1_cache(upstream_client_t *client, upstream_server_t *server) {
+    pthread_mutex_lock(&client->stage1_cache_mutex);
+    upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(server);
+    pthread_mutex_unlock(&client->stage1_cache_mutex);
+
+    if (stage1_cache == UPSTREAM_STAGE1_CACHE_HIT) {
+        client_counter_inc(&client->stage_metrics.stage1_cache_hits);
+    } else if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
+        client_counter_inc(&client->stage_metrics.stage1_cache_refreshes);
+    } else {
+        client_counter_inc(&client->stage_metrics.stage1_cache_misses);
+    }
+    return stage1_cache;
+}
+
+static void maybe_hydrate_stage1_cache(
+    upstream_client_t *client,
+    upstream_server_t *server,
+    upstream_stage1_cache_result_t stage1_cache) {
+    if (stage1_cache != UPSTREAM_STAGE1_CACHE_REFRESHED) {
+        return;
+    }
+    if (upstream_bootstrap_stage1_hydrate(client, server, stage1_hydrate_timeout_ms(client)) == 0) {
+        LOGF_DEBUG("Stage1 cache hydrated with DNS TTL: host=%s", server->host);
+    }
+}
+
+static void note_stage1_failure(upstream_client_t *client, upstream_server_t *server) {
+    pthread_mutex_lock(&client->stage1_cache_mutex);
+    if (server->stage.has_stage1_cached_v4) {
+        server->stage.stage1_cached_failures++;
+        if (server->stage.stage1_cached_failures >= 2) {
+            upstream_bootstrap_stage1_invalidate(server);
+            client_counter_inc(&client->stage_metrics.stage1_cache_invalidations);
+        }
+    }
+    pthread_mutex_unlock(&client->stage1_cache_mutex);
+}
+
+typedef enum {
+    UPSTREAM_REASON_CLASS_NETWORK = 0,
+    UPSTREAM_REASON_CLASS_DNS = 1,
+    UPSTREAM_REASON_CLASS_TRANSPORT = 2,
+    UPSTREAM_REASON_CLASS_COOLDOWN = 3,
+    UPSTREAM_REASON_CLASS_OTHER = 4,
+} upstream_reason_class_t;
+
+static int reason_in_list(const char *reason, const char *const *list, size_t list_len) {
+    if (reason == NULL || list == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < list_len; i++) {
+        if (strcmp(reason, list[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static upstream_reason_class_t classify_stage_reason(const char *reason) {
+    static const char *const dns_reasons[] = {
+        "dns_resolve_failed",
+        "dns_rcode_nonzero",
+        "invalid_dns_response",
+        "invalid_question_section",
+        "invalid_answer_section",
+        "invalid_rdata_length",
+        "no_a_answer",
+        "txid_mismatch",
+        "invalid_hostname",
+    };
+    static const char *const network_reasons[] = {
+        "invalid_resolver_ip",
+        "socket_create_failed",
+        "sendto_failed",
+        "poll_timeout",
+        "poll_failed",
+        "poll_revents_error",
+        "recv_short_or_failed",
+        "iterative_resolve_failed",
+        "timeout",
+    };
+    static const char *const transport_reasons[] = {
+        "transport_connect_failed",
+        "transport_io_failed",
+        "transport_failed",
+        "transport_retry_failed",
+        "tls_handshake_failed",
+        "protocol_exchange_failed",
+        "upstream_http_status",
+    };
+
+    if (reason == NULL) {
+        return UPSTREAM_REASON_CLASS_OTHER;
+    }
+    if (strcmp(reason, "cooldown") == 0) {
+        return UPSTREAM_REASON_CLASS_COOLDOWN;
+    }
+    if (reason_in_list(reason, dns_reasons, sizeof(dns_reasons) / sizeof(dns_reasons[0]))) {
+        return UPSTREAM_REASON_CLASS_DNS;
+    }
+    if (reason_in_list(reason, network_reasons, sizeof(network_reasons) / sizeof(network_reasons[0]))) {
+        return UPSTREAM_REASON_CLASS_NETWORK;
+    }
+    if (reason_in_list(reason, transport_reasons, sizeof(transport_reasons) / sizeof(transport_reasons[0]))) {
+        return UPSTREAM_REASON_CLASS_TRANSPORT;
+    }
+    return UPSTREAM_REASON_CLASS_OTHER;
+}
+
+static void note_stage_reason(upstream_client_t *client, int stage, const char *reason) {
+    if (client == NULL || reason == NULL) {
+        return;
+    }
+
+    upstream_reason_class_t reason_class = classify_stage_reason(reason);
+    if (stage == 2) {
+        switch (reason_class) {
+            case UPSTREAM_REASON_CLASS_NETWORK:
+                client_counter_inc(&client->stage_metrics.stage2_reason_network);
+                break;
+            case UPSTREAM_REASON_CLASS_DNS:
+                client_counter_inc(&client->stage_metrics.stage2_reason_dns);
+                break;
+            case UPSTREAM_REASON_CLASS_TRANSPORT:
+                client_counter_inc(&client->stage_metrics.stage2_reason_transport);
+                break;
+            case UPSTREAM_REASON_CLASS_COOLDOWN:
+                client_counter_inc(&client->stage_metrics.stage2_reason_cooldown);
+                break;
+            case UPSTREAM_REASON_CLASS_OTHER:
+            default:
+                client_counter_inc(&client->stage_metrics.stage2_reason_other);
+                break;
+        }
+    } else {
+        switch (reason_class) {
+            case UPSTREAM_REASON_CLASS_NETWORK:
+                client_counter_inc(&client->stage_metrics.stage3_reason_network);
+                break;
+            case UPSTREAM_REASON_CLASS_DNS:
+                client_counter_inc(&client->stage_metrics.stage3_reason_dns);
+                break;
+            case UPSTREAM_REASON_CLASS_TRANSPORT:
+                client_counter_inc(&client->stage_metrics.stage3_reason_transport);
+                break;
+            case UPSTREAM_REASON_CLASS_COOLDOWN:
+                client_counter_inc(&client->stage_metrics.stage3_reason_cooldown);
+                break;
+            case UPSTREAM_REASON_CLASS_OTHER:
+            default:
+                client_counter_inc(&client->stage_metrics.stage3_reason_other);
+                break;
+        }
+    }
+}
+
+static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    struct in_addr addr;
+    addr.s_addr = addr_v4_be;
+    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+        out[0] = '\0';
+    }
+}
+
+static uint64_t stage_cooldown_remaining_ms(const upstream_server_t *server, int stage_id) {
+    if (server == NULL) {
+        return 0;
+    }
+    uint64_t now = now_ms();
+    if (stage_id == 2) {
+        if (server->stage.stage2_next_retry_ms > now) {
+            return server->stage.stage2_next_retry_ms - now;
+        }
+        return 0;
+    }
+    if (stage_id == 3) {
+        if (server->stage.iterative_last_attempt_ms == 0 || now <= server->stage.iterative_last_attempt_ms) {
+            return 0;
+        }
+        uint64_t elapsed = now - server->stage.iterative_last_attempt_ms;
+        if (elapsed >= UPSTREAM_STAGE3_RETRY_COOLDOWN_MS) {
+            return 0;
+        }
+        return UPSTREAM_STAGE3_RETRY_COOLDOWN_MS - elapsed;
+    }
+    return 0;
+}
+
+static void log_stage_event(
+    const upstream_server_t *server,
+    int stage_id,
+    const char *stage,
+    const char *action,
+    const char *reason,
+    int timeout_ms) {
+    uint64_t cooldown_ms = stage_cooldown_remaining_ms(server, stage_id);
+    char ip_text[INET_ADDRSTRLEN];
+    ip_text[0] = '\0';
+    if (server->stage.has_bootstrap_v4) {
+        format_ipv4(server->stage.bootstrap_addr_v4_be, ip_text, sizeof(ip_text));
+    }
+
+    LOGF_WARN(
+        "Upstream stage event: host=%s type=%s stage=%s action=%s reason=%s timeout_ms=%d cooldown_ms=%llu override_ip=%s",
+        server->host,
+        upstream_type_name(server->type),
+        stage,
+        action,
+        reason != NULL ? reason : "none",
+        timeout_ms,
+        (unsigned long long)cooldown_ms,
+        ip_text[0] != '\0' ? ip_text : "none");
+}
+
+static int consume_retry_budget(int *budget, const upstream_server_t *server, const char *phase) {
+    if (budget == NULL || server == NULL || phase == NULL) {
+        return -1;
+    }
+    if (*budget <= 0) {
+        LOGF_WARN("Upstream retry budget exhausted: host=%s phase=%s", server->host, phase);
+        return -1;
+    }
+    (*budget)--;
+    return 0;
+}
+
+static int resolve_server_with_fallback(
+    upstream_client_t *client,
+    upstream_server_t *server,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out,
+    int *retry_budget,
+    int unhealthy_probe) {
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+
+    upstream_stage1_cache_result_t stage1_cache = prepare_stage1_cache(client, server);
+
+    if (unhealthy_probe) {
+        LOGF_DEBUG("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
+    } else {
+        LOGF_DEBUG("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
+    }
+
+    if (consume_retry_budget(retry_budget, server, "stage1") == 0 &&
+        resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+        maybe_hydrate_stage1_cache(client, server, stage1_cache);
+        upstream_server_record_success(server);
+        *response_out = response;
+        *response_len_out = response_len;
+        return 0;
+    }
+
+    if (unhealthy_probe) {
+        LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
+    } else {
+        LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
+    }
+
+    note_stage1_failure(client, server);
+
+    log_stage_event(server, 2, "stage2", "enter", "stage1_failed", client->config.timeout_ms);
+    client_counter_inc(&client->stage_metrics.stage2_attempts);
+    const char *stage2_reason = NULL;
+    if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms, &stage2_reason) == 0) {
+        client_counter_inc(&client->stage_metrics.stage2_successes);
+        if (consume_retry_budget(retry_budget, server, "stage2") == 0 &&
+            resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+            upstream_server_record_success(server);
+            *response_out = response;
+            *response_len_out = response_len;
+            return 0;
+        }
+        client_counter_inc(&client->stage_metrics.stage2_failures);
+        note_stage_reason(client, 2, "transport_retry_failed");
+        log_stage_event(server, 2, "stage2", "retry_failed", stage2_reason, client->config.timeout_ms);
+    } else {
+        client_counter_inc(&client->stage_metrics.stage2_failures);
+        if (stage2_reason != NULL && strcmp(stage2_reason, "cooldown") == 0) {
+            client_counter_inc(&client->stage_metrics.stage2_cooldowns);
+        }
+        note_stage_reason(client, 2, stage2_reason);
+        log_stage_event(server, 2, "stage2", "failed", stage2_reason, client->config.timeout_ms);
+    }
+
+    if (client->config.iterative_bootstrap_enabled) {
+        log_stage_event(server, 3, "stage3", "enter", "stage2_failed", client->config.timeout_ms);
+        client_counter_inc(&client->stage_metrics.stage3_attempts);
+
+        const char *stage3_reason = NULL;
+        if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms, &stage3_reason) == 0) {
+            client_counter_inc(&client->stage_metrics.stage3_successes);
+            LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
+            if (consume_retry_budget(retry_budget, server, "stage3") == 0 &&
+                resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+                upstream_server_record_success(server);
+                *response_out = response;
+                *response_len_out = response_len;
+                return 0;
+            }
+            client_counter_inc(&client->stage_metrics.stage3_failures);
+            note_stage_reason(client, 3, "transport_retry_failed");
+            log_stage_event(server, 3, "stage3", "retry_failed", stage3_reason, client->config.timeout_ms);
+        } else {
+            client_counter_inc(&client->stage_metrics.stage3_failures);
+            if (stage3_reason != NULL && strcmp(stage3_reason, "cooldown") == 0) {
+                client_counter_inc(&client->stage_metrics.stage3_cooldowns);
+            }
+            note_stage_reason(client, 3, stage3_reason);
+            log_stage_event(server, 3, "stage3", "failed", stage3_reason, client->config.timeout_ms);
+        }
+    }
+
+    upstream_server_record_failure(server, &client->config);
+    return -1;
+}
+
 int upstream_resolve(
     upstream_client_t *client,
     const uint8_t *query,
@@ -557,194 +894,35 @@ int upstream_resolve(
      * Pass 1 = normal path. Pass 2 = last-chance probe of unhealthy servers.
      * Keeps normal latency low but still lets bad servers recover.
      */
-    /* Try each server in order, starting from round-robin index */
-    for (int attempt = 0; attempt < client->server_count; attempt++) {
-        int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->server_count);
-        upstream_server_t *server = &client->servers[idx];
-        
-        /* Skip unhealthy servers unless backoff has elapsed */
-        if (upstream_server_should_skip(server, &client->config)) {
-            continue;
-        }
-        
-        uint8_t *response = NULL;
-        size_t response_len = 0;
+    int retry_budget = UPSTREAM_MAX_STAGE_ATTEMPTS_PER_QUERY;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int attempt = 0; attempt < client->server_count; attempt++) {
+            int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->server_count);
+            upstream_server_t *server = &client->servers[idx];
 
-        pthread_mutex_lock(&client->stage1_cache_mutex);
-        upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(server);
-        pthread_mutex_unlock(&client->stage1_cache_mutex);
-        if (stage1_cache == UPSTREAM_STAGE1_CACHE_HIT) {
-            client_counter_inc(&client->stage1_cache_hits);
-        } else if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
-            client_counter_inc(&client->stage1_cache_refreshes);
-        } else {
-            client_counter_inc(&client->stage1_cache_misses);
-        }
-
-        /* Stage 1 first on purpose: local DNS tracks provider IP changes. */
-        LOGF_DEBUG("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
-        
-        if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
-            if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
-                int hydrate_timeout_ms = client->config.timeout_ms / 4;
-                if (hydrate_timeout_ms < 100) {
-                    hydrate_timeout_ms = 100;
+            if (pass == 0) {
+                if (upstream_server_should_skip(server, &client->config)) {
+                    continue;
                 }
-                if (hydrate_timeout_ms > 500) {
-                    hydrate_timeout_ms = 500;
-                }
-                if (upstream_bootstrap_stage1_hydrate(client, server, hydrate_timeout_ms) == 0) {
-                    LOGF_DEBUG("Stage1 cache hydrated with DNS TTL: host=%s", server->host);
+            } else {
+                if (server->health.healthy) {
+                    continue;
                 }
             }
-            upstream_server_record_success(server);
-            *response_out = response;
-            *response_len_out = response_len;
-            return 0;
-        }
 
-        /* Keep this per-attempt so failover behavior is visible in prod logs. */
-        LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
-
-        pthread_mutex_lock(&client->stage1_cache_mutex);
-        if (server->has_stage1_cached_v4) {
-            server->stage1_cached_failures++;
-            if (server->stage1_cached_failures >= 2) {
-                upstream_bootstrap_stage1_invalidate(server);
-                client_counter_inc(&client->stage1_cache_invalidations);
-            }
-        }
-        pthread_mutex_unlock(&client->stage1_cache_mutex);
-
-        LOGF_WARN("Upstream fallback stage2 recursive bootstrap: host=%s", server->host);
-        if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms) == 0) {
-            if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
-                upstream_server_record_success(server);
-                *response_out = response;
-                *response_len_out = response_len;
+            if (resolve_server_with_fallback(
+                    client,
+                    server,
+                    query,
+                    query_len,
+                    response_out,
+                    response_len_out,
+                    &retry_budget,
+                    pass == 1)
+                == 0) {
                 return 0;
             }
-            LOGF_WARN("Upstream stage2 bootstrap retry failed: host=%s", server->host);
-        } else {
-            LOGF_WARN("Upstream stage2 recursive bootstrap failed: host=%s", server->host);
         }
-
-        if (client->config.iterative_bootstrap_enabled) {
-            LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 failure", server->host);
-
-            if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms) == 0) {
-                LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
-                if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
-                    upstream_server_record_success(server);
-                    *response_out = response;
-                    *response_len_out = response_len;
-                    return 0;
-                }
-                LOGF_WARN("Upstream stage3 iterative bootstrap retry failed: host=%s", server->host);
-            } else {
-                LOGF_WARN("Upstream stage3 iterative bootstrap failed: host=%s", server->host);
-            }
-        }
-
-        upstream_server_record_failure(server, &client->config);
-    }
-    
-    /*
-     * Pass 2 (last resort): probe unhealthy servers if healthy set failed.
-     * This helps recover from stale health state when all primaries degraded.
-     */
-    /* All servers failed - try unhealthy servers as last resort */
-    for (int attempt = 0; attempt < client->server_count; attempt++) {
-        int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->server_count);
-        upstream_server_t *server = &client->servers[idx];
-        
-        if (server->health.healthy) {
-            continue;  /* Already tried */
-        }
-        
-        uint8_t *response = NULL;
-        size_t response_len = 0;
-
-        pthread_mutex_lock(&client->stage1_cache_mutex);
-        upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(server);
-        pthread_mutex_unlock(&client->stage1_cache_mutex);
-        if (stage1_cache == UPSTREAM_STAGE1_CACHE_HIT) {
-            client_counter_inc(&client->stage1_cache_hits);
-        } else if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
-            client_counter_inc(&client->stage1_cache_refreshes);
-        } else {
-            client_counter_inc(&client->stage1_cache_misses);
-        }
-
-        /*
-         * Pass 2 is a bounded "last chance" probe for currently unhealthy
-         * entries. This avoids permanent brownout after stale health state while
-         * keeping normal success path in pass 1 fast.
-         */
-        LOGF_DEBUG("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
-        
-        if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
-            if (stage1_cache == UPSTREAM_STAGE1_CACHE_REFRESHED) {
-                int hydrate_timeout_ms = client->config.timeout_ms / 4;
-                if (hydrate_timeout_ms < 100) {
-                    hydrate_timeout_ms = 100;
-                }
-                if (hydrate_timeout_ms > 500) {
-                    hydrate_timeout_ms = 500;
-                }
-                if (upstream_bootstrap_stage1_hydrate(client, server, hydrate_timeout_ms) == 0) {
-                    LOGF_DEBUG("Stage1 cache hydrated with DNS TTL: host=%s", server->host);
-                }
-            }
-            upstream_server_record_success(server);
-            *response_out = response;
-            *response_len_out = response_len;
-            return 0;
-        }
-
-        LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
-
-        pthread_mutex_lock(&client->stage1_cache_mutex);
-        if (server->has_stage1_cached_v4) {
-            server->stage1_cached_failures++;
-            if (server->stage1_cached_failures >= 2) {
-                upstream_bootstrap_stage1_invalidate(server);
-                client_counter_inc(&client->stage1_cache_invalidations);
-            }
-        }
-        pthread_mutex_unlock(&client->stage1_cache_mutex);
-
-        LOGF_WARN("Upstream fallback stage2 recursive bootstrap: host=%s", server->host);
-        if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms) == 0) {
-            if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
-                upstream_server_record_success(server);
-                *response_out = response;
-                *response_len_out = response_len;
-                return 0;
-            }
-            LOGF_WARN("Upstream stage2 bootstrap retry failed: host=%s", server->host);
-        } else {
-            LOGF_WARN("Upstream stage2 recursive bootstrap failed: host=%s", server->host);
-        }
-
-        if (client->config.iterative_bootstrap_enabled) {
-            LOGF_WARN("Upstream fallback stage3 iterative bootstrap: host=%s after stage2 failure", server->host);
-
-            if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms) == 0) {
-                LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
-                if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
-                    upstream_server_record_success(server);
-                    *response_out = response;
-                    *response_len_out = response_len;
-                    return 0;
-                }
-                LOGF_WARN("Upstream stage3 iterative bootstrap retry failed: host=%s", server->host);
-            } else {
-                LOGF_WARN("Upstream stage3 iterative bootstrap failed: host=%s", server->host);
-            }
-        }
-
-        upstream_server_record_failure(server, &client->config);
     }
     
     return -1;
@@ -759,8 +937,8 @@ int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *ho
     for (int i = 0; i < client->server_count; i++) {
         upstream_server_t *server = &client->servers[i];
         if (strcasecmp(server->host, host) == 0) {
-            server->bootstrap_addr_v4_be = addr_v4_be;
-            server->has_bootstrap_v4 = 1;
+            server->stage.bootstrap_addr_v4_be = addr_v4_be;
+            server->stage.has_bootstrap_v4 = 1;
             applied++;
         }
     }
@@ -778,10 +956,28 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
         return -1;
     }
 
-    stats_out->stage1_cache_hits = __atomic_load_n(&client->stage1_cache_hits, __ATOMIC_RELAXED);
-    stats_out->stage1_cache_misses = __atomic_load_n(&client->stage1_cache_misses, __ATOMIC_RELAXED);
-    stats_out->stage1_cache_refreshes = __atomic_load_n(&client->stage1_cache_refreshes, __ATOMIC_RELAXED);
-    stats_out->stage1_cache_invalidations = __atomic_load_n(&client->stage1_cache_invalidations, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_hits = __atomic_load_n(&client->stage_metrics.stage1_cache_hits, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_misses = __atomic_load_n(&client->stage_metrics.stage1_cache_misses, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_refreshes = __atomic_load_n(&client->stage_metrics.stage1_cache_refreshes, __ATOMIC_RELAXED);
+    stats_out->stage1_cache_invalidations = __atomic_load_n(&client->stage_metrics.stage1_cache_invalidations, __ATOMIC_RELAXED);
+    stats_out->stage2_attempts = __atomic_load_n(&client->stage_metrics.stage2_attempts, __ATOMIC_RELAXED);
+    stats_out->stage2_successes = __atomic_load_n(&client->stage_metrics.stage2_successes, __ATOMIC_RELAXED);
+    stats_out->stage2_failures = __atomic_load_n(&client->stage_metrics.stage2_failures, __ATOMIC_RELAXED);
+    stats_out->stage2_cooldowns = __atomic_load_n(&client->stage_metrics.stage2_cooldowns, __ATOMIC_RELAXED);
+    stats_out->stage3_attempts = __atomic_load_n(&client->stage_metrics.stage3_attempts, __ATOMIC_RELAXED);
+    stats_out->stage3_successes = __atomic_load_n(&client->stage_metrics.stage3_successes, __ATOMIC_RELAXED);
+    stats_out->stage3_failures = __atomic_load_n(&client->stage_metrics.stage3_failures, __ATOMIC_RELAXED);
+    stats_out->stage3_cooldowns = __atomic_load_n(&client->stage_metrics.stage3_cooldowns, __ATOMIC_RELAXED);
+    stats_out->stage2_reason_network = __atomic_load_n(&client->stage_metrics.stage2_reason_network, __ATOMIC_RELAXED);
+    stats_out->stage2_reason_dns = __atomic_load_n(&client->stage_metrics.stage2_reason_dns, __ATOMIC_RELAXED);
+    stats_out->stage2_reason_transport = __atomic_load_n(&client->stage_metrics.stage2_reason_transport, __ATOMIC_RELAXED);
+    stats_out->stage2_reason_cooldown = __atomic_load_n(&client->stage_metrics.stage2_reason_cooldown, __ATOMIC_RELAXED);
+    stats_out->stage2_reason_other = __atomic_load_n(&client->stage_metrics.stage2_reason_other, __ATOMIC_RELAXED);
+    stats_out->stage3_reason_network = __atomic_load_n(&client->stage_metrics.stage3_reason_network, __ATOMIC_RELAXED);
+    stats_out->stage3_reason_dns = __atomic_load_n(&client->stage_metrics.stage3_reason_dns, __ATOMIC_RELAXED);
+    stats_out->stage3_reason_transport = __atomic_load_n(&client->stage_metrics.stage3_reason_transport, __ATOMIC_RELAXED);
+    stats_out->stage3_reason_cooldown = __atomic_load_n(&client->stage_metrics.stage3_reason_cooldown, __ATOMIC_RELAXED);
+    stats_out->stage3_reason_other = __atomic_load_n(&client->stage_metrics.stage3_reason_other, __ATOMIC_RELAXED);
 
 #if UPSTREAM_DOH_ENABLED
     if (client->doh_client != NULL) {

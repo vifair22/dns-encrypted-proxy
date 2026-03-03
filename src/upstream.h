@@ -30,6 +30,50 @@ typedef struct {
     uint64_t total_failures;        /* Total failures for this server */
 } upstream_health_t;
 
+typedef struct {
+    uint32_t bootstrap_addr_v4_be;
+    uint64_t bootstrap_expires_at_ms;
+    int has_bootstrap_v4;
+
+    uint64_t stage2_next_retry_ms;
+
+    uint32_t stage1_cached_addr_v4_be;
+    uint64_t stage1_cache_expires_at_ms;
+    int has_stage1_cached_v4;
+    uint32_t stage1_cached_failures;
+
+    uint64_t iterative_last_attempt_ms;
+} upstream_stage_state_t;
+
+typedef struct {
+    uint64_t stage1_cache_hits;
+    uint64_t stage1_cache_misses;
+    uint64_t stage1_cache_refreshes;
+    uint64_t stage1_cache_invalidations;
+
+    uint64_t stage2_attempts;
+    uint64_t stage2_successes;
+    uint64_t stage2_failures;
+    uint64_t stage2_cooldowns;
+
+    uint64_t stage3_attempts;
+    uint64_t stage3_successes;
+    uint64_t stage3_failures;
+    uint64_t stage3_cooldowns;
+
+    uint64_t stage2_reason_network;
+    uint64_t stage2_reason_dns;
+    uint64_t stage2_reason_transport;
+    uint64_t stage2_reason_cooldown;
+    uint64_t stage2_reason_other;
+
+    uint64_t stage3_reason_network;
+    uint64_t stage3_reason_dns;
+    uint64_t stage3_reason_transport;
+    uint64_t stage3_reason_cooldown;
+    uint64_t stage3_reason_other;
+} upstream_stage_metrics_t;
+
 /*
  * Configuration for a single upstream server
  */
@@ -38,14 +82,7 @@ typedef struct {
     char url[UPSTREAM_MAX_URL_LEN];  /* Full URL for DoH, or host:port for DoT */
     char host[256];                   /* Parsed hostname */
     int port;                         /* Parsed port (853 default for DoT) */
-    uint32_t bootstrap_addr_v4_be;    /* Optional IPv4 bootstrap override (network byte order) */
-    uint64_t bootstrap_expires_at_ms;
-    int has_bootstrap_v4;
-    uint32_t stage1_cached_addr_v4_be;    /* Cached local-resolver IPv4 for stage1 fast path */
-    uint64_t stage1_cache_expires_at_ms;  /* Monotonic expiry for cached stage1 address */
-    int has_stage1_cached_v4;
-    uint32_t stage1_cached_failures;
-    uint64_t iterative_last_attempt_ms;
+    upstream_stage_state_t stage;
     upstream_health_t health;
 } upstream_server_t;
 
@@ -89,11 +126,7 @@ typedef struct {
     int bootstrap_resolver_count;
     char bootstrap_resolvers[UPSTREAM_MAX_BOOTSTRAP_RESOLVERS][64];
 
-    /* Stage1 cache runtime counters */
-    uint64_t stage1_cache_hits;
-    uint64_t stage1_cache_misses;
-    uint64_t stage1_cache_refreshes;
-    uint64_t stage1_cache_invalidations;
+    upstream_stage_metrics_t stage_metrics;
 } upstream_client_t;
 
 typedef struct {
@@ -116,6 +149,28 @@ typedef struct {
     uint64_t stage1_cache_misses;
     uint64_t stage1_cache_refreshes;
     uint64_t stage1_cache_invalidations;
+
+    uint64_t stage2_attempts;
+    uint64_t stage2_successes;
+    uint64_t stage2_failures;
+    uint64_t stage2_cooldowns;
+
+    uint64_t stage3_attempts;
+    uint64_t stage3_successes;
+    uint64_t stage3_failures;
+    uint64_t stage3_cooldowns;
+
+    uint64_t stage2_reason_network;
+    uint64_t stage2_reason_dns;
+    uint64_t stage2_reason_transport;
+    uint64_t stage2_reason_cooldown;
+    uint64_t stage2_reason_other;
+
+    uint64_t stage3_reason_network;
+    uint64_t stage3_reason_dns;
+    uint64_t stage3_reason_transport;
+    uint64_t stage3_reason_cooldown;
+    uint64_t stage3_reason_other;
 } upstream_runtime_stats_t;
 
 /*

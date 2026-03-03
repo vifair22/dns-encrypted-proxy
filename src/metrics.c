@@ -285,6 +285,61 @@ static int append_pool_metric_row(
         connections_alive);
 }
 
+static int append_stage_fallback_metrics(
+    char *out,
+    size_t out_size,
+    size_t *offset,
+    const upstream_runtime_stats_t *runtime_stats) {
+    if (runtime_stats == NULL) {
+        return -1;
+    }
+
+    return appendf(
+        out,
+        out_size,
+        offset,
+        "# HELP dns_encrypted_proxy_upstream_stage_fallback_total Stage fallback outcomes by stage and result.\n"
+        "# TYPE dns_encrypted_proxy_upstream_stage_fallback_total counter\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage2\",result=\"attempt\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage2\",result=\"success\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage2\",result=\"failure\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage2\",result=\"cooldown\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage3\",result=\"attempt\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage3\",result=\"success\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage3\",result=\"failure\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_fallback_total{stage=\"stage3\",result=\"cooldown\"} %llu\n"
+        "# HELP dns_encrypted_proxy_upstream_stage_reason_total Stage fallback failures grouped by normalized reason class.\n"
+        "# TYPE dns_encrypted_proxy_upstream_stage_reason_total counter\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage2\",reason=\"network\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage2\",reason=\"dns\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage2\",reason=\"transport\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage2\",reason=\"cooldown\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage2\",reason=\"other\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage3\",reason=\"network\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage3\",reason=\"dns\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage3\",reason=\"transport\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage3\",reason=\"cooldown\"} %llu\n"
+        "dns_encrypted_proxy_upstream_stage_reason_total{stage=\"stage3\",reason=\"other\"} %llu\n",
+        (unsigned long long)runtime_stats->stage2_attempts,
+        (unsigned long long)runtime_stats->stage2_successes,
+        (unsigned long long)runtime_stats->stage2_failures,
+        (unsigned long long)runtime_stats->stage2_cooldowns,
+        (unsigned long long)runtime_stats->stage3_attempts,
+        (unsigned long long)runtime_stats->stage3_successes,
+        (unsigned long long)runtime_stats->stage3_failures,
+        (unsigned long long)runtime_stats->stage3_cooldowns,
+        (unsigned long long)runtime_stats->stage2_reason_network,
+        (unsigned long long)runtime_stats->stage2_reason_dns,
+        (unsigned long long)runtime_stats->stage2_reason_transport,
+        (unsigned long long)runtime_stats->stage2_reason_cooldown,
+        (unsigned long long)runtime_stats->stage2_reason_other,
+        (unsigned long long)runtime_stats->stage3_reason_network,
+        (unsigned long long)runtime_stats->stage3_reason_dns,
+        (unsigned long long)runtime_stats->stage3_reason_transport,
+        (unsigned long long)runtime_stats->stage3_reason_cooldown,
+        (unsigned long long)runtime_stats->stage3_reason_other);
+}
+
 static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_size) {
     if (m == NULL || out == NULL || out_size == 0) {
         return -1;
@@ -513,6 +568,10 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)runtime_stats.stage1_cache_misses,
             (unsigned long long)runtime_stats.stage1_cache_refreshes,
             (unsigned long long)runtime_stats.stage1_cache_invalidations) != 0) {
+        return -1;
+    }
+
+    if (append_stage_fallback_metrics(out, out_size, &offset, &runtime_stats) != 0) {
         return -1;
     }
 

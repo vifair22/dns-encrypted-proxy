@@ -54,6 +54,53 @@ static void write_u16(uint8_t *ptr, uint16_t value) {
     ptr[1] = (uint8_t)(value & 0xFFu);
 }
 
+static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    struct in_addr addr;
+    addr.s_addr = addr_v4_be;
+    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+        out[0] = '\0';
+    }
+}
+
+static const char *dot_normalize_reason(const char *detail_reason) {
+    if (detail_reason == NULL) {
+        return "unknown";
+    }
+    if (strcmp(detail_reason, "connect_failed") == 0) {
+        return "transport_connect_failed";
+    }
+    if (strcmp(detail_reason, "tls_handshake_failed") == 0 || strcmp(detail_reason, "ssl_new_failed") == 0) {
+        return "tls_handshake_failed";
+    }
+    return detail_reason;
+}
+
+static void log_dot_attempt_failure(
+    const upstream_server_t *server,
+    const char *phase,
+    const char *detail_reason,
+    int used_override_v4,
+    uint32_t override_addr_v4_be,
+    int timeout_ms) {
+    char ip_text[INET_ADDRSTRLEN];
+    ip_text[0] = '\0';
+    if (used_override_v4) {
+        format_ipv4(override_addr_v4_be, ip_text, sizeof(ip_text));
+    }
+    const char *reason = dot_normalize_reason(detail_reason);
+    LOGF_WARN(
+        "DoT %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=%s",
+        phase,
+        server->host,
+        reason,
+        timeout_ms,
+        used_override_v4 ? ip_text : "none",
+        detail_reason != NULL ? detail_reason : "none");
+}
+
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -194,7 +241,11 @@ static int establish_tls_connection(
     int port,
     int timeout_ms,
     int use_bootstrap_v4,
-    uint32_t bootstrap_addr_v4_be) {
+    uint32_t bootstrap_addr_v4_be,
+    const char **reason_out) {
+    if (reason_out != NULL) {
+        *reason_out = "connect_failed";
+    }
     
     /* Close existing connection if any */
     close_connection(conn);
@@ -222,6 +273,9 @@ static int establish_tls_connection(
     /* Create SSL connection */
     conn->ssl = SSL_new(client->ssl_ctx);
     if (conn->ssl == NULL) {
+        if (reason_out != NULL) {
+            *reason_out = "ssl_new_failed";
+        }
         close(conn->fd);
         conn->fd = -1;
         return -1;
@@ -238,6 +292,9 @@ static int establish_tls_connection(
     /* Perform TLS handshake */
     int rc = SSL_connect(conn->ssl);
     if (rc != 1) {
+        if (reason_out != NULL) {
+            *reason_out = "tls_handshake_failed";
+        }
         SSL_free(conn->ssl);
         conn->ssl = NULL;
         close(conn->fd);
@@ -460,8 +517,9 @@ int upstream_dot_resolve(
     if (need_connect) {
         int connected = 0;
         int stage2_used = 0;
+        const char *attempt_reason = NULL;
 
-        if (server->has_stage1_cached_v4 &&
+        if (server->stage.has_stage1_cached_v4 &&
             establish_tls_connection(
                 client,
                 conn,
@@ -469,13 +527,24 @@ int upstream_dot_resolve(
                 server->port,
                 timeout_ms,
                 1,
-                server->stage1_cached_addr_v4_be)
+                server->stage.stage1_cached_addr_v4_be,
+                &attempt_reason)
                 == 0) {
             connected = 1;
+        } else if (server->stage.has_stage1_cached_v4) {
+            log_dot_attempt_failure(
+                server,
+                "stage1 cached IPv4",
+                attempt_reason,
+                1,
+                server->stage.stage1_cached_addr_v4_be,
+                timeout_ms);
         }
 
-        if (!connected && establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0) == 0) {
+        if (!connected && establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0, &attempt_reason) == 0) {
             connected = 1;
+        } else if (!connected) {
+            log_dot_attempt_failure(server, "primary request", attempt_reason, 0, 0, timeout_ms);
         }
 
         if (!connected) {
@@ -484,7 +553,7 @@ int upstream_dot_resolve(
              * but keep TLS hostname checks against server->host for security.
              */
             LOGF_WARN("DoT stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
-            if (!server->has_bootstrap_v4 ||
+            if (!server->stage.has_bootstrap_v4 ||
                 establish_tls_connection(
                     client,
                     conn,
@@ -492,13 +561,20 @@ int upstream_dot_resolve(
                     server->port,
                     timeout_ms,
                     1,
-                    server->bootstrap_addr_v4_be)
+                    server->stage.bootstrap_addr_v4_be,
+                    &attempt_reason)
                     == 0) {
                 connected = 1;
                 stage2_used = 1;
             } else {
-                if (server->has_bootstrap_v4) {
-                    LOGF_WARN("DoT stage2 bootstrap IPv4 failed: host=%s", server->host);
+                if (server->stage.has_bootstrap_v4) {
+                    log_dot_attempt_failure(
+                        server,
+                        "stage2 bootstrap IPv4",
+                        attempt_reason,
+                        1,
+                        server->stage.bootstrap_addr_v4_be,
+                        timeout_ms);
                 }
                 pool_release(client, slot);
                 return -1;

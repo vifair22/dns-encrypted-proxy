@@ -24,6 +24,102 @@ typedef struct {
     size_t cap;
 } buffer_t;
 
+typedef struct {
+    CURLcode curl_rc;
+    long http_status;
+    size_t response_len;
+    int timeout_ms;
+    int used_override_v4;
+    uint32_t override_addr_v4_be;
+} doh_attempt_error_t;
+
+static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
+    if (out == NULL || out_len == 0) {
+        return;
+    }
+    struct in_addr addr;
+    addr.s_addr = addr_v4_be;
+    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+        out[0] = '\0';
+    }
+}
+
+static const char *doh_curl_code_string(CURLcode rc) {
+    switch (rc) {
+        case CURLE_OK:
+            return "ok";
+        case CURLE_COULDNT_RESOLVE_HOST:
+            return "couldnt_resolve_host";
+        case CURLE_COULDNT_CONNECT:
+            return "couldnt_connect";
+        case CURLE_OPERATION_TIMEDOUT:
+            return "operation_timedout";
+        case CURLE_SSL_CONNECT_ERROR:
+            return "ssl_connect_error";
+        case CURLE_PEER_FAILED_VERIFICATION:
+            return "peer_failed_verification";
+        case CURLE_RECV_ERROR:
+            return "recv_error";
+        case CURLE_SEND_ERROR:
+            return "send_error";
+        default:
+            return "other";
+    }
+}
+
+static const char *doh_failure_reason(CURLcode rc, long http_status, size_t response_len) {
+    if (rc == CURLE_OPERATION_TIMEDOUT) {
+        return "timeout";
+    }
+    if (rc == CURLE_COULDNT_RESOLVE_HOST) {
+        return "dns_resolve_failed";
+    }
+    if (rc == CURLE_COULDNT_CONNECT) {
+        return "transport_connect_failed";
+    }
+    if (rc == CURLE_SSL_CONNECT_ERROR || rc == CURLE_PEER_FAILED_VERIFICATION) {
+        return "tls_handshake_failed";
+    }
+    if (rc == CURLE_SEND_ERROR || rc == CURLE_RECV_ERROR) {
+        return "transport_io_failed";
+    }
+    if (rc != CURLE_OK) {
+        return "transport_failed";
+    }
+    if (http_status != 200) {
+        return "upstream_http_status";
+    }
+    if (response_len == 0) {
+        return "empty_response";
+    }
+    return "unknown";
+}
+
+static void log_doh_attempt_failure(const char *phase, const upstream_server_t *server, const doh_attempt_error_t *err) {
+    if (phase == NULL || server == NULL || err == NULL) {
+        return;
+    }
+
+    char ip_text[INET_ADDRSTRLEN];
+    ip_text[0] = '\0';
+    if (err->used_override_v4) {
+        format_ipv4(err->override_addr_v4_be, ip_text, sizeof(ip_text));
+    }
+
+    const char *reason = doh_failure_reason(err->curl_rc, err->http_status, err->response_len);
+    LOGF_WARN(
+        "DoH %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=curl=%d(%s),http=%ld,body_len=%zu",
+        phase,
+        server->host,
+        reason,
+        err->timeout_ms,
+        err->used_override_v4 ? ip_text : "none",
+        (int)err->curl_rc,
+        doh_curl_code_string(err->curl_rc),
+        err->http_status,
+        err->response_len);
+}
+
 struct upstream_doh_client {
     CURL **pool_handles;
     int *pool_in_use;
@@ -183,7 +279,16 @@ static int doh_post_with_handle(
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
-    size_t *response_len_out) {
+    size_t *response_len_out,
+    doh_attempt_error_t *err_out) {
+
+    if (err_out != NULL) {
+        memset(err_out, 0, sizeof(*err_out));
+        err_out->curl_rc = CURLE_OK;
+        err_out->timeout_ms = timeout_ms;
+        err_out->used_override_v4 = use_override_v4;
+        err_out->override_addr_v4_be = override_addr_v4_be;
+    }
     
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/dns-message");
@@ -251,6 +356,12 @@ static int doh_post_with_handle(
     curl_slist_free_all(headers);
     if (resolve != NULL) {
         curl_slist_free_all(resolve);
+    }
+
+    if (err_out != NULL) {
+        err_out->curl_rc = rc;
+        err_out->http_status = status;
+        err_out->response_len = response.len;
     }
 
     /* Empty body is treated as transport failure for resolver semantics. */
@@ -393,6 +504,7 @@ int upstream_doh_resolve(
     
     uint8_t *response = NULL;
     size_t response_len = 0;
+    doh_attempt_error_t attempt_err;
     
     int result = doh_post_with_handle(
         client,
@@ -402,23 +514,32 @@ int upstream_doh_resolve(
         0,
         timeout_ms,
         query, query_len,
-        &response, &response_len);
+        &response, &response_len,
+        &attempt_err);
 
-    if (result != 0 && server->has_stage1_cached_v4) {
+    if (result != 0) {
+        log_doh_attempt_failure("primary request", server, &attempt_err);
+    }
+
+    if (result != 0 && server->stage.has_stage1_cached_v4) {
         result = doh_post_with_handle(
             client,
             curl,
             server,
             1,
-            server->stage1_cached_addr_v4_be,
+            server->stage.stage1_cached_addr_v4_be,
             timeout_ms,
             query,
             query_len,
             &response,
-            &response_len);
+            &response_len,
+            &attempt_err);
+        if (result != 0) {
+            log_doh_attempt_failure("stage1 cached IPv4", server, &attempt_err);
+        }
     }
 
-    if (result != 0 && server->has_bootstrap_v4) {
+    if (result != 0 && server->stage.has_bootstrap_v4) {
         /*
          * Stage 2 fallback: pin host:port to bootstrap IP for this request.
          * We still keep the original hostname for SNI/cert checks.
@@ -432,16 +553,17 @@ int upstream_doh_resolve(
             curl,
             server,
             1,
-            server->bootstrap_addr_v4_be,
+            server->stage.bootstrap_addr_v4_be,
             timeout_ms,
             query,
             query_len,
             &response,
-            &response_len);
+            &response_len,
+            &attempt_err);
         if (result == 0) {
             LOGF_INFO("DoH stage2 bootstrap IPv4 succeeded: host=%s", server->host);
         } else {
-            LOGF_WARN("DoH stage2 bootstrap IPv4 failed: host=%s", server->host);
+            log_doh_attempt_failure("stage2 bootstrap IPv4", server, &attempt_err);
         }
     }
     

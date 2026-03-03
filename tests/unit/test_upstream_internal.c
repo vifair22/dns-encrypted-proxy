@@ -23,6 +23,10 @@ static int g_doq_init_rc = 0;
 static int g_doh_resolve_rc = -1;
 static int g_dot_resolve_rc = -1;
 static int g_doq_resolve_rc = -1;
+static int g_stage2_rc = -1;
+static int g_stage3_rc = -1;
+static const char *g_stage2_reason = "stub_stage2_failed";
+static const char *g_stage3_reason = "stub_stage3_failed";
 static uint8_t g_resp_buf[16];
 static size_t g_resp_len = 0;
 static int g_doh_destroy_calls = 0;
@@ -49,6 +53,10 @@ static void reset_stubs(void) {
     g_doh_resolve_rc = -1;
     g_dot_resolve_rc = -1;
     g_doq_resolve_rc = -1;
+    g_stage2_rc = -1;
+    g_stage3_rc = -1;
+    g_stage2_reason = "stub_stage2_failed";
+    g_stage3_reason = "stub_stage3_failed";
     g_resp_len = 0;
     g_doh_destroy_calls = 0;
     g_dot_destroy_calls = 0;
@@ -248,17 +256,23 @@ int iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_
     return -1;
 }
 
-int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms) {
+int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms, const char **reason_out) {
     (void)server;
     (void)timeout_ms;
-    return -1;
+    if (reason_out != NULL) {
+        *reason_out = g_stage3_reason;
+    }
+    return g_stage3_rc;
 }
 
-int upstream_bootstrap_try_stage2(upstream_client_t *client, upstream_server_t *server, int timeout_ms) {
+int upstream_bootstrap_try_stage2(upstream_client_t *client, upstream_server_t *server, int timeout_ms, const char **reason_out) {
     (void)client;
     (void)server;
     (void)timeout_ms;
-    return -1;
+    if (reason_out != NULL) {
+        *reason_out = g_stage2_reason;
+    }
+    return g_stage2_rc;
 }
 
 int upstream_bootstrap_stage1_hydrate(upstream_client_t *client, upstream_server_t *server, int timeout_ms) {
@@ -455,6 +469,146 @@ static void test_upstream_parse_and_stats_edges(void **state) {
 #endif
 }
 
+static void test_upstream_stage_metrics_matrix(void **state) {
+    (void)state;
+
+    typedef struct {
+        const char *name;
+        int iterative_enabled;
+        int stage2_rc;
+        const char *stage2_reason;
+        int stage3_rc;
+        const char *stage3_reason;
+        uint64_t exp_s2_attempts;
+        uint64_t exp_s2_successes;
+        uint64_t exp_s2_failures;
+        uint64_t exp_s2_cooldowns;
+        uint64_t exp_s2_reason_dns;
+        uint64_t exp_s2_reason_transport;
+        uint64_t exp_s2_reason_cooldown;
+        uint64_t exp_s3_attempts;
+        uint64_t exp_s3_successes;
+        uint64_t exp_s3_failures;
+        uint64_t exp_s3_cooldowns;
+        uint64_t exp_s3_reason_transport;
+        uint64_t exp_s3_reason_cooldown;
+    } stage_case_t;
+
+    const stage_case_t cases[] = {
+        {
+            .name = "s2 cooldown and s3 cooldown",
+            .iterative_enabled = 1,
+            .stage2_rc = -1,
+            .stage2_reason = "cooldown",
+            .stage3_rc = -1,
+            .stage3_reason = "cooldown",
+            .exp_s2_attempts = 1,
+            .exp_s2_successes = 0,
+            .exp_s2_failures = 1,
+            .exp_s2_cooldowns = 1,
+            .exp_s2_reason_dns = 0,
+            .exp_s2_reason_transport = 0,
+            .exp_s2_reason_cooldown = 1,
+            .exp_s3_attempts = 1,
+            .exp_s3_successes = 0,
+            .exp_s3_failures = 1,
+            .exp_s3_cooldowns = 1,
+            .exp_s3_reason_transport = 0,
+            .exp_s3_reason_cooldown = 1,
+        },
+        {
+            .name = "s2 success but retry transport failure",
+            .iterative_enabled = 0,
+            .stage2_rc = 0,
+            .stage2_reason = "ok",
+            .stage3_rc = -1,
+            .stage3_reason = "cooldown",
+            .exp_s2_attempts = 1,
+            .exp_s2_successes = 1,
+            .exp_s2_failures = 1,
+            .exp_s2_cooldowns = 0,
+            .exp_s2_reason_dns = 0,
+            .exp_s2_reason_transport = 1,
+            .exp_s2_reason_cooldown = 0,
+            .exp_s3_attempts = 0,
+            .exp_s3_successes = 0,
+            .exp_s3_failures = 0,
+            .exp_s3_cooldowns = 0,
+            .exp_s3_reason_transport = 0,
+            .exp_s3_reason_cooldown = 0,
+        },
+        {
+            .name = "s2 dns failure then s3 retry transport failure",
+            .iterative_enabled = 1,
+            .stage2_rc = -1,
+            .stage2_reason = "dns_rcode_nonzero",
+            .stage3_rc = 0,
+            .stage3_reason = "ok",
+            .exp_s2_attempts = 1,
+            .exp_s2_successes = 0,
+            .exp_s2_failures = 1,
+            .exp_s2_cooldowns = 0,
+            .exp_s2_reason_dns = 1,
+            .exp_s2_reason_transport = 0,
+            .exp_s2_reason_cooldown = 0,
+            .exp_s3_attempts = 1,
+            .exp_s3_successes = 1,
+            .exp_s3_failures = 1,
+            .exp_s3_cooldowns = 0,
+            .exp_s3_reason_transport = 1,
+            .exp_s3_reason_cooldown = 0,
+        },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        reset_stubs();
+        g_doh_resolve_rc = -1;
+        g_dot_resolve_rc = -1;
+        g_doq_resolve_rc = -1;
+        g_stage2_rc = cases[i].stage2_rc;
+        g_stage2_reason = cases[i].stage2_reason;
+        g_stage3_rc = cases[i].stage3_rc;
+        g_stage3_reason = cases[i].stage3_reason;
+
+        upstream_config_t cfg = {
+            .timeout_ms = 50,
+            .pool_size = 1,
+            .max_failures_before_unhealthy = 10,
+            .unhealthy_backoff_ms = 1000,
+            .iterative_bootstrap_enabled = cases[i].iterative_enabled,
+        };
+        const char *urls[] = {PRIMARY_TEST_URL};
+        upstream_client_t client;
+        assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+        uint8_t q[] = {0x01, 0x00};
+        uint8_t *out = NULL;
+        size_t out_len = 0;
+        assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, &out_len), -1);
+        free(out);
+
+        upstream_runtime_stats_t stats;
+        assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+
+        assert_int_equal(stats.stage2_attempts, cases[i].exp_s2_attempts);
+        assert_int_equal(stats.stage2_successes, cases[i].exp_s2_successes);
+        assert_int_equal(stats.stage2_failures, cases[i].exp_s2_failures);
+        assert_int_equal(stats.stage2_cooldowns, cases[i].exp_s2_cooldowns);
+        assert_int_equal(stats.stage2_reason_dns, cases[i].exp_s2_reason_dns);
+        assert_int_equal(stats.stage2_reason_transport, cases[i].exp_s2_reason_transport);
+        assert_int_equal(stats.stage2_reason_cooldown, cases[i].exp_s2_reason_cooldown);
+
+        assert_int_equal(stats.stage3_attempts, cases[i].exp_s3_attempts);
+        assert_int_equal(stats.stage3_successes, cases[i].exp_s3_successes);
+        assert_int_equal(stats.stage3_failures, cases[i].exp_s3_failures);
+        assert_int_equal(stats.stage3_cooldowns, cases[i].exp_s3_cooldowns);
+        assert_int_equal(stats.stage3_reason_transport, cases[i].exp_s3_reason_transport);
+        assert_int_equal(stats.stage3_reason_cooldown, cases[i].exp_s3_reason_cooldown);
+
+        upstream_client_destroy(&client);
+    }
+}
+
 static void test_upstream_guard_and_limit_edges(void **state) {
     (void)state;
     reset_stubs();
@@ -505,6 +659,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_resolve_last_resort_unhealthy),
         cmocka_unit_test(test_upstream_internal_init_and_switch_edges),
         cmocka_unit_test(test_upstream_parse_and_stats_edges),
+        cmocka_unit_test(test_upstream_stage_metrics_matrix),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
     };
 
