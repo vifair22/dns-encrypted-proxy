@@ -694,9 +694,13 @@ static void *udp_loop(void *arg) {
     socket_loop_ctx_t *ctx = (socket_loop_ctx_t *)arg;
     proxy_server_t *server = ctx->server;
     int fd = ctx->fd;
+    const char *exit_reason = "stop_requested";
+
+    LOGF_INFO("UDP loop thread started");
 
     uint8_t *buffer = (uint8_t *)malloc(DNS_MAX_MESSAGE_SIZE);
     if (buffer == NULL) {
+        LOGF_ERROR("UDP loop failed to allocate receive buffer");
         return NULL;
     }
 
@@ -710,12 +714,14 @@ static void *udp_loop(void *arg) {
             if (errno == EINTR) {
                 continue;
             }
+            exit_reason = "poll_error";
             break;
         }
         if (poll_rc == 0) {
             continue;
         }
         if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            exit_reason = "poll_revents_error";
             break;
         }
         if ((pfd.revents & POLLIN) == 0) {
@@ -772,6 +778,11 @@ static void *udp_loop(void *arg) {
     }
 
     free(buffer);
+    if (strcmp(exit_reason, "stop_requested") == 0) {
+        LOGF_INFO("UDP loop thread stopped");
+    } else {
+        LOGF_ERROR("UDP loop thread exiting due to %s", exit_reason);
+    }
     return NULL;
 }
 
@@ -919,6 +930,9 @@ static void *tcp_accept_loop(void *arg) {
     proxy_server_t *server = ctx->server;
     int fd = ctx->fd;
     int max_clients = server->config.tcp_max_clients;
+    const char *exit_reason = "stop_requested";
+
+    LOGF_INFO("TCP accept loop thread started");
 
     while (!should_stop(server)) {
         struct pollfd pfd = {0};
@@ -930,12 +944,14 @@ static void *tcp_accept_loop(void *arg) {
             if (errno == EINTR) {
                 continue;
             }
+            exit_reason = "poll_error";
             break;
         }
         if (poll_rc == 0) {
             continue;
         }
         if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            exit_reason = "poll_revents_error";
             break;
         }
         if ((pfd.revents & POLLIN) == 0) {
@@ -982,6 +998,7 @@ static void *tcp_accept_loop(void *arg) {
 
         pthread_t thread;
         if (pthread_create(&thread, NULL, tcp_client_loop, client_ctx) != 0) {
+            LOGF_ERROR("Failed to create TCP client thread");
             close(client_fd);
             atomic_fetch_sub(&server->active_tcp_clients, 1);
             atomic_fetch_sub(&server->metrics.tcp_connections_active, 1);
@@ -989,6 +1006,12 @@ static void *tcp_accept_loop(void *arg) {
             continue;
         }
         pthread_detach(thread);
+    }
+
+    if (strcmp(exit_reason, "stop_requested") == 0) {
+        LOGF_INFO("TCP accept loop thread stopped");
+    } else {
+        LOGF_ERROR("TCP accept loop thread exiting due to %s", exit_reason);
     }
 
     return NULL;
@@ -1067,13 +1090,13 @@ int proxy_server_run(proxy_server_t *server) {
 
     int udp_fd = create_udp_socket(&server->config);
     if (udp_fd < 0) {
-        fprintf(stderr, "Failed to create/bind UDP socket on %s:%d\n", server->config.listen_addr, server->config.listen_port);
+        LOGF_ERROR("Failed to create/bind UDP socket on %s:%d", server->config.listen_addr, server->config.listen_port);
         return -1;
     }
 
     int tcp_fd = create_tcp_socket(&server->config);
     if (tcp_fd < 0) {
-        fprintf(stderr, "Failed to create/bind TCP socket on %s:%d\n", server->config.listen_addr, server->config.listen_port);
+        LOGF_ERROR("Failed to create/bind TCP socket on %s:%d", server->config.listen_addr, server->config.listen_port);
         close(udp_fd);
         return -1;
     }
@@ -1089,12 +1112,14 @@ int proxy_server_run(proxy_server_t *server) {
      * guarantee sockets and worker lifecycle are fully drained on shutdown.
      */
     if (pthread_create(&udp_thread, NULL, udp_loop, &udp_ctx) != 0) {
+        LOGF_ERROR("Failed to create UDP loop thread");
         close(udp_fd);
         close(tcp_fd);
         return -1;
     }
 
     if (pthread_create(&tcp_thread, NULL, tcp_accept_loop, &tcp_ctx) != 0) {
+        LOGF_ERROR("Failed to create TCP accept loop thread");
         close(udp_fd);
         close(tcp_fd);
         pthread_join(udp_thread, NULL);
@@ -1106,6 +1131,8 @@ int proxy_server_run(proxy_server_t *server) {
 
     close(udp_fd);
     close(tcp_fd);
+
+    LOGF_INFO("Proxy server shutdown complete");
 
     return 0;
 }

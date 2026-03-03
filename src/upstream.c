@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "logger.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -79,6 +80,19 @@ static int upstream_iterative_bootstrap_stub(upstream_server_t *server) {
     }
     server->iterative_stub_done = 1;
     return -1;
+}
+
+static const char *upstream_type_name(upstream_type_t type) {
+    switch (type) {
+        case UPSTREAM_TYPE_DOH:
+            return "doh";
+        case UPSTREAM_TYPE_DOT:
+            return "dot";
+        case UPSTREAM_TYPE_DOQ:
+            return "doq";
+        default:
+            return "unknown";
+    }
 }
 
 #if UPSTREAM_DOT_ENABLED || UPSTREAM_DOQ_ENABLED
@@ -289,17 +303,29 @@ void upstream_server_record_success(upstream_server_t *server) {
     if (server == NULL) {
         return;
     }
+
+    int was_unhealthy = !server->health.healthy;
     
     server->health.healthy = 1;
     server->health.consecutive_failures = 0;
     server->health.last_success_time = now_ms();
     server->health.total_queries++;
+
+    if (was_unhealthy) {
+        LOGF_INFO(
+            "Upstream recovered: host=%s type=%s total_failures=%llu",
+            server->host,
+            upstream_type_name(server->type),
+            (unsigned long long)server->health.total_failures);
+    }
 }
 
 void upstream_server_record_failure(upstream_server_t *server, const upstream_config_t *config) {
     if (server == NULL || config == NULL) {
         return;
     }
+
+    int was_healthy = server->health.healthy;
     
     server->health.consecutive_failures++;
     server->health.last_failure_time = now_ms();
@@ -308,6 +334,15 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
     
     if (server->health.consecutive_failures >= (uint32_t)config->max_failures_before_unhealthy) {
         server->health.healthy = 0;
+    }
+
+    if (was_healthy && !server->health.healthy) {
+        LOGF_WARN(
+            "Upstream marked unhealthy: host=%s type=%s consecutive_failures=%u backoff_ms=%d",
+            server->host,
+            upstream_type_name(server->type),
+            server->health.consecutive_failures,
+            config->unhealthy_backoff_ms);
     }
 }
 
@@ -531,6 +566,8 @@ int upstream_resolve(
         
         uint8_t *response = NULL;
         size_t response_len = 0;
+
+        LOGF_INFO("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
         
         if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
             upstream_server_record_success(server);
@@ -539,7 +576,14 @@ int upstream_resolve(
             return 0;
         }
 
+        LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
+
         if (client->config.iterative_bootstrap_enabled && !server->iterative_stub_done) {
+            if (server->has_bootstrap_v4) {
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s after stage2 bootstrap failure", server->host);
+            } else {
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s stage2 bootstrap unavailable/disabled", server->host);
+            }
             (void)upstream_iterative_bootstrap_stub(server);
         }
 
@@ -561,6 +605,8 @@ int upstream_resolve(
         
         uint8_t *response = NULL;
         size_t response_len = 0;
+
+        LOGF_INFO("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
         
         if (resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
             upstream_server_record_success(server);
@@ -569,7 +615,14 @@ int upstream_resolve(
             return 0;
         }
 
+        LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
+
         if (client->config.iterative_bootstrap_enabled && !server->iterative_stub_done) {
+            if (server->has_bootstrap_v4) {
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s after stage2 bootstrap failure", server->host);
+            } else {
+                LOGF_WARN("Upstream fallback stage3 iterative bootstrap (stub): host=%s stage2 bootstrap unavailable/disabled", server->host);
+            }
             (void)upstream_iterative_bootstrap_stub(server);
         }
 

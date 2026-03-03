@@ -2,6 +2,7 @@
 
 #include "upstream.h"
 #include "dns_message.h"
+#include "logger.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -458,6 +459,7 @@ int upstream_dot_resolve(
     
     if (need_connect) {
         if (establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0) != 0) {
+            LOGF_WARN("DoT stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
             if (!server->has_bootstrap_v4 ||
                 establish_tls_connection(
                     client,
@@ -468,9 +470,13 @@ int upstream_dot_resolve(
                     1,
                     server->bootstrap_addr_v4_be)
                     != 0) {
+                if (server->has_bootstrap_v4) {
+                    LOGF_WARN("DoT stage2 bootstrap IPv4 failed: host=%s", server->host);
+                }
                 pool_release(client, slot);
                 return -1;
             }
+            LOGF_INFO("DoT stage2 bootstrap IPv4 succeeded: host=%s", server->host);
         }
     }
     

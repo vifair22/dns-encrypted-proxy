@@ -1,5 +1,6 @@
 #include "upstream.h"
 #include "dns_message.h"
+#include "logger.h"
 
 #include <curl/curl.h>
 
@@ -402,6 +403,7 @@ int upstream_doh_resolve(
         &response, &response_len);
 
     if (result != 0 && server->has_bootstrap_v4) {
+        LOGF_WARN("DoH stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
         result = doh_post_with_handle(
             client,
             curl,
@@ -412,6 +414,11 @@ int upstream_doh_resolve(
             query_len,
             &response,
             &response_len);
+        if (result == 0) {
+            LOGF_INFO("DoH stage2 bootstrap IPv4 succeeded: host=%s", server->host);
+        } else {
+            LOGF_WARN("DoH stage2 bootstrap IPv4 failed: host=%s", server->host);
+        }
     }
     
     pool_release(client, slot);

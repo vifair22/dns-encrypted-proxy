@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    config_print(&config, stdout);
+    LOGF_INFO("Loaded configuration from %s", config.config_path);
     LOGF_INFO("Starting DNS listener on %s:%d (UDP+TCP)", config.listen_addr, config.listen_port);
 
     proxy_server_t server;

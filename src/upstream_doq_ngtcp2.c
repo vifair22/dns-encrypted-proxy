@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "logger.h"
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -861,6 +862,7 @@ int upstream_doq_ngtcp2_resolve(
     }
 
     if (result != 0 && server->has_bootstrap_v4) {
+        LOGF_WARN("DoQ stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
         uint64_t now = now_ns();
         if (now < overall_deadline) {
             int remaining_ms = (int)((overall_deadline - now) / 1000000ULL);
@@ -893,6 +895,11 @@ int upstream_doq_ngtcp2_resolve(
                     response_out,
                     response_len_out);
                 close(fd);
+                if (result == 0) {
+                    LOGF_INFO("DoQ stage2 bootstrap IPv4 succeeded: host=%s", server->host);
+                } else {
+                    LOGF_WARN("DoQ stage2 bootstrap IPv4 failed: host=%s", server->host);
+                }
             }
         }
     }
