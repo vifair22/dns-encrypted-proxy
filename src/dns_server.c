@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,6 +31,30 @@ typedef struct {
     int client_fd;
     int query_count;
 } tcp_client_ctx_t;
+
+static void record_internal_error_impl(const char *func, proxy_server_t *server, const char *reason, const char *fmt, ...) {
+    if (server != NULL) {
+        atomic_fetch_add(&server->metrics.internal_errors_total, 1);
+    }
+
+    if (func == NULL || reason == NULL || fmt == NULL) {
+        return;
+    }
+
+    char detail[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(detail, sizeof(detail), fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        logger_logf(func, "ERROR", "Internal error [%s]", reason);
+        return;
+    }
+    logger_logf(func, "ERROR", "Internal error [%s]: %s", reason, detail);
+}
+
+#define RECORD_INTERNAL_ERROR(server, reason, fmt, ...) \
+    record_internal_error_impl(__func__, (server), (reason), (fmt), ##__VA_ARGS__)
 
 static int should_stop(const proxy_server_t *server) {
     return server->stop_flag != NULL && *server->stop_flag != 0;
@@ -628,8 +653,11 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     atomic_fetch_add(&server->metrics.upstream_failures, 1);
     atomic_fetch_add(&server->metrics.servfail_sent, 1);
-
-    return build_servfail_response(query, query_len, response_out, response_len_out);
+    if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
+        RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "query_len=%zu", query_len);
+        return -1;
+    }
+    return 0;
 }
 
 static int create_udp_socket(const proxy_config_t *config) {
@@ -736,11 +764,15 @@ static void *udp_loop(void *arg) {
         if (n <= 0) {
             continue;
         }
+        if (n < 12) {
+            continue;
+        }
         atomic_fetch_add(&server->metrics.queries_udp, 1);
 
         uint8_t *response = NULL;
         size_t response_len = 0;
         if (process_query(server, buffer, (size_t)n, &response, &response_len) != 0) {
+            RECORD_INTERNAL_ERROR(server, "process_query_failed", "udp_query_len=%zd", n);
             continue;
         }
 
@@ -765,6 +797,7 @@ static void *udp_loop(void *arg) {
                     response = NULL;
                     response_len = 0;
                     if (build_servfail_response(buffer, (size_t)n, &response, &response_len) != 0) {
+                        RECORD_INTERNAL_ERROR(server, "truncation_and_servfail_build_failed", "udp_limit=%zu response_len=%zu", udp_limit, response_len);
                         continue;
                     }
                     atomic_fetch_add(&server->metrics.servfail_sent, 1);
@@ -895,6 +928,7 @@ static void *tcp_client_loop(void *arg) {
         uint8_t *response = NULL;
         size_t response_len = 0;
         if (process_query(server, query, message_len, &response, &response_len) != 0) {
+            RECORD_INTERNAL_ERROR(server, "process_query_failed", "tcp_query_len=%u", (unsigned int)message_len);
             free(query);
             break;
         }

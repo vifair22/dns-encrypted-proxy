@@ -17,6 +17,8 @@ static proxy_metrics_t *g_metrics = NULL;
 static dns_cache_t *g_cache = NULL;
 static upstream_client_t *g_upstream = NULL;
 static uint64_t g_start_monotonic_ms = 0;
+static uint64_t g_prev_process_cpu_wall_ms = 0;
+static double g_prev_process_cpu_seconds = 0.0;
 static atomic_int g_stop = 0;
 static pthread_t g_thread;
 static int g_thread_started = 0;
@@ -28,6 +30,102 @@ static uint64_t now_monotonic_ms(void) {
         return 0;
     }
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int read_process_cpu_seconds(double *cpu_seconds_out) {
+    if (cpu_seconds_out == NULL) {
+        return -1;
+    }
+
+    FILE *fp = fopen("/proc/self/stat", "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    char line[4096];
+    if (fgets(line, sizeof(line), fp) == NULL) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+
+    char *rparen = strrchr(line, ')');
+    if (rparen == NULL || rparen[1] == '\0') {
+        return -1;
+    }
+
+    char *cursor = rparen + 2;
+    int field = 3;
+    uint64_t utime_ticks = 0;
+    uint64_t stime_ticks = 0;
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+
+        char *end = cursor;
+        while (*end != '\0' && *end != ' ') {
+            end++;
+        }
+
+        if (field == 14 || field == 15) {
+            char saved = *end;
+            *end = '\0';
+            unsigned long long ticks = strtoull(cursor, NULL, 10);
+            *end = saved;
+            if (field == 14) {
+                utime_ticks = (uint64_t)ticks;
+            } else {
+                stime_ticks = (uint64_t)ticks;
+                break;
+            }
+        }
+
+        if (*end == '\0') {
+            break;
+        }
+        cursor = end + 1;
+        field++;
+    }
+
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) {
+        return -1;
+    }
+
+    *cpu_seconds_out = (double)(utime_ticks + stime_ticks) / (double)hz;
+    return 0;
+}
+
+static int read_process_rss_bytes(uint64_t *rss_bytes_out) {
+    if (rss_bytes_out == NULL) {
+        return -1;
+    }
+
+    FILE *fp = fopen("/proc/self/statm", "r");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    unsigned long total_pages = 0;
+    unsigned long rss_pages = 0;
+    int rc = fscanf(fp, "%lu %lu", &total_pages, &rss_pages);
+    fclose(fp);
+    if (rc != 2) {
+        return -1;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return -1;
+    }
+
+    *rss_bytes_out = (uint64_t)rss_pages * (uint64_t)page_size;
+    return 0;
 }
 
 static int write_all(int fd, const char *buf, size_t len) {
@@ -208,6 +306,26 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
         uptime_seconds = (double)(now_ms - g_start_monotonic_ms) / 1000.0;
     }
 
+    double process_cpu_percent = 0.0;
+    double process_cpu_seconds = 0.0;
+    if (read_process_cpu_seconds(&process_cpu_seconds) == 0) {
+        if (g_prev_process_cpu_wall_ms > 0 && now_ms > g_prev_process_cpu_wall_ms && process_cpu_seconds >= g_prev_process_cpu_seconds) {
+            double wall_seconds = (double)(now_ms - g_prev_process_cpu_wall_ms) / 1000.0;
+            double cpu_delta = process_cpu_seconds - g_prev_process_cpu_seconds;
+            if (wall_seconds > 0.0) {
+                process_cpu_percent = (cpu_delta / wall_seconds) * 100.0;
+                if (process_cpu_percent < 0.0) {
+                    process_cpu_percent = 0.0;
+                }
+            }
+        }
+        g_prev_process_cpu_seconds = process_cpu_seconds;
+        g_prev_process_cpu_wall_ms = now_ms;
+    }
+
+    uint64_t process_rss_bytes = 0;
+    (void)read_process_rss_bytes(&process_rss_bytes);
+
     uint64_t rcode_other = 0;
     for (size_t i = 0; i < 16; i++) {
         if (i == 0 || i == 2 || i == 3 || i == 5) {
@@ -240,6 +358,12 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "# HELP dns_encrypted_proxy_uptime_seconds Process uptime in seconds.\n"
             "# TYPE dns_encrypted_proxy_uptime_seconds gauge\n"
             "dns_encrypted_proxy_uptime_seconds %.3f\n"
+            "# HELP dns_encrypted_proxy_process_cpu_percent Process CPU usage percentage over last metrics scrape interval.\n"
+            "# TYPE dns_encrypted_proxy_process_cpu_percent gauge\n"
+            "dns_encrypted_proxy_process_cpu_percent %.3f\n"
+            "# HELP dns_encrypted_proxy_process_memory_rss_bytes Process resident memory usage in bytes.\n"
+            "# TYPE dns_encrypted_proxy_process_memory_rss_bytes gauge\n"
+            "dns_encrypted_proxy_process_memory_rss_bytes %llu\n"
             "# HELP dns_encrypted_proxy_queries_udp_total Total number of DNS queries received over UDP.\n"
             "# TYPE dns_encrypted_proxy_queries_udp_total counter\n"
             "dns_encrypted_proxy_queries_udp_total %llu\n"
@@ -261,6 +385,9 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "# HELP dns_encrypted_proxy_servfail_sent_total Total number of SERVFAIL responses sent by the proxy.\n"
             "# TYPE dns_encrypted_proxy_servfail_sent_total counter\n"
             "dns_encrypted_proxy_servfail_sent_total %llu\n"
+            "# HELP dns_encrypted_proxy_internal_errors_total Total number of internal proxy errors detected while processing requests.\n"
+            "# TYPE dns_encrypted_proxy_internal_errors_total counter\n"
+            "dns_encrypted_proxy_internal_errors_total %llu\n"
             "# HELP dns_encrypted_proxy_truncated_sent_total Total number of truncated UDP responses sent.\n"
             "# TYPE dns_encrypted_proxy_truncated_sent_total counter\n"
             "dns_encrypted_proxy_truncated_sent_total %llu\n"
@@ -284,6 +411,8 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "dns_encrypted_proxy_responses_rcode_total{rcode=\"REFUSED\"} %llu\n"
             "dns_encrypted_proxy_responses_rcode_total{rcode=\"OTHER\"} %llu\n",
             uptime_seconds,
+            process_cpu_percent,
+            (unsigned long long)process_rss_bytes,
             (unsigned long long)atomic_load(&m->queries_udp),
             (unsigned long long)atomic_load(&m->queries_tcp),
             (unsigned long long)atomic_load(&m->cache_hits),
@@ -291,6 +420,7 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)atomic_load(&m->upstream_success),
             (unsigned long long)atomic_load(&m->upstream_failures),
             (unsigned long long)atomic_load(&m->servfail_sent),
+            (unsigned long long)atomic_load(&m->internal_errors_total),
             (unsigned long long)atomic_load(&m->truncated_sent),
             (unsigned long long)atomic_load(&m->tcp_connections_total),
             (unsigned long long)atomic_load(&m->tcp_connections_rejected),
@@ -558,6 +688,7 @@ void metrics_init(proxy_metrics_t *m) {
     atomic_store(&m->upstream_success, 0);
     atomic_store(&m->upstream_failures, 0);
     atomic_store(&m->servfail_sent, 0);
+    atomic_store(&m->internal_errors_total, 0);
     atomic_store(&m->truncated_sent, 0);
     atomic_store(&m->tcp_connections_total, 0);
     atomic_store(&m->tcp_connections_rejected, 0);
@@ -605,6 +736,8 @@ int metrics_server_start(proxy_metrics_t *m, dns_cache_t *cache, upstream_client
     g_cache = cache;
     g_upstream = upstream;
     g_start_monotonic_ms = now_monotonic_ms();
+    g_prev_process_cpu_wall_ms = 0;
+    g_prev_process_cpu_seconds = 0.0;
     g_listen_fd = fd;
     atomic_store(&g_stop, 0);
 
@@ -640,4 +773,6 @@ void metrics_server_stop(void) {
     g_cache = NULL;
     g_upstream = NULL;
     g_start_monotonic_ms = 0;
+    g_prev_process_cpu_wall_ms = 0;
+    g_prev_process_cpu_seconds = 0.0;
 }

@@ -1479,7 +1479,7 @@ static void test_dns_server_udp_loop_poll_and_process_fail_paths(void **state) {
     g_wrap_recvfrom_data_len = sizeof(short_query);
 
     assert_ptr_equal(udp_loop(&ctx), NULL);
-    assert_true((uint64_t)atomic_load(&server.metrics.queries_udp) >= 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.queries_udp), 0);
 }
 
 static void test_hosts_override_edns_and_parser_edges(void **state) {

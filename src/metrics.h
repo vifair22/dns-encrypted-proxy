@@ -15,6 +15,7 @@ typedef struct {
     atomic_uint_fast64_t upstream_success;
     atomic_uint_fast64_t upstream_failures;
     atomic_uint_fast64_t servfail_sent;
+    atomic_uint_fast64_t internal_errors_total;
     atomic_uint_fast64_t truncated_sent;
     atomic_uint_fast64_t tcp_connections_total;
     atomic_uint_fast64_t tcp_connections_rejected;
