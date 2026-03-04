@@ -104,6 +104,9 @@ typedef struct {
 typedef struct {
     int timeout_ms;                  /* Per-query timeout */
     int pool_size;                   /* Connection pool size per protocol */
+    int max_inflight_doh;            /* Per-member inflight limit for DoH */
+    int max_inflight_dot;            /* Per-member inflight limit for DoT */
+    int max_inflight_doq;            /* Per-member inflight limit for DoQ */
     int max_failures_before_unhealthy;  /* Mark unhealthy after N consecutive failures */
     int unhealthy_backoff_ms;        /* Wait time before retrying unhealthy server */
     int iterative_bootstrap_enabled; /* Placeholder for future iterative bootstrap resolver */
@@ -130,10 +133,7 @@ typedef struct {
     upstream_dot_client_t *dot_client;
     upstream_doq_client_t *doq_client;
     
-    /* Round-robin state */
-    pthread_mutex_t rr_mutex;
     pthread_mutex_t stage1_cache_mutex;
-    uint64_t next_index;
 
     int bootstrap_resolver_count;
     char bootstrap_resolvers[UPSTREAM_MAX_BOOTSTRAP_RESOLVERS][64];
@@ -205,23 +205,19 @@ int upstream_client_init(
  */
 void upstream_client_destroy(upstream_client_t *client);
 
-/*
- * Resolve a DNS query through upstream servers
- * 
- * Tries servers in order (round-robin start), failing over on error.
- * Respects health status and backoff policies.
- * 
- * @param client          Initialized client
- * @param query           DNS query wire format
- * @param query_len       Length of query
- * @param response_out    Output: allocated response buffer (caller frees)
- * @param response_len_out Output: length of response
- * @return 0 on success, -1 on error (all servers failed)
- */
-int upstream_resolve(
+int upstream_resolve_on_server(
     upstream_client_t *client,
+    int server_index,
     const uint8_t *query,
     size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out);
+int upstream_resolve_on_server_with_deadline(
+    upstream_client_t *client,
+    int server_index,
+    const uint8_t *query,
+    size_t query_len,
+    uint64_t deadline_ms,
     uint8_t **response_out,
     size_t *response_len_out);
 
@@ -256,5 +252,6 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
 
 int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats_t *stats_out);
 int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *host, uint32_t addr_v4_be);
+int upstream_is_ready(const upstream_client_t *client);
 
 #endif /* UPSTREAM_H */

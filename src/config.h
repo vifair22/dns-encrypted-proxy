@@ -21,6 +21,9 @@ typedef struct {
     int listen_port;
     int upstream_timeout_ms;
     int upstream_pool_size;
+    int max_inflight_doh;
+    int max_inflight_dot;
+    int max_inflight_doq;
     int cache_capacity;
     char upstream_urls[MAX_UPSTREAMS][MAX_URL_LEN];
     int upstream_count;

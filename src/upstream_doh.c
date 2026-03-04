@@ -121,9 +121,11 @@ static upstream_failure_class_t doh_failure_class(CURLcode rc, long http_status,
     if (strcmp(reason, "transport_connect_failed") == 0 ||
         strcmp(reason, "transport_io_failed") == 0 ||
         strcmp(reason, "transport_failed") == 0 ||
-        strcmp(reason, "upstream_http_status") == 0 ||
         strcmp(reason, "empty_response") == 0) {
         return UPSTREAM_FAILURE_CLASS_TRANSPORT;
+    }
+    if (strcmp(reason, "upstream_http_status") == 0) {
+        return UPSTREAM_FAILURE_CLASS_UNKNOWN;
     }
     return UPSTREAM_FAILURE_CLASS_UNKNOWN;
 }

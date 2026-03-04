@@ -48,6 +48,23 @@ static int g_doq_destroy_calls = 0;
 #define PRIMARY_TYPE UPSTREAM_TYPE_DOQ
 #endif
 
+static int resolve_any_server(
+    upstream_client_t *client,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    if (client == NULL || query == NULL || query_len == 0 || response_out == NULL || response_len_out == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < client->server_count; i++) {
+        if (upstream_resolve_on_server(client, i, query, query_len, response_out, response_len_out) == 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static void reset_stubs(void) {
     g_mutex_init_fail = 0;
     g_now_ms = 0;
@@ -378,7 +395,7 @@ static void test_upstream_resolve_last_resort_unhealthy(void **state) {
     uint8_t q[] = {0xAA};
     uint8_t *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, &out_len), 0);
+    assert_int_equal(resolve_any_server(&client, q, sizeof(q), &out, &out_len), 0);
     assert_non_null(out);
     assert_int_equal((int)out_len, 4);
     free(out);
@@ -412,24 +429,24 @@ static void test_upstream_internal_init_and_switch_edges(void **state) {
     uint8_t q[] = {0x01};
     uint8_t *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
 
 #if UPSTREAM_DOH_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOH;
     g_doh_init_rc = -1;
-    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
 #endif
 
 #if UPSTREAM_DOT_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOT;
     g_dot_init_rc = -1;
-    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
 #endif
 
 #if UPSTREAM_DOQ_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOQ;
     g_doq_init_rc = -1;
-    assert_int_equal(resolve_with_server(&client, &bad_server, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
 #endif
 
     upstream_client_destroy(&client);
@@ -599,7 +616,7 @@ static void test_upstream_stage_metrics_matrix(void **state) {
         uint8_t q[] = {0x01, 0x00};
         uint8_t *out = NULL;
         size_t out_len = 0;
-        assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, &out_len), -1);
+        assert_int_equal(resolve_any_server(&client, q, sizeof(q), &out, &out_len), -1);
         free(out);
 
         upstream_runtime_stats_t stats;
@@ -651,7 +668,7 @@ static void test_upstream_transport_timeout_skips_stage_traversal(void **state) 
     uint8_t q[] = {0x12, 0x34};
     uint8_t *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_any_server(&client, q, sizeof(q), &out, &out_len), -1);
     free(out);
 
     assert_int_equal(g_stage2_calls, 0);
@@ -700,14 +717,35 @@ static void test_upstream_guard_and_limit_edges(void **state) {
     uint8_t q[] = {0x01};
     uint8_t *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(upstream_resolve(NULL, q, sizeof(q), &out, &out_len), -1);
-    assert_int_equal(upstream_resolve(&client, NULL, sizeof(q), &out, &out_len), -1);
-    assert_int_equal(upstream_resolve(&client, q, 0, &out, &out_len), -1);
-    assert_int_equal(upstream_resolve(&client, q, sizeof(q), NULL, &out_len), -1);
-    assert_int_equal(upstream_resolve(&client, q, sizeof(q), &out, NULL), -1);
+    assert_int_equal(resolve_any_server(NULL, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_any_server(&client, NULL, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_any_server(&client, q, 0, &out, &out_len), -1);
+    assert_int_equal(resolve_any_server(&client, q, sizeof(q), NULL, &out_len), -1);
+    assert_int_equal(resolve_any_server(&client, q, sizeof(q), &out, NULL), -1);
 
     upstream_client_destroy(NULL);
     upstream_client_destroy(&client);
+}
+
+static void test_upstream_ready_state(void **state) {
+    (void)state;
+    reset_stubs();
+
+    assert_int_equal(upstream_is_ready(NULL), 0);
+
+    upstream_client_t client;
+    memset(&client, 0, sizeof(client));
+    assert_int_equal(upstream_is_ready(&client), 0);
+
+    client.server_count = 1;
+    assert_int_equal(upstream_is_ready(&client), 0);
+
+    client.servers[0].stage.has_bootstrap_v4 = 1;
+    assert_int_equal(upstream_is_ready(&client), 1);
+
+    client.servers[0].stage.has_bootstrap_v4 = 0;
+    client.servers[0].health.last_success_time = 1;
+    assert_int_equal(upstream_is_ready(&client), 1);
 }
 
 int main(void) {
@@ -718,6 +756,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_stage_metrics_matrix),
         cmocka_unit_test(test_upstream_transport_timeout_skips_stage_traversal),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
+        cmocka_unit_test(test_upstream_ready_state),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

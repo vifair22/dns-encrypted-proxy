@@ -6,6 +6,7 @@
 
 #include "cache.h"
 #include "upstream.h"
+#include "upstream_dispatch.h"
 
 typedef struct {
     atomic_uint_fast64_t queries_udp;
@@ -32,7 +33,12 @@ typedef struct {
 } proxy_metrics_t;
 
 void metrics_init(proxy_metrics_t *m);
-int metrics_server_start(proxy_metrics_t *m, dns_cache_t *cache, upstream_client_t *upstream, int port);
+int metrics_server_start(
+    proxy_metrics_t *m,
+    dns_cache_t *cache,
+    upstream_client_t *upstream,
+    upstream_facilitator_t *facilitator,
+    int port);
 void metrics_server_stop(void);
 
 #endif

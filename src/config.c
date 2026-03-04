@@ -286,6 +286,30 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
+    if (strcmp(key, "max_inflight_doh") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->max_inflight_doh = parsed;
+        }
+        return;
+    }
+
+    if (strcmp(key, "max_inflight_dot") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->max_inflight_dot = parsed;
+        }
+        return;
+    }
+
+    if (strcmp(key, "max_inflight_doq") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->max_inflight_doq = parsed;
+        }
+        return;
+    }
+
     if (strcmp(key, "cache_capacity") == 0) {
         int parsed = 0;
         if (parse_int(value, &parsed) == 0 && parsed > 0) {
@@ -390,6 +414,30 @@ static void apply_env_overrides(proxy_config_t *config) {
         }
     }
 
+    value = getenv("MAX_INFLIGHT_DOH");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->max_inflight_doh = parsed;
+        }
+    }
+
+    value = getenv("MAX_INFLIGHT_DOT");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->max_inflight_dot = parsed;
+        }
+    }
+
+    value = getenv("MAX_INFLIGHT_DOQ");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->max_inflight_doq = parsed;
+        }
+    }
+
     value = getenv("CACHE_CAPACITY");
     if (value != NULL && *value != '\0') {
         int parsed = 0;
@@ -466,6 +514,9 @@ static void set_defaults(proxy_config_t *config) {
     config->listen_port = 53;
     config->upstream_timeout_ms = 2500;
     config->upstream_pool_size = 6;
+    config->max_inflight_doh = 4;
+    config->max_inflight_dot = 1;
+    config->max_inflight_doq = 1;
     config->cache_capacity = 1024;
 
 #if UPSTREAM_DOH_ENABLED
@@ -578,6 +629,10 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
         return -1;
     }
 
+    if (config->max_inflight_doh <= 0 || config->max_inflight_dot <= 0 || config->max_inflight_doq <= 0) {
+        return -1;
+    }
+
     if (config->cache_capacity <= 0) {
         return -1;
     }
@@ -603,6 +658,9 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  listen_port=%d\n", config->listen_port);
     fprintf(out, "  upstream_timeout_ms=%d\n", config->upstream_timeout_ms);
     fprintf(out, "  upstream_pool_size=%d\n", config->upstream_pool_size);
+    fprintf(out, "  max_inflight_doh=%d\n", config->max_inflight_doh);
+    fprintf(out, "  max_inflight_dot=%d\n", config->max_inflight_dot);
+    fprintf(out, "  max_inflight_doq=%d\n", config->max_inflight_doq);
     fprintf(out, "  cache_capacity=%d\n", config->cache_capacity);
     fprintf(out, "  tcp_idle_timeout_ms=%d\n", config->tcp_idle_timeout_ms);
     fprintf(out, "  tcp_max_clients=%d\n", config->tcp_max_clients);

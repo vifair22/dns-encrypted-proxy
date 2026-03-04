@@ -7,12 +7,14 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <string.h>
 #include <time.h>
 
 #define UPSTREAM_MAX_STAGE_ATTEMPTS_PER_QUERY 12
+#define UPSTREAM_MIN_USEFUL_BUDGET_MS 25
 
 /* Forward declarations for protocol-specific functions */
 #if UPSTREAM_DOH_ENABLED
@@ -325,6 +327,12 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
         return;
     }
 
+    if (server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_UNKNOWN) {
+        server->health.last_failure_time = now_ms();
+        server->health.total_queries++;
+        return;
+    }
+
     int was_healthy = server->health.healthy;
     
     server->health.consecutive_failures++;
@@ -370,6 +378,15 @@ int upstream_client_init(
     if (client->config.unhealthy_backoff_ms <= 0) {
         client->config.unhealthy_backoff_ms = 10000;  /* 10 seconds */
     }
+    if (client->config.max_inflight_doh <= 0) {
+        client->config.max_inflight_doh = 4;
+    }
+    if (client->config.max_inflight_dot <= 0) {
+        client->config.max_inflight_dot = 1;
+    }
+    if (client->config.max_inflight_doq <= 0) {
+        client->config.max_inflight_doq = 1;
+    }
     if (client->config.iterative_bootstrap_enabled != 0) {
         client->config.iterative_bootstrap_enabled = 1;
     }
@@ -389,12 +406,7 @@ int upstream_client_init(
         return -1;
     }
     
-    if (pthread_mutex_init(&client->rr_mutex, NULL) != 0) {
-        return -1;
-    }
-
     if (pthread_mutex_init(&client->stage1_cache_mutex, NULL) != 0) {
-        pthread_mutex_destroy(&client->rr_mutex);
         return -1;
     }
     
@@ -433,7 +445,6 @@ void upstream_client_destroy(upstream_client_t *client) {
     }
 #endif
     
-    pthread_mutex_destroy(&client->rr_mutex);
     pthread_mutex_destroy(&client->stage1_cache_mutex);
     memset(client, 0, sizeof(*client));
 }
@@ -468,6 +479,7 @@ static int ensure_doq_client(upstream_client_t *client) {
 static int resolve_with_server(
     upstream_client_t *client,
     upstream_server_t *server,
+    int timeout_ms,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -486,7 +498,7 @@ static int resolve_with_server(
             result = upstream_doh_resolve(
                 client->doh_client,
                 server,
-                client->config.timeout_ms,
+                timeout_ms,
                 query, query_len,
                 response_out, response_len_out);
             break;
@@ -502,7 +514,7 @@ static int resolve_with_server(
             result = upstream_dot_resolve(
                 client->dot_client,
                 server,
-                client->config.timeout_ms,
+                timeout_ms,
                 query, query_len,
                 response_out, response_len_out);
             break;
@@ -518,7 +530,7 @@ static int resolve_with_server(
             result = upstream_doq_resolve(
                 client->doq_client,
                 server,
-                client->config.timeout_ms,
+                timeout_ms,
                 query,
                 query_len,
                 response_out,
@@ -541,6 +553,42 @@ static int stage1_hydrate_timeout_ms(const upstream_client_t *client) {
         hydrate_timeout_ms = 500;
     }
     return hydrate_timeout_ms;
+}
+
+static int normalize_timeout_ms(int timeout_ms) {
+    if (timeout_ms <= 0) {
+        return 1000;
+    }
+    return timeout_ms;
+}
+
+static int remaining_budget_ms(uint64_t deadline_ms, int fallback_timeout_ms) {
+    if (deadline_ms == 0) {
+        return normalize_timeout_ms(fallback_timeout_ms);
+    }
+
+    uint64_t now = now_ms();
+    if (now >= deadline_ms) {
+        return 0;
+    }
+
+    uint64_t remain = deadline_ms - now;
+    if (remain > (uint64_t)INT32_MAX) {
+        remain = (uint64_t)INT32_MAX;
+    }
+    return (int)remain;
+}
+
+static int effective_attempt_timeout_ms(uint64_t deadline_ms, int configured_timeout_ms) {
+    int configured = normalize_timeout_ms(configured_timeout_ms);
+    int remain = remaining_budget_ms(deadline_ms, configured);
+    if (remain <= 0) {
+        return 0;
+    }
+    if (remain < UPSTREAM_MIN_USEFUL_BUDGET_MS) {
+        return 0;
+    }
+    return remain < configured ? remain : configured;
 }
 
 static upstream_stage1_cache_result_t prepare_stage1_cache(upstream_client_t *client, upstream_server_t *server) {
@@ -831,9 +879,17 @@ static int resolve_server_with_fallback(
     uint8_t **response_out,
     size_t *response_len_out,
     int *retry_budget,
-    int unhealthy_probe) {
+    int unhealthy_probe,
+    uint64_t deadline_ms) {
     uint8_t *response = NULL;
     size_t response_len = 0;
+    int timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
+
+    if (timeout_ms <= 0) {
+        LOG_STAGE_EVENT(server, 1, "stage1", "skipped", "budget_exhausted", "insufficient_remaining_budget", 0);
+        server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+        return -1;
+    }
 
     upstream_stage1_cache_result_t stage1_cache = prepare_stage1_cache(client, server);
 
@@ -844,7 +900,7 @@ static int resolve_server_with_fallback(
     }
 
     if (consume_retry_budget(retry_budget, server, "stage1") == 0 &&
-        resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+        resolve_with_server(client, server, timeout_ms, query, query_len, &response, &response_len) == 0) {
         maybe_hydrate_stage1_cache(client, server, stage1_cache);
         upstream_server_record_success(server);
         *response_out = response;
@@ -873,18 +929,28 @@ static int resolve_server_with_fallback(
             "skipped",
             "transport_path_presumed",
             suppress_remaining_ms > 0 ? "transport_suppress_active" : failure_class_name(server->stage.last_failure_class),
-            client->config.timeout_ms);
+            timeout_ms);
         upstream_server_record_failure(server, &client->config);
         return -1;
     }
 
-    LOG_STAGE_EVENT(server, 2, "stage2", "enter", "stage1_failed", NULL, client->config.timeout_ms);
+    timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
+    if (timeout_ms <= 0) {
+        LOG_STAGE_EVENT(server, 2, "stage2", "skipped", "budget_exhausted", "insufficient_remaining_budget", 0);
+        server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+        upstream_server_record_failure(server, &client->config);
+        return -1;
+    }
+
+    LOG_STAGE_EVENT(server, 2, "stage2", "enter", "stage1_failed", NULL, timeout_ms);
     client_counter_inc(&client->stage_metrics.stage2_attempts);
     const char *stage2_reason = NULL;
-    if (upstream_bootstrap_try_stage2(client, server, client->config.timeout_ms, &stage2_reason) == 0) {
+    if (upstream_bootstrap_try_stage2(client, server, timeout_ms, &stage2_reason) == 0) {
         client_counter_inc(&client->stage_metrics.stage2_successes);
+        timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
         if (consume_retry_budget(retry_budget, server, "stage2") == 0 &&
-            resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+            timeout_ms > 0 &&
+            resolve_with_server(client, server, timeout_ms, query, query_len, &response, &response_len) == 0) {
             upstream_server_record_success(server);
             *response_out = response;
             *response_len_out = response_len;
@@ -899,7 +965,7 @@ static int resolve_server_with_fallback(
             "retry_failed",
             "transport_retry_failed",
             stage2_reason,
-            client->config.timeout_ms);
+            timeout_ms);
         LOG_STAGE_EVENT(
             server,
             3,
@@ -907,7 +973,7 @@ static int resolve_server_with_fallback(
             "skipped",
             "stage2_resolved_transport_failed",
             stage2_reason,
-            client->config.timeout_ms);
+            timeout_ms);
         upstream_server_record_failure(server, &client->config);
         return -1;
     } else {
@@ -916,19 +982,29 @@ static int resolve_server_with_fallback(
             client_counter_inc(&client->stage_metrics.stage2_cooldowns);
         }
         note_stage_reason(client, 2, stage2_reason);
-        LOG_STAGE_EVENT(server, 2, "stage2", "failed", stage2_reason, NULL, client->config.timeout_ms);
+        LOG_STAGE_EVENT(server, 2, "stage2", "failed", stage2_reason, NULL, timeout_ms);
     }
 
     if (client->config.iterative_bootstrap_enabled && should_try_stage3_after_stage2_failure(stage2_reason)) {
-        LOG_STAGE_EVENT(server, 3, "stage3", "enter", "stage2_failed", stage2_reason, client->config.timeout_ms);
+        timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
+        if (timeout_ms <= 0) {
+            LOG_STAGE_EVENT(server, 3, "stage3", "skipped", "budget_exhausted", "insufficient_remaining_budget", 0);
+            server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+            upstream_server_record_failure(server, &client->config);
+            return -1;
+        }
+
+        LOG_STAGE_EVENT(server, 3, "stage3", "enter", "stage2_failed", stage2_reason, timeout_ms);
         client_counter_inc(&client->stage_metrics.stage3_attempts);
 
         const char *stage3_reason = NULL;
-        if (upstream_bootstrap_try_stage3(server, client->config.timeout_ms, &stage3_reason) == 0) {
+        if (upstream_bootstrap_try_stage3(server, timeout_ms, &stage3_reason) == 0) {
             client_counter_inc(&client->stage_metrics.stage3_successes);
             LOGF_INFO("Upstream stage3 iterative bootstrap resolved host=%s", server->host);
+            timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
             if (consume_retry_budget(retry_budget, server, "stage3") == 0 &&
-                resolve_with_server(client, server, query, query_len, &response, &response_len) == 0) {
+                timeout_ms > 0 &&
+                resolve_with_server(client, server, timeout_ms, query, query_len, &response, &response_len) == 0) {
                 upstream_server_record_success(server);
                 *response_out = response;
                 *response_len_out = response_len;
@@ -943,16 +1019,17 @@ static int resolve_server_with_fallback(
                 "retry_failed",
                 "transport_retry_failed",
                 stage3_reason,
-                client->config.timeout_ms);
+                timeout_ms);
         } else {
             client_counter_inc(&client->stage_metrics.stage3_failures);
             if (stage3_reason != NULL && strcmp(stage3_reason, "cooldown") == 0) {
                 client_counter_inc(&client->stage_metrics.stage3_cooldowns);
             }
             note_stage_reason(client, 3, stage3_reason);
-            LOG_STAGE_EVENT(server, 3, "stage3", "failed", stage3_reason, NULL, client->config.timeout_ms);
+            LOG_STAGE_EVENT(server, 3, "stage3", "failed", stage3_reason, NULL, timeout_ms);
         }
     } else if (client->config.iterative_bootstrap_enabled) {
+        timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
         LOG_STAGE_EVENT(
             server,
             3,
@@ -960,73 +1037,84 @@ static int resolve_server_with_fallback(
             "skipped",
             "non_lookup_stage2_failure",
             stage2_reason,
-            client->config.timeout_ms);
+            timeout_ms);
     }
 
     upstream_server_record_failure(server, &client->config);
     return -1;
 }
 
-int upstream_resolve(
+int upstream_resolve_on_server(
     upstream_client_t *client,
+    int server_index,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
-    
+    int timeout_ms = normalize_timeout_ms(client != NULL ? client->config.timeout_ms : 0);
+    uint64_t deadline_ms = now_ms() + (uint64_t)timeout_ms;
+    return upstream_resolve_on_server_with_deadline(
+        client,
+        server_index,
+        query,
+        query_len,
+        deadline_ms,
+        response_out,
+        response_len_out);
+}
+
+int upstream_resolve_on_server_with_deadline(
+    upstream_client_t *client,
+    int server_index,
+    const uint8_t *query,
+    size_t query_len,
+    uint64_t deadline_ms,
+    uint8_t **response_out,
+    size_t *response_len_out) {
     if (client == NULL || query == NULL || query_len == 0 ||
-        response_out == NULL || response_len_out == NULL) {
+        response_out == NULL || response_len_out == NULL ||
+        server_index < 0 || server_index >= client->server_count) {
         return -1;
     }
-    
+
     *response_out = NULL;
     *response_len_out = 0;
-    
-    /*
-     * Take one RR snapshot per query so all retry attempts for that query use
-     * a stable ordering, while subsequent queries still rotate fairly.
-     */
-    /* Get round-robin starting index */
-    pthread_mutex_lock(&client->rr_mutex);
-    uint64_t start = client->next_index;
-    client->next_index++;
-    pthread_mutex_unlock(&client->rr_mutex);
-    
-    /*
-     * Pass 1 = normal path. Pass 2 = last-chance probe of unhealthy servers.
-     * Keeps normal latency low but still lets bad servers recover.
-     */
+
+    upstream_server_t *server = &client->servers[server_index];
     int retry_budget = UPSTREAM_MAX_STAGE_ATTEMPTS_PER_QUERY;
-    for (int pass = 0; pass < 2; pass++) {
-        for (int attempt = 0; attempt < client->server_count; attempt++) {
-            int idx = (int)((start + (uint64_t)attempt) % (uint64_t)client->server_count);
-            upstream_server_t *server = &client->servers[idx];
 
-            if (pass == 0) {
-                if (upstream_server_should_skip(server, &client->config)) {
-                    continue;
-                }
-            } else {
-                if (server->health.healthy) {
-                    continue;
-                }
-            }
-
-            if (resolve_server_with_fallback(
-                    client,
-                    server,
-                    query,
-                    query_len,
-                    response_out,
-                    response_len_out,
-                    &retry_budget,
-                    pass == 1)
-                == 0) {
-                return 0;
-            }
+    if (!upstream_server_should_skip(server, &client->config)) {
+        if (resolve_server_with_fallback(
+                client,
+                server,
+                query,
+                query_len,
+                response_out,
+                response_len_out,
+                &retry_budget,
+                0,
+                deadline_ms)
+            == 0) {
+            return 0;
         }
     }
-    
+
+    if (!server->health.healthy) {
+        if (resolve_server_with_fallback(
+                client,
+                server,
+                query,
+                query_len,
+                response_out,
+                response_len_out,
+                &retry_budget,
+                1,
+                deadline_ms)
+            == 0) {
+            return 0;
+        }
+    }
+
     return -1;
 }
 
@@ -1113,6 +1201,24 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             &stats_out->doq_connections_alive);
     }
 #endif
+
+    return 0;
+}
+
+int upstream_is_ready(const upstream_client_t *client) {
+    if (client == NULL || client->server_count <= 0) {
+        return 0;
+    }
+
+    for (int i = 0; i < client->server_count; i++) {
+        const upstream_server_t *server = &client->servers[i];
+        if (server->health.last_success_time != 0) {
+            return 1;
+        }
+        if (server->stage.has_stage1_cached_v4 || server->stage.has_bootstrap_v4) {
+            return 1;
+        }
+    }
 
     return 0;
 }

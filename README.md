@@ -26,7 +26,8 @@ Notes on DoH HTTP version selection:
 
 - Accepts DNS queries over UDP/TCP.
 - Extracts a canonical question key and checks an in-memory cache.
-- On miss, resolves upstream via DoH/DoT with health-aware failover.
+- On miss, enqueues upstream work into the dispatch facilitator (priority-ordered provider/member selection, per-job deadlines, completion queue).
+- Allocator loop manages member lifecycle (`UNINIT -> CONNECTING -> READY/FAILED -> COOLDOWN`) and refresh scheduling.
 - Rewrites response ID to match the incoming client query.
 - Applies cache policy from DNS TTLs and response semantics.
 - Exposes runtime metrics for traffic, cache behavior, upstream health, and transport usage.
@@ -106,6 +107,7 @@ Main config keys:
 - `listen_addr`, `listen_port`
 - `upstreams` (comma-separated `https://...`, `tls://host[:port]`, and/or `quic://host[:port]`)
 - `upstream_timeout_ms`, `upstream_pool_size`
+- `max_inflight_doh`, `max_inflight_dot`, `max_inflight_doq`
 - `bootstrap_resolvers` (comma-separated IPv4 recursive resolvers used for stage2 bootstrap)
 - `cache_capacity`
 - `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
@@ -117,6 +119,7 @@ Environment override support includes:
 
 - `DNS_ENCRYPTED_PROXY_CONFIG`, `LISTEN_ADDR`, `LISTEN_PORT`
 - `UPSTREAMS`, `UPSTREAM_TIMEOUT_MS`, `UPSTREAM_POOL_SIZE`
+- `MAX_INFLIGHT_DOH`, `MAX_INFLIGHT_DOT`, `MAX_INFLIGHT_DOQ`
 - `BOOTSTRAP_RESOLVERS`
 - `CACHE_CAPACITY`
 - `HOSTS_A`
@@ -141,10 +144,11 @@ Environment override support includes:
 Prometheus endpoint:
 
 - route: `GET /metrics`
+- health probes: `GET /healthz` and `GET /readyz`
 - bind: `0.0.0.0:<metrics_port>`
 - format: `text/plain; version=0.0.4`
 
-Includes counters/gauges for query volume, upstream success/failure, cache entries/evictions/expirations/bytes, TCP connection state, and response codes.
+Includes counters/gauges for query volume, upstream success/failure, cache entries/evictions/expirations/bytes, TCP connection state, response codes, and upstream-dispatch internals (queue depth, member states, queue-wait histogram, requeue/drop/budget-exhausted events).
 
 ## Docker
 

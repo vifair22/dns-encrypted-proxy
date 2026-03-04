@@ -117,6 +117,7 @@ set(DNS_ENCRYPTED_PROXY_SOURCES
     src/logger.c
     src/iterative_resolver.c
     src/upstream_bootstrap.c
+    src/upstream_dispatch.c
     src/upstream.c
     src/dns_server.c
     src/metrics.c
@@ -279,6 +280,12 @@ if(BUILD_TESTS)
         apply_target_defaults(test_upstream_internal)
         add_proxy_test(test_upstream_internal)
 
+        add_executable(test_upstream_dispatch_internal tests/unit/test_upstream_dispatch_internal.c)
+        target_link_libraries(test_upstream_dispatch_internal ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_upstream_dispatch_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_upstream_dispatch_internal)
+        add_proxy_test(test_upstream_dispatch_internal)
+
         if(ENABLE_UPSTREAM_DOT)
             # Unit test: upstream DoT internals (static helper branch coverage)
             add_executable(test_upstream_dot_internal tests/unit/test_upstream_dot_internal.c)
@@ -333,7 +340,7 @@ if(BUILD_TESTS)
             find_program(GCOVR_EXECUTABLE gcovr)
             if(GCOVR_EXECUTABLE)
                 set(COVERAGE_TEST_DEPS
-                    test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_iterative_resolver_internal test_upstream_bootstrap_internal test_upstream_internal test_integration_core test_integration_transport test_integration_runtime)
+                    test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_iterative_resolver_internal test_upstream_bootstrap_internal test_upstream_internal test_upstream_dispatch_internal test_integration_core test_integration_transport test_integration_runtime)
                 if(ENABLE_UPSTREAM_DOH)
                     list(APPEND COVERAGE_TEST_DEPS test_upstream_doh_internal)
                 endif()

@@ -40,8 +40,10 @@ static uint32_t g_stub_hosts_lookup_addr_be = 0;
 static uint8_t g_huge_response[70000];
 static int g_stub_dns_cache_init_rc = 0;
 static int g_stub_upstream_client_init_rc = 0;
+static int g_stub_upstream_facilitator_init_rc = 0;
 static int g_stub_dns_cache_destroy_calls = 0;
 static int g_stub_upstream_client_destroy_calls = 0;
+static int g_stub_upstream_facilitator_destroy_calls = 0;
 static uint32_t dns_server_rng_state = 0x89ABCDEFu;
 static int g_wrap_poll_script[16];
 static int g_wrap_poll_script_len = 0;
@@ -119,8 +121,10 @@ static void reset_stubs(void) {
     g_stub_hosts_lookup_addr_be = 0;
     g_stub_dns_cache_init_rc = 0;
     g_stub_upstream_client_init_rc = 0;
+    g_stub_upstream_facilitator_init_rc = 0;
     g_stub_dns_cache_destroy_calls = 0;
     g_stub_upstream_client_destroy_calls = 0;
+    g_stub_upstream_facilitator_destroy_calls = 0;
     g_wrap_poll_script_len = 0;
     g_wrap_poll_script_idx = 0;
     g_wrap_recvfrom_return = -1;
@@ -407,13 +411,24 @@ int upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t
     return 0;
 }
 
-int upstream_resolve(
-    upstream_client_t *client,
+int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_client_t *upstream) {
+    (void)facilitator;
+    (void)upstream;
+    return g_stub_upstream_facilitator_init_rc;
+}
+
+void upstream_facilitator_destroy(upstream_facilitator_t *facilitator) {
+    (void)facilitator;
+    g_stub_upstream_facilitator_destroy_calls++;
+}
+
+int upstream_facilitator_resolve(
+    upstream_facilitator_t *facilitator,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
-    (void)client;
+    (void)facilitator;
     (void)query;
     (void)query_len;
     if (g_stub_upstream_rc != 0) {
@@ -429,6 +444,17 @@ int upstream_resolve(
     memcpy(*response_out, g_stub_upstream_resp, g_stub_upstream_resp_len);
     *response_len_out = g_stub_upstream_resp_len;
     return 0;
+}
+
+int upstream_facilitator_resolve_with_deadline(
+    upstream_facilitator_t *facilitator,
+    const uint8_t *query,
+    size_t query_len,
+    uint64_t deadline_ms,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    (void)deadline_ms;
+    return upstream_facilitator_resolve(facilitator, query, query_len, response_out, response_len_out);
 }
 
 void metrics_init(proxy_metrics_t *m) {
@@ -719,6 +745,8 @@ static void test_process_query_branches(void **state) {
     assert_true((uint64_t)atomic_load(&server.metrics.upstream_success) >= 1);
 
     reset_stubs();
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
     assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
     assert_non_null(out);
     free(out);
@@ -752,9 +780,16 @@ static void test_proxy_server_init_and_socket_success_paths(void **state) {
     assert_true(g_stub_dns_cache_destroy_calls >= 1);
 
     reset_stubs();
+    g_stub_upstream_facilitator_init_rc = -1;
+    assert_int_equal(proxy_server_init(&server, &cfg, &stop), -1);
+    assert_true(g_stub_upstream_client_destroy_calls >= 1);
+    assert_true(g_stub_dns_cache_destroy_calls >= 1);
+
+    reset_stubs();
     assert_int_equal(proxy_server_init(&server, &cfg, &stop), 0);
     proxy_server_destroy(&server);
     assert_true(g_stub_upstream_client_destroy_calls >= 1);
+    assert_true(g_stub_upstream_facilitator_destroy_calls >= 1);
     assert_true(g_stub_dns_cache_destroy_calls >= 1);
 
     int udp_fd = create_udp_socket(&cfg);
@@ -1256,6 +1291,8 @@ static void test_dns_server_udp_loop_truncation_fallback(void **state) {
     g_stub_upstream_rc = 0;
     g_stub_upstream_resp = malformed_large;
     g_stub_upstream_resp_len = sizeof(malformed_large);
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
 
     socket_loop_ctx_t ctx = {.server = &server, .fd = 42};
     g_wrap_poll_script[0] = 3;
@@ -1277,6 +1314,8 @@ static void test_dns_server_udp_loop_truncation_fallback(void **state) {
     g_stub_upstream_rc = 0;
     g_stub_upstream_resp = malformed_large;
     g_stub_upstream_resp_len = sizeof(malformed_large);
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
 
     ctx.server = &server;
     ctx.fd = 42;
@@ -1316,6 +1355,8 @@ static void test_dns_server_udp_truncation_and_servfail_build_fail(void **state)
     g_stub_upstream_rc = 0;
     g_stub_upstream_resp = malformed_large;
     g_stub_upstream_resp_len = sizeof(malformed_large);
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
 
     socket_loop_ctx_t ctx = {.server = &server, .fd = 42};
     g_wrap_poll_script[0] = 3;

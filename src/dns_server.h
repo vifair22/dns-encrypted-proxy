@@ -7,12 +7,14 @@
 #include "cache.h"
 #include "config.h"
 #include "upstream.h"
+#include "upstream_dispatch.h"
 #include "metrics.h"
 
 typedef struct {
     proxy_config_t config;
     dns_cache_t cache;
     upstream_client_t upstream;
+    upstream_facilitator_t upstream_facilitator;
     proxy_metrics_t metrics;
     volatile sig_atomic_t *stop_flag;
     atomic_int active_tcp_clients;

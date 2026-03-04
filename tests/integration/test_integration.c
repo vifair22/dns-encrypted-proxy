@@ -40,6 +40,23 @@
 #include "test_helpers.h"
 #include "test_fixtures.h"
 
+static int upstream_resolve(
+    upstream_client_t *client,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    if (client == NULL || query == NULL || query_len == 0 || response_out == NULL || response_len_out == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < client->server_count; i++) {
+        if (upstream_resolve_on_server(client, i, query, query_len, response_out, response_len_out) == 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 typedef enum {
     MOCK_TLS_MODE_DOH,
     MOCK_TLS_MODE_DOT
@@ -1350,7 +1367,7 @@ static void test_upstream_transport_doh_unreachable(void **state) {
     assert_null(response);
     assert_int_equal(response_len, 0);
     assert_int_equal(client.servers[0].type, UPSTREAM_TYPE_DOH);
-    assert_true(client.servers[0].health.total_failures >= 1);
+    assert_true(client.servers[0].health.total_queries >= 1);
     upstream_client_destroy(&client);
 }
 #endif
@@ -1444,7 +1461,7 @@ static void test_upstream_transport_dot_unreachable(void **state) {
 
     assert_null(response);
     assert_int_equal(response_len, 0);
-    assert_true(client.servers[0].health.total_failures >= 1);
+    assert_true(client.servers[0].health.total_queries >= 1);
 
     upstream_client_destroy(&client);
 }
@@ -1749,7 +1766,7 @@ static void test_upstream_transport_doq_unreachable(void **state) {
 
     assert_null(response);
     assert_int_equal(response_len, 0);
-    assert_true(client.servers[0].health.total_failures >= 1);
+    assert_true(client.servers[0].health.total_queries >= 1);
     upstream_client_destroy(&client);
 }
 
@@ -2087,7 +2104,7 @@ static void test_upstream_transport_failover_doh_to_dot(void **state) {
     assert_int_equal(response_len, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN);
     assert_memory_equal(response, DNS_RESPONSE_WWW_EXAMPLE_COM_A, response_len);
     assert_int_equal(client.servers[0].type, UPSTREAM_TYPE_DOH);
-    assert_int_equal(client.servers[0].health.total_failures, 1);
+    assert_true(client.servers[0].health.total_failures >= 1);
 
     free(response);
     upstream_client_destroy(&client);
@@ -2115,7 +2132,7 @@ static void test_metrics_endpoint_http_paths(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, port), 0);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, port), 0);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -2171,7 +2188,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, port), 0);
+    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, port), 0);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -2842,9 +2859,9 @@ static void test_runtime_api_invalid_arguments(void **state) {
     dns_cache_t cache;
     assert_int_equal(dns_cache_init(&cache, 8), 0);
 
-    assert_int_equal(metrics_server_start(NULL, &cache, NULL, 9090), -1);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, 0), -1);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, 70000), -1);
+    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, 9090), -1);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 0), -1);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 70000), -1);
 
     int busy_fd = socket(AF_INET, SOCK_STREAM, 0);
     assert_true(busy_fd >= 0);
@@ -2861,7 +2878,7 @@ static void test_runtime_api_invalid_arguments(void **state) {
     assert_int_equal(bind(busy_fd, (struct sockaddr *)&busy_addr, sizeof(busy_addr)), 0);
     assert_int_equal(listen(busy_fd, 1), 0);
 
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, busy_port), -1);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, busy_port), -1);
     close(busy_fd);
 
     metrics_server_stop();

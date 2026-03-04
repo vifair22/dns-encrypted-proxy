@@ -304,6 +304,7 @@ static void test_record_failure_marks_unhealthy(void **state) {
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
     server.health.healthy = 1;
+    server.stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TRANSPORT;
 
     upstream_config_t config = {
         .max_failures_before_unhealthy = 2,
@@ -329,6 +330,7 @@ static void test_backoff_elapsed_allows_retry(void **state) {
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
     server.health.healthy = 1;
+    server.stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TRANSPORT;
 
     upstream_config_t failure_config = {
         .max_failures_before_unhealthy = 1,

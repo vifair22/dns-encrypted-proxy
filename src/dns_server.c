@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "dns_server.h"
 
 #include "dns_message.h"
@@ -16,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DNS_MAX_MESSAGE_SIZE 65535
@@ -31,6 +34,12 @@ typedef struct {
     int client_fd;
     int query_count;
 } tcp_client_ctx_t;
+
+static uint64_t monotonic_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
 
 static void record_internal_error_impl(const char *func, proxy_server_t *server, const char *reason, const char *fmt, ...) {
     if (server != NULL) {
@@ -602,6 +611,8 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
     *response_out = NULL;
     *response_len_out = 0;
 
+    uint64_t request_start_ms = monotonic_now_ms();
+
     uint8_t key[CACHE_KEY_MAX_SIZE];
     size_t key_len = 0;
     int key_ok = (dns_extract_question_key(query, query_len, key, sizeof(key), &key_len) == 0);
@@ -620,18 +631,39 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
     }
 
     /*
-     * Cache path is best-effort: malformed/unkeyable queries bypass cache and
-     * still resolve upstream; we do not fail request processing on key errors.
+     * Reject malformed/unkeyable queries before upstream dispatch.
+     * This avoids forwarding invalid DNS payloads that DoH providers return as
+     * HTTP 400/413 and keeps upstream health accounting meaningful.
      */
-    if (key_ok) {
-        if (dns_cache_lookup(&server->cache, key, key_len, request_id, response_out, response_len_out)) {
-            atomic_fetch_add(&server->metrics.cache_hits, 1);
-            return 0;
+    if (!key_ok) {
+        atomic_fetch_add(&server->metrics.servfail_sent, 1);
+        if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
+            RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "invalid_query_len=%zu", query_len);
+            return -1;
         }
-        atomic_fetch_add(&server->metrics.cache_misses, 1);
+        return 0;
     }
 
-    if (upstream_resolve(&server->upstream, query, query_len, response_out, response_len_out) == 0) {
+    if (dns_cache_lookup(&server->cache, key, key_len, request_id, response_out, response_len_out)) {
+        atomic_fetch_add(&server->metrics.cache_hits, 1);
+        return 0;
+    }
+    atomic_fetch_add(&server->metrics.cache_misses, 1);
+
+    int upstream_budget_ms = server->config.upstream_timeout_ms;
+    if (upstream_budget_ms <= 0) {
+        upstream_budget_ms = 1000;
+    }
+    uint64_t request_deadline_ms = request_start_ms + (uint64_t)upstream_budget_ms;
+
+    if (upstream_facilitator_resolve_with_deadline(
+            &server->upstream_facilitator,
+            query,
+            query_len,
+            request_deadline_ms,
+            response_out,
+            response_len_out)
+        == 0) {
         atomic_fetch_add(&server->metrics.upstream_success, 1);
         /* Upstream response ID is rewritten to client request ID at edge. */
         if (*response_len_out >= 2) {
@@ -640,7 +672,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
         }
 
         /* Cache only policy-approved responses with meaningful TTL. */
-        if (key_ok && dns_response_is_cacheable(*response_out, *response_len_out)) {
+        if (dns_response_is_cacheable(*response_out, *response_len_out)) {
             int ttl_ok = 0;
             uint32_t min_ttl = dns_response_min_ttl(*response_out, *response_len_out, &ttl_ok);
             if (ttl_ok && min_ttl > 0) {
@@ -1077,6 +1109,9 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
     upstream_config_t upstream_cfg = {
         .timeout_ms = config->upstream_timeout_ms,
         .pool_size = config->upstream_pool_size,
+        .max_inflight_doh = config->max_inflight_doh,
+        .max_inflight_dot = config->max_inflight_dot,
+        .max_inflight_doq = config->max_inflight_doq,
         .max_failures_before_unhealthy = 3,
         .unhealthy_backoff_ms = 10000,
         .iterative_bootstrap_enabled = 1,
@@ -1088,6 +1123,12 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
     }
 
     (void)upstream_bootstrap_configure(&server->upstream, config);
+
+    if (upstream_facilitator_init(&server->upstream_facilitator, &server->upstream) != 0) {
+        upstream_client_destroy(&server->upstream);
+        dns_cache_destroy(&server->cache);
+        return -1;
+    }
 
     LOGF_INFO("Upstream fallback configuration:");
     LOGF_INFO(
@@ -1106,6 +1147,7 @@ void proxy_server_destroy(proxy_server_t *server) {
         return;
     }
     
+    upstream_facilitator_destroy(&server->upstream_facilitator);
     upstream_client_destroy(&server->upstream);
     dns_cache_destroy(&server->cache);
     memset(server, 0, sizeof(*server));

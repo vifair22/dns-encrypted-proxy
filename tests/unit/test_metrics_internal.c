@@ -28,6 +28,7 @@ static int g_fail_bind = 0;
 static int g_fail_listen = 0;
 static int g_fail_pthread_create = 0;
 static int g_fail_send = 0;
+static int g_stub_upstream_ready = 0;
 
 static int metrics_wrap_socket(int domain, int type, int protocol) {
     if (g_fail_socket) {
@@ -97,6 +98,30 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
         return -1;
     }
     *stats_out = g_stub_runtime_stats;
+    return 0;
+}
+
+int upstream_is_ready(const upstream_client_t *client) {
+    (void)client;
+    return g_stub_upstream_ready;
+}
+
+int upstream_facilitator_get_stats(
+    const upstream_facilitator_t *facilitator,
+    upstream_facilitator_stats_t *stats_out) {
+    (void)facilitator;
+    if (stats_out == NULL) {
+        return -1;
+    }
+    memset(stats_out, 0, sizeof(*stats_out));
+    return 0;
+}
+
+uint64_t upstream_facilitator_get_provider_inflight(
+    const upstream_facilitator_t *facilitator,
+    int provider_index) {
+    (void)facilitator;
+    (void)provider_index;
     return 0;
 }
 
@@ -214,6 +239,31 @@ static void test_handle_client_error_paths(void **state) {
     assert_true((uint64_t)atomic_load(&g_test_metrics.metrics_http_responses_4xx_total) >= 1);
 
     assert_int_equal(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    const char *req_health = "GET /healthz HTTP/1.1\r\n\r\n";
+    assert_int_equal((int)write(sv[1], req_health, strlen(req_health)), (int)strlen(req_health));
+    shutdown(sv[1], SHUT_WR);
+    handle_client(sv[0]);
+    close(sv[0]);
+    close(sv[1]);
+
+    g_stub_upstream_ready = 0;
+    assert_int_equal(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    const char *req_ready = "GET /readyz HTTP/1.1\r\n\r\n";
+    assert_int_equal((int)write(sv[1], req_ready, strlen(req_ready)), (int)strlen(req_ready));
+    shutdown(sv[1], SHUT_WR);
+    handle_client(sv[0]);
+    close(sv[0]);
+    close(sv[1]);
+
+    g_stub_upstream_ready = 1;
+    assert_int_equal(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    assert_int_equal((int)write(sv[1], req_ready, strlen(req_ready)), (int)strlen(req_ready));
+    shutdown(sv[1], SHUT_WR);
+    handle_client(sv[0]);
+    close(sv[0]);
+    close(sv[1]);
+
+    assert_int_equal(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
     const char *req_metrics = "GET /metrics HTTP/1.1\r\n\r\n";
     assert_int_equal((int)write(sv[1], req_metrics, strlen(req_metrics)), (int)strlen(req_metrics));
     shutdown(sv[1], SHUT_WR);
@@ -235,19 +285,19 @@ static void test_metrics_server_start_failure_paths(void **state) {
     metrics_init(&g_test_metrics);
 
     g_fail_socket = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
     g_fail_socket = 0;
 
     g_fail_bind = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
     g_fail_bind = 0;
 
     g_fail_listen = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
     g_fail_listen = 0;
 
     g_fail_pthread_create = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
     g_fail_pthread_create = 0;
 }
 

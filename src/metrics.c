@@ -16,6 +16,7 @@
 static proxy_metrics_t *g_metrics = NULL;
 static dns_cache_t *g_cache = NULL;
 static upstream_client_t *g_upstream = NULL;
+static upstream_facilitator_t *g_facilitator = NULL;
 static uint64_t g_start_monotonic_ms = 0;
 static uint64_t g_prev_process_cpu_wall_ms = 0;
 static double g_prev_process_cpu_seconds = 0.0;
@@ -252,6 +253,111 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     upstream_protocol_label(server->type),
                     (unsigned int)server->health.consecutive_failures) != 0) {
             return -1;
+        }
+    }
+
+    if (g_facilitator != NULL) {
+        upstream_facilitator_stats_t fs;
+        if (upstream_facilitator_get_stats(g_facilitator, &fs) == 0) {
+            if (appendf(
+                    out,
+                    out_size,
+                    offset,
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_queue_depth Dispatch queue depth by queue type.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_queue_depth gauge\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_depth{queue=\"submit\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_depth{queue=\"work\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_depth{queue=\"completed\"} %llu\n"
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_members Members by state.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_members gauge\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"connecting\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"ready\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"enqueued\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"busy\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"cooldown\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"failed\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_members{state=\"draining\"} %llu\n"
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_events_total Dispatch events counters.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_events_total counter\n"
+                    "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"budget_exhausted\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"requeued\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"dropped\"} %llu\n"
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg Average queue wait before worker execution.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg gauge\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg %f\n"
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max Maximum queue wait before worker execution.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max gauge\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max %llu\n"
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket Queue wait histogram buckets.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket counter\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"1\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"5\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"10\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"25\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"50\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"100\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"250\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"500\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"1000\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket{le=\"+Inf\"} %llu\n",
+                    (unsigned long long)fs.submit_queue_depth,
+                    (unsigned long long)fs.work_queue_depth,
+                    (unsigned long long)fs.completed_queue_depth,
+                    (unsigned long long)fs.members_connecting,
+                    (unsigned long long)fs.members_ready,
+                    (unsigned long long)fs.members_enqueued,
+                    (unsigned long long)fs.members_busy,
+                    (unsigned long long)fs.members_cooldown,
+                    (unsigned long long)fs.members_failed,
+                    (unsigned long long)fs.members_draining,
+                    (unsigned long long)fs.budget_exhausted_total,
+                    (unsigned long long)fs.requeued_total,
+                    (unsigned long long)fs.dropped_total,
+                    fs.queue_wait_samples_total == 0 ? 0.0 : (double)fs.queue_wait_ms_total / (double)fs.queue_wait_samples_total,
+                    (unsigned long long)fs.queue_wait_ms_max,
+                    (unsigned long long)fs.queue_wait_le_1ms,
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms + fs.queue_wait_le_25ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms + fs.queue_wait_le_25ms + fs.queue_wait_le_50ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms + fs.queue_wait_le_25ms + fs.queue_wait_le_50ms + fs.queue_wait_le_100ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms + fs.queue_wait_le_25ms + fs.queue_wait_le_50ms + fs.queue_wait_le_100ms + fs.queue_wait_le_250ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms + fs.queue_wait_le_25ms + fs.queue_wait_le_50ms + fs.queue_wait_le_100ms + fs.queue_wait_le_250ms + fs.queue_wait_le_500ms),
+                    (unsigned long long)(fs.queue_wait_le_1ms + fs.queue_wait_le_5ms + fs.queue_wait_le_10ms + fs.queue_wait_le_25ms + fs.queue_wait_le_50ms + fs.queue_wait_le_100ms + fs.queue_wait_le_250ms + fs.queue_wait_le_500ms + fs.queue_wait_le_1000ms),
+                    (unsigned long long)(fs.queue_wait_samples_total))
+                != 0) {
+                return -1;
+            }
+        }
+
+        if (g_upstream != NULL) {
+            if (appendf(
+                    out,
+                    out_size,
+                    offset,
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_inflight Inflight dispatch jobs by upstream provider.\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_inflight gauge\n")
+                != 0) {
+                return -1;
+            }
+            for (int i = 0; i < g_upstream->server_count; i++) {
+                const upstream_server_t *server = &g_upstream->servers[i];
+                char escaped_url[2048];
+                escape_label_value(server->url, escaped_url, sizeof(escaped_url));
+                uint64_t inflight = upstream_facilitator_get_provider_inflight(g_facilitator, i);
+                if (appendf(
+                        out,
+                        out_size,
+                        offset,
+                        "dns_encrypted_proxy_upstream_dispatch_inflight{provider=\"%d\",upstream=\"%s\",protocol=\"%s\"} %llu\n",
+                        i,
+                        escaped_url,
+                        upstream_protocol_label(server->type),
+                        (unsigned long long)inflight)
+                    != 0) {
+                    return -1;
+                }
+            }
         }
     }
 
@@ -637,6 +743,71 @@ static void handle_client(int client_fd) {
     }
 
     const int is_metrics = (strncmp(req, "GET /metrics ", 13) == 0);
+    const int is_healthz = (strncmp(req, "GET /healthz ", 13) == 0);
+    const int is_readyz = (strncmp(req, "GET /readyz ", 12) == 0);
+
+    if (is_healthz) {
+        const char *body = "ok\n";
+        char header[192];
+        int header_len = snprintf(
+            header,
+            sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n",
+            strlen(body));
+        if (header_len > 0 && (size_t)header_len < sizeof(header) &&
+            write_all(client_fd, header, (size_t)header_len) == 0 &&
+            write_all(client_fd, body, strlen(body)) == 0) {
+            if (g_metrics != NULL) {
+                atomic_fetch_add(&g_metrics->metrics_http_responses_2xx_total, 1);
+            }
+        } else if (g_metrics != NULL) {
+            atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
+        }
+        goto done;
+    }
+
+    if (is_readyz) {
+        int ready = 0;
+        if (g_facilitator != NULL) {
+            upstream_facilitator_stats_t fs;
+            if (upstream_facilitator_get_stats(g_facilitator, &fs) == 0 && fs.members_ready > 0) {
+                ready = 1;
+            }
+        } else {
+            ready = (g_upstream != NULL && upstream_is_ready(g_upstream));
+        }
+        const char *body = ready ? "ready\n" : "not ready\n";
+        int status = ready ? 200 : 503;
+        char header[192];
+        int header_len = snprintf(
+            header,
+            sizeof(header),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n",
+            status,
+            ready ? "OK" : "Service Unavailable",
+            strlen(body));
+        if (header_len > 0 && (size_t)header_len < sizeof(header) &&
+            write_all(client_fd, header, (size_t)header_len) == 0 &&
+            write_all(client_fd, body, strlen(body)) == 0) {
+            if (g_metrics != NULL) {
+                if (ready) {
+                    atomic_fetch_add(&g_metrics->metrics_http_responses_2xx_total, 1);
+                } else {
+                    atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
+                }
+            }
+        } else if (g_metrics != NULL) {
+            atomic_fetch_add(&g_metrics->metrics_http_responses_5xx_total, 1);
+        }
+        goto done;
+    }
+
     if (!is_metrics) {
         const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         (void)write_all(client_fd, resp, strlen(resp));
@@ -763,7 +934,12 @@ void metrics_init(proxy_metrics_t *m) {
     atomic_store(&m->metrics_http_in_flight, 0);
 }
 
-int metrics_server_start(proxy_metrics_t *m, dns_cache_t *cache, upstream_client_t *upstream, int port) {
+int metrics_server_start(
+    proxy_metrics_t *m,
+    dns_cache_t *cache,
+    upstream_client_t *upstream,
+    upstream_facilitator_t *facilitator,
+    int port) {
     if (m == NULL || port <= 0 || port > 65535) {
         return -1;
     }
@@ -794,6 +970,7 @@ int metrics_server_start(proxy_metrics_t *m, dns_cache_t *cache, upstream_client
     g_metrics = m;
     g_cache = cache;
     g_upstream = upstream;
+    g_facilitator = facilitator;
     g_start_monotonic_ms = now_monotonic_ms();
     g_prev_process_cpu_wall_ms = 0;
     g_prev_process_cpu_seconds = 0.0;
@@ -806,6 +983,7 @@ int metrics_server_start(proxy_metrics_t *m, dns_cache_t *cache, upstream_client
         g_metrics = NULL;
         g_cache = NULL;
         g_upstream = NULL;
+        g_facilitator = NULL;
         g_start_monotonic_ms = 0;
         return -1;
     }
@@ -831,6 +1009,7 @@ void metrics_server_stop(void) {
     g_metrics = NULL;
     g_cache = NULL;
     g_upstream = NULL;
+    g_facilitator = NULL;
     g_start_monotonic_ms = 0;
     g_prev_process_cpu_wall_ms = 0;
     g_prev_process_cpu_seconds = 0.0;

@@ -46,12 +46,12 @@ int main(int argc, char **argv) {
     }
 
     if (config.metrics_enabled) {
-        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, config.metrics_port) != 0) {
+        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_port) != 0) {
             LOGF_ERROR("Failed to start metrics server on port %d", config.metrics_port);
             proxy_server_destroy(&server);
             return 1;
         }
-        LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics", config.metrics_port);
+        LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_port);
     }
 
     int rc = proxy_server_run(&server);
