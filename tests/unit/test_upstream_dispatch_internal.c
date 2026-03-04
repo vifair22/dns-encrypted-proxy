@@ -120,12 +120,21 @@ static void *resolve_thread_main(void *arg) {
     return NULL;
 }
 
+static void init_test_client(upstream_client_t *client) {
+    memset(client, 0, sizeof(*client));
+    assert_int_equal(pthread_mutex_init(&client->stage1_cache_mutex, NULL), 0);
+}
+
+static void destroy_test_client(upstream_client_t *client) {
+    pthread_mutex_destroy(&client->stage1_cache_mutex);
+}
+
 static void test_priority_fallback_to_second_provider(void **state) {
     (void)state;
     reset_stubs();
 
     upstream_client_t client;
-    memset(&client, 0, sizeof(client));
+    init_test_client(&client);
     client.server_count = 2;
     client.config.pool_size = 1;
     client.config.timeout_ms = 1000;
@@ -150,6 +159,7 @@ static void test_priority_fallback_to_second_provider(void **state) {
     assert_true(g_resolve_calls[1] >= 1);
 
     upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
 }
 
 static void test_deadline_expired_fails_fast(void **state) {
@@ -157,7 +167,7 @@ static void test_deadline_expired_fails_fast(void **state) {
     reset_stubs();
 
     upstream_client_t client;
-    memset(&client, 0, sizeof(client));
+    init_test_client(&client);
     client.server_count = 1;
     client.config.pool_size = 1;
     client.config.timeout_ms = 1;
@@ -175,6 +185,7 @@ static void test_deadline_expired_fails_fast(void **state) {
     assert_int_equal(resp_len, 0);
 
     upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
 }
 
 static void test_dispatch_stats_exposed(void **state) {
@@ -182,7 +193,7 @@ static void test_dispatch_stats_exposed(void **state) {
     reset_stubs();
 
     upstream_client_t client;
-    memset(&client, 0, sizeof(client));
+    init_test_client(&client);
     client.server_count = 2;
     client.config.pool_size = 2;
     client.config.timeout_ms = 1000;
@@ -212,6 +223,7 @@ static void test_dispatch_stats_exposed(void **state) {
     assert_int_equal(stats.completed_queue_depth, 0);
 
     upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
 }
 
 static void test_cooldown_skips_failed_provider_member(void **state) {
@@ -219,7 +231,7 @@ static void test_cooldown_skips_failed_provider_member(void **state) {
     reset_stubs();
 
     upstream_client_t client;
-    memset(&client, 0, sizeof(client));
+    init_test_client(&client);
     client.server_count = 2;
     client.config.pool_size = 1;
     client.config.timeout_ms = 1000;
@@ -249,6 +261,7 @@ static void test_cooldown_skips_failed_provider_member(void **state) {
     assert_true(g_resolve_calls[1] >= 2);
 
     upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
 }
 
 static void test_inflight_failure_drain_no_job_loss(void **state) {
@@ -256,7 +269,7 @@ static void test_inflight_failure_drain_no_job_loss(void **state) {
     reset_stubs();
 
     upstream_client_t client;
-    memset(&client, 0, sizeof(client));
+    init_test_client(&client);
     client.server_count = 1;
     client.config.pool_size = 1;
     client.config.timeout_ms = 1000;
@@ -289,6 +302,7 @@ static void test_inflight_failure_drain_no_job_loss(void **state) {
     assert_true(g_resolve_calls[0] < THREADS);
 
     upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
 }
 
 int main(void) {
