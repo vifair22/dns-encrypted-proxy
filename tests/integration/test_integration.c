@@ -505,22 +505,30 @@ static int send_udp_query_and_recv(int port, const uint8_t *query, size_t query_
 }
 
 static int open_tcp_connection_local(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        return -1;
-    }
-
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    const int max_attempts = 100;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return -1;
+        }
+
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            return fd;
+        }
+
         close(fd);
-        return -1;
+
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
+        nanosleep(&ts, NULL);
     }
-    return fd;
+
+    return -1;
 }
 
 static int send_tcp_query_and_recv(int port, const uint8_t *query, size_t query_len, uint8_t *resp_out, size_t *resp_len_out) {
