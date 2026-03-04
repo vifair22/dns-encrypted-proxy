@@ -2429,6 +2429,191 @@
       ],
       "title": "Stage Fallback Outcomes & Reasons",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 104
+      },
+      "id": 30,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "expr": "sum by (from, to) (rate(dns_encrypted_proxy_doh_protocol_downgrades_total{job=\"$job\",instance=\"$instance\"}[5m]))",
+          "legendFormat": "{{from}}->{{to}}/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (result) (rate(dns_encrypted_proxy_doh_protocol_upgrade_probes_total{job=\"$job\",instance=\"$instance\"}[5m]))",
+          "legendFormat": "upgrade {{result}}/s",
+          "refId": "B"
+        }
+      ],
+      "title": "DoH Protocol Fallback/Upgrade (rate)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "text": "h3"
+                },
+                "1": {
+                  "text": "h2"
+                },
+                "2": {
+                  "text": "h1"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 104
+      },
+      "id": 31,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "expr": "dns_encrypted_proxy_upstream_doh_forced_http_tier{job=\"$job\",instance=\"$instance\"}",
+          "legendFormat": "{{upstream}} tier",
+          "refId": "A"
+        }
+      ],
+      "title": "DoH Forced Protocol Tier",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 111
+      },
+      "id": 32,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.4.0",
+      "targets": [
+        {
+          "expr": "dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds{job=\"$job\",instance=\"$instance\"} / 1000",
+          "legendFormat": "{{upstream}} retry",
+          "refId": "A"
+        }
+      ],
+      "title": "DoH Upgrade Retry Remaining",
+      "type": "timeseries"
     }
   ],
   "preload": false,
@@ -2510,6 +2695,6 @@
   "timezone": "browser",
   "title": "DNS Encrypted Proxy",
   "uid": "adjpz6x",
-  "version": 2,
+  "version": 4,
   "weekStart": ""
 }

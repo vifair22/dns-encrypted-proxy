@@ -219,7 +219,11 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                 "# HELP dns_encrypted_proxy_upstream_server_healthy Upstream health state (1 healthy, 0 unhealthy).\n"
                 "# TYPE dns_encrypted_proxy_upstream_server_healthy gauge\n"
                 "# HELP dns_encrypted_proxy_upstream_server_consecutive_failures Consecutive failure count per upstream.\n"
-                "# TYPE dns_encrypted_proxy_upstream_server_consecutive_failures gauge\n") != 0) {
+                "# TYPE dns_encrypted_proxy_upstream_server_consecutive_failures gauge\n"
+                "# HELP dns_encrypted_proxy_upstream_doh_forced_http_tier Active forced DoH protocol tier (0=h3,1=h2,2=h1).\n"
+                "# TYPE dns_encrypted_proxy_upstream_doh_forced_http_tier gauge\n"
+                "# HELP dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds Remaining wait before next DoH protocol upgrade probe for upstream.\n"
+                "# TYPE dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds gauge\n") != 0) {
         return -1;
     }
 
@@ -239,7 +243,7 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     "dns_encrypted_proxy_upstream_server_requests_total{upstream=\"%s\",protocol=\"%s\"} %llu\n"
                     "dns_encrypted_proxy_upstream_server_failures_total{upstream=\"%s\",protocol=\"%s\"} %llu\n"
                     "dns_encrypted_proxy_upstream_server_healthy{upstream=\"%s\",protocol=\"%s\"} %d\n"
-                    "dns_encrypted_proxy_upstream_server_consecutive_failures{upstream=\"%s\",protocol=\"%s\"} %u\n",
+                "dns_encrypted_proxy_upstream_server_consecutive_failures{upstream=\"%s\",protocol=\"%s\"} %u\n",
                     escaped_url,
                     upstream_protocol_label(server->type),
                     (unsigned long long)server->health.total_queries,
@@ -253,6 +257,29 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     upstream_protocol_label(server->type),
                     (unsigned int)server->health.consecutive_failures) != 0) {
             return -1;
+        }
+
+        if (server->type == UPSTREAM_TYPE_DOH) {
+            uint64_t now = now_monotonic_ms();
+            uint64_t retry_remaining_ms = 0;
+            if (server->stage.doh_upgrade_retry_after_ms > now) {
+                retry_remaining_ms = server->stage.doh_upgrade_retry_after_ms - now;
+            }
+            if (appendf(
+                    out,
+                    out_size,
+                    offset,
+                    "dns_encrypted_proxy_upstream_doh_forced_http_tier{upstream=\"%s\",protocol=\"%s\"} %u\n"
+                    "dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds{upstream=\"%s\",protocol=\"%s\"} %llu\n",
+                    escaped_url,
+                    upstream_protocol_label(server->type),
+                    (unsigned)server->stage.doh_forced_http_tier,
+                    escaped_url,
+                    upstream_protocol_label(server->type),
+                    (unsigned long long)retry_remaining_ms)
+                != 0) {
+                return -1;
+            }
         }
     }
 
@@ -675,6 +702,16 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h2\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"h1\"} %llu\n"
             "dns_encrypted_proxy_doh_http_responses_total{version=\"other\"} %llu\n"
+            "# HELP dns_encrypted_proxy_doh_protocol_downgrades_total Total DoH protocol downgrade outcomes.\n"
+            "# TYPE dns_encrypted_proxy_doh_protocol_downgrades_total counter\n"
+            "dns_encrypted_proxy_doh_protocol_downgrades_total{from=\"h3\",to=\"h2\"} %llu\n"
+            "dns_encrypted_proxy_doh_protocol_downgrades_total{from=\"h3\",to=\"h1\"} %llu\n"
+            "dns_encrypted_proxy_doh_protocol_downgrades_total{from=\"h2\",to=\"h1\"} %llu\n"
+            "# HELP dns_encrypted_proxy_doh_protocol_upgrade_probes_total Total DoH protocol upgrade probe outcomes.\n"
+            "# TYPE dns_encrypted_proxy_doh_protocol_upgrade_probes_total counter\n"
+            "dns_encrypted_proxy_doh_protocol_upgrade_probes_total{result=\"attempt\"} %llu\n"
+            "dns_encrypted_proxy_doh_protocol_upgrade_probes_total{result=\"success\"} %llu\n"
+            "dns_encrypted_proxy_doh_protocol_upgrade_probes_total{result=\"failure\"} %llu\n"
             "# HELP dns_encrypted_proxy_upstream_stage1_cache_total Upstream stage1 resolver cache counters.\n"
             "# TYPE dns_encrypted_proxy_upstream_stage1_cache_total counter\n"
             "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"hit\"} %llu\n"
@@ -685,6 +722,12 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)runtime_stats.doh_http2_responses_total,
             (unsigned long long)runtime_stats.doh_http1_responses_total,
             (unsigned long long)runtime_stats.doh_http_other_responses_total,
+            (unsigned long long)runtime_stats.doh_downgrade_h3_to_h2_total,
+            (unsigned long long)runtime_stats.doh_downgrade_h3_to_h1_total,
+            (unsigned long long)runtime_stats.doh_downgrade_h2_to_h1_total,
+            (unsigned long long)runtime_stats.doh_upgrade_probe_attempt_total,
+            (unsigned long long)runtime_stats.doh_upgrade_probe_success_total,
+            (unsigned long long)runtime_stats.doh_upgrade_probe_failure_total,
             (unsigned long long)runtime_stats.stage1_cache_hits,
             (unsigned long long)runtime_stats.stage1_cache_misses,
             (unsigned long long)runtime_stats.stage1_cache_refreshes,

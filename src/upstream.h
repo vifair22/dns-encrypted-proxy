@@ -55,6 +55,17 @@ typedef struct {
 
     int last_failure_class;
     uint64_t transport_retry_suppress_until_ms;
+
+    uint8_t doh_forced_http_tier;
+    uint8_t doh_upgrade_failures;
+    uint64_t doh_upgrade_retry_after_ms;
+
+    uint64_t doh_downgrade_h3_to_h2_total;
+    uint64_t doh_downgrade_h3_to_h1_total;
+    uint64_t doh_downgrade_h2_to_h1_total;
+    uint64_t doh_upgrade_probe_attempt_total;
+    uint64_t doh_upgrade_probe_success_total;
+    uint64_t doh_upgrade_probe_failure_total;
 } upstream_stage_state_t;
 
 typedef struct {
@@ -148,6 +159,12 @@ typedef struct {
     uint64_t doh_http2_responses_total;
     uint64_t doh_http1_responses_total;
     uint64_t doh_http_other_responses_total;
+    uint64_t doh_downgrade_h3_to_h2_total;
+    uint64_t doh_downgrade_h3_to_h1_total;
+    uint64_t doh_downgrade_h2_to_h1_total;
+    uint64_t doh_upgrade_probe_attempt_total;
+    uint64_t doh_upgrade_probe_success_total;
+    uint64_t doh_upgrade_probe_failure_total;
 
     int dot_pool_capacity;
     int dot_pool_in_use;

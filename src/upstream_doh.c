@@ -16,6 +16,16 @@
 
 #define DOH_MIN_ATTEMPT_TIMEOUT_MS 200
 #define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
+#define DOH_UPGRADE_BACKOFF_BASE_MS (10ULL * 60ULL * 1000ULL)
+#define DOH_UPGRADE_BACKOFF_MAX_MS (6ULL * 60ULL * 60ULL * 1000ULL)
+
+typedef enum {
+    DOH_HTTP_TIER_H3 = 0,
+    DOH_HTTP_TIER_H2 = 1,
+    DOH_HTTP_TIER_H1 = 2,
+} doh_http_tier_t;
+
+static const char *doh_tier_name(doh_http_tier_t tier);
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -41,6 +51,7 @@ typedef struct {
     long http_status;
     size_t response_len;
     int timeout_ms;
+    int attempt_tier;
     int used_override_v4;
     uint32_t override_addr_v4_be;
 } doh_attempt_error_t;
@@ -187,6 +198,15 @@ static void log_doh_attempt_failure_impl(
         doh_curl_code_string(err->curl_rc),
         err->http_status,
         err->response_len);
+
+    if (err->attempt_tier >= 0) {
+        logger_logf(
+            caller_func,
+            "DEBUG",
+            "DoH %s protocol_tier=%s",
+            phase,
+            doh_tier_name((doh_http_tier_t)err->attempt_tier));
+    }
 }
 
 #define LOG_DOH_ATTEMPT_FAILURE(phase, server, err) \
@@ -280,6 +300,69 @@ static long doh_preferred_http_version(void) {
 #endif
 }
 
+static long doh_http_version_for_tier(doh_http_tier_t tier) {
+    switch (tier) {
+        case DOH_HTTP_TIER_H3:
+#ifdef CURL_HTTP_VERSION_3
+            return CURL_HTTP_VERSION_3;
+#elif defined(CURL_HTTP_VERSION_3ONLY)
+            return CURL_HTTP_VERSION_3ONLY;
+#elif defined(CURL_HTTP_VERSION_2TLS)
+            return CURL_HTTP_VERSION_2TLS;
+#elif defined(CURL_HTTP_VERSION_2)
+            return CURL_HTTP_VERSION_2;
+#elif defined(CURL_HTTP_VERSION_1_1)
+            return CURL_HTTP_VERSION_1_1;
+#else
+            return CURL_HTTP_VERSION_NONE;
+#endif
+        case DOH_HTTP_TIER_H2:
+#ifdef CURL_HTTP_VERSION_2TLS
+            return CURL_HTTP_VERSION_2TLS;
+#elif defined(CURL_HTTP_VERSION_2)
+            return CURL_HTTP_VERSION_2;
+#elif defined(CURL_HTTP_VERSION_2_0)
+            return CURL_HTTP_VERSION_2_0;
+#elif defined(CURL_HTTP_VERSION_1_1)
+            return CURL_HTTP_VERSION_1_1;
+#else
+            return CURL_HTTP_VERSION_NONE;
+#endif
+        case DOH_HTTP_TIER_H1:
+#ifdef CURL_HTTP_VERSION_1_1
+            return CURL_HTTP_VERSION_1_1;
+#elif defined(CURL_HTTP_VERSION_1_0)
+            return CURL_HTTP_VERSION_1_0;
+#else
+            return CURL_HTTP_VERSION_NONE;
+#endif
+        default:
+            return doh_preferred_http_version();
+    }
+}
+
+static const char *doh_tier_name(doh_http_tier_t tier) {
+    switch (tier) {
+        case DOH_HTTP_TIER_H3:
+            return "h3";
+        case DOH_HTTP_TIER_H2:
+            return "h2";
+        case DOH_HTTP_TIER_H1:
+            return "h1";
+        default:
+            return "unknown";
+    }
+}
+
+static uint64_t doh_upgrade_backoff_ms(uint8_t failures) {
+    uint8_t shift = failures > 10 ? 10 : failures;
+    uint64_t backoff = DOH_UPGRADE_BACKOFF_BASE_MS << shift;
+    if (backoff > DOH_UPGRADE_BACKOFF_MAX_MS) {
+        backoff = DOH_UPGRADE_BACKOFF_MAX_MS;
+    }
+    return backoff;
+}
+
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
     buffer_t *buffer = (buffer_t *)userdata;
     size_t chunk = size * nmemb;
@@ -345,6 +428,7 @@ static int doh_post_with_handle(
     upstream_doh_client_t *client,
     CURL *curl,
     const upstream_server_t *server,
+    doh_http_tier_t http_tier,
     int use_override_v4,
     uint32_t override_addr_v4_be,
     int timeout_ms,
@@ -358,6 +442,7 @@ static int doh_post_with_handle(
         memset(err_out, 0, sizeof(*err_out));
         err_out->curl_rc = CURLE_OK;
         err_out->timeout_ms = timeout_ms;
+        err_out->attempt_tier = (int)http_tier;
         err_out->used_override_v4 = use_override_v4;
         err_out->override_addr_v4_be = override_addr_v4_be;
     }
@@ -384,7 +469,7 @@ static int doh_post_with_handle(
     if (force_http1 != NULL && *force_http1 != '\0') {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     } else {
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, doh_preferred_http_version());
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, doh_http_version_for_tier(http_tier));
     }
 
     const char *insecure_tls = getenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
@@ -581,130 +666,106 @@ int upstream_doh_resolve(
     size_t response_len = 0;
     doh_attempt_error_t attempt_err;
 
-    int attempts_left = 1;
+    uint64_t now = now_ms();
+    doh_http_tier_t forced_tier = (doh_http_tier_t)mutable_server->stage.doh_forced_http_tier;
+    if (forced_tier < DOH_HTTP_TIER_H3 || forced_tier > DOH_HTTP_TIER_H1) {
+        forced_tier = DOH_HTTP_TIER_H3;
+        mutable_server->stage.doh_forced_http_tier = (uint8_t)forced_tier;
+    }
+
+    doh_http_tier_t top_tier = forced_tier;
+    int attempted_upgrade = 0;
+    if (forced_tier > DOH_HTTP_TIER_H3 &&
+        now >= mutable_server->stage.doh_upgrade_retry_after_ms) {
+        top_tier = (doh_http_tier_t)(forced_tier - 1);
+        attempted_upgrade = 1;
+    }
+
+    int route_count = 1;
     if (server->stage.has_stage1_cached_v4) {
-        attempts_left++;
+        route_count++;
     }
     if (server->stage.has_bootstrap_v4) {
-        attempts_left++;
+        route_count++;
     }
+    int protocol_attempts_per_route = (int)(DOH_HTTP_TIER_H1 - top_tier + 1);
+    int attempts_left = route_count * protocol_attempts_per_route;
     int total_budget_ms = timeout_ms > 0 ? timeout_ms : 1000;
-    uint64_t deadline_ms = now_ms() + (uint64_t)total_budget_ms;
-    upstream_failure_class_t primary_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    uint64_t deadline_ms = now + (uint64_t)total_budget_ms;
+    int result = -1;
+    upstream_failure_class_t final_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    doh_http_tier_t successful_tier = DOH_HTTP_TIER_H3;
 
-    int attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left);
-    if (attempt_timeout_ms < 0) {
-        pool_release(client, slot);
-        mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
-        return -1;
-    }
-    int result = doh_post_with_handle(
-        client,
-        curl,
-        server,
-        0,
-        0,
-        attempt_timeout_ms,
-        query, query_len,
-        &response, &response_len,
-        &attempt_err);
-    attempts_left--;
+    for (int route = 0; route < route_count && result != 0; route++) {
+        int use_override_v4 = 0;
+        uint32_t override_addr_v4_be = 0;
+        const char *phase = "primary request";
 
-    if (result != 0) {
-        LOG_DOH_ATTEMPT_FAILURE("primary request", server, &attempt_err);
-        primary_failure_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
-        mutable_server->stage.last_failure_class = (int)primary_failure_class;
-
-        uint64_t now = now_ms();
-        if (failure_class_is_transport_like(primary_failure_class)) {
-            mutable_server->stage.transport_retry_suppress_until_ms = now + DOH_TRANSPORT_SUPPRESS_MS;
+        if (route == 1 && server->stage.has_stage1_cached_v4) {
+            use_override_v4 = 1;
+            override_addr_v4_be = server->stage.stage1_cached_addr_v4_be;
+            phase = "stage1 cached IPv4";
+        } else if ((route == 1 && !server->stage.has_stage1_cached_v4 && server->stage.has_bootstrap_v4) ||
+                   (route == 2 && server->stage.has_bootstrap_v4)) {
+            use_override_v4 = 1;
+            override_addr_v4_be = server->stage.bootstrap_addr_v4_be;
+            phase = "stage2 bootstrap IPv4";
+            LOGF_WARN("DoH stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
         }
 
-        int bootstrap_fresh =
-            server->stage.has_bootstrap_v4 &&
-            server->stage.bootstrap_expires_at_ms > now;
-        int stage1_cache_available =
-            server->stage.has_stage1_cached_v4 &&
-            server->stage.stage1_cache_expires_at_ms > now;
+        for (doh_http_tier_t tier = top_tier; tier <= DOH_HTTP_TIER_H1; tier = (doh_http_tier_t)(tier + 1)) {
+            int attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
+            if (attempt_timeout_ms < 0) {
+                pool_release(client, slot);
+                mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+                return -1;
+            }
 
-        if (failure_class_is_transport_like(primary_failure_class) &&
-            bootstrap_fresh &&
-            stage1_cache_available) {
-            LOGF_WARN(
-                "DoH retry chain skipped after primary transport-class failure: host=%s class=%d reason=%s budget_ms=%d",
-                server->host,
-                (int)primary_failure_class,
-                doh_failure_reason(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len),
-                total_budget_ms);
-            pool_release(client, slot);
-            return -1;
-        }
-    }
+            result = doh_post_with_handle(
+                client,
+                curl,
+                server,
+                tier,
+                use_override_v4,
+                override_addr_v4_be,
+                attempt_timeout_ms,
+                query,
+                query_len,
+                &response,
+                &response_len,
+                &attempt_err);
+            attempts_left--;
 
-    if (result != 0 && server->stage.has_stage1_cached_v4) {
-        attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
-        if (attempt_timeout_ms < 0) {
-            pool_release(client, slot);
-            return -1;
-        }
-        result = doh_post_with_handle(
-            client,
-            curl,
-            server,
-            1,
-            server->stage.stage1_cached_addr_v4_be,
-            attempt_timeout_ms,
-            query,
-            query_len,
-            &response,
-            &response_len,
-            &attempt_err);
-        attempts_left--;
-        if (result != 0) {
-            LOG_DOH_ATTEMPT_FAILURE("stage1 cached IPv4", server, &attempt_err);
-            mutable_server->stage.last_failure_class =
-                (int)doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
-        }
-    }
+            if (result == 0) {
+                successful_tier = tier;
+                if (strcmp(phase, "stage2 bootstrap IPv4") == 0) {
+                    LOGF_INFO("DoH stage2 bootstrap IPv4 succeeded: host=%s protocol=%s", server->host, doh_tier_name(tier));
+                }
+                break;
+            }
 
-    if (result != 0 && server->stage.has_bootstrap_v4) {
-        /*
-         * Stage 2 fallback: pin host:port to bootstrap IP for this request.
-         * We still keep the original hostname for SNI/cert checks.
-         *
-         * Not the default path: local DNS is usually fresher when providers
-         * rotate or rebalance endpoints.
-         */
-        LOGF_WARN("DoH stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
-        attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
-        if (attempt_timeout_ms < 0) {
-            pool_release(client, slot);
-            return -1;
-        }
-        result = doh_post_with_handle(
-            client,
-            curl,
-            server,
-            1,
-            server->stage.bootstrap_addr_v4_be,
-            attempt_timeout_ms,
-            query,
-            query_len,
-            &response,
-            &response_len,
-            &attempt_err);
-        if (result == 0) {
-            LOGF_INFO("DoH stage2 bootstrap IPv4 succeeded: host=%s", server->host);
-        } else {
-            LOG_DOH_ATTEMPT_FAILURE("stage2 bootstrap IPv4", server, &attempt_err);
-            mutable_server->stage.last_failure_class =
-                (int)doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
+            LOG_DOH_ATTEMPT_FAILURE(phase, server, &attempt_err);
+            final_failure_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
+            mutable_server->stage.last_failure_class = (int)final_failure_class;
         }
     }
     
     pool_release(client, slot);
     
     if (result != 0) {
+        now = now_ms();
+        if (failure_class_is_transport_like(final_failure_class)) {
+            mutable_server->stage.transport_retry_suppress_until_ms = now + DOH_TRANSPORT_SUPPRESS_MS;
+            if (attempted_upgrade) {
+                __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_failure_total, 1, __ATOMIC_RELAXED);
+                if (mutable_server->stage.doh_upgrade_failures < 255) {
+                    mutable_server->stage.doh_upgrade_failures++;
+                }
+                mutable_server->stage.doh_upgrade_retry_after_ms =
+                    now + doh_upgrade_backoff_ms(mutable_server->stage.doh_upgrade_failures);
+            }
+        }
         return -1;
     }
     
@@ -712,6 +773,44 @@ int upstream_doh_resolve(
     if (dns_validate_response_for_query(query, query_len, response, response_len) != 0) {
         free(response);
         return -1;
+    }
+
+    now = now_ms();
+    if (successful_tier > forced_tier) {
+        if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H2) {
+            __atomic_add_fetch(&mutable_server->stage.doh_downgrade_h3_to_h2_total, 1, __ATOMIC_RELAXED);
+        } else if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H1) {
+            __atomic_add_fetch(&mutable_server->stage.doh_downgrade_h3_to_h1_total, 1, __ATOMIC_RELAXED);
+        } else if (forced_tier == DOH_HTTP_TIER_H2 && successful_tier == DOH_HTTP_TIER_H1) {
+            __atomic_add_fetch(&mutable_server->stage.doh_downgrade_h2_to_h1_total, 1, __ATOMIC_RELAXED);
+        }
+        mutable_server->stage.doh_forced_http_tier = (uint8_t)successful_tier;
+        if (mutable_server->stage.doh_upgrade_failures < 255) {
+            mutable_server->stage.doh_upgrade_failures++;
+        }
+        mutable_server->stage.doh_upgrade_retry_after_ms =
+            now + doh_upgrade_backoff_ms(mutable_server->stage.doh_upgrade_failures);
+        LOGF_WARN(
+            "DoH protocol downgrade pinned: host=%s forced=%s retry_after_ms=%llu failures=%u",
+            server->host,
+            doh_tier_name(successful_tier),
+            (unsigned long long)mutable_server->stage.doh_upgrade_retry_after_ms,
+            (unsigned)mutable_server->stage.doh_upgrade_failures);
+    } else if (attempted_upgrade && successful_tier < forced_tier) {
+        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_success_total, 1, __ATOMIC_RELAXED);
+        mutable_server->stage.doh_forced_http_tier = (uint8_t)successful_tier;
+        mutable_server->stage.doh_upgrade_failures = 0;
+        mutable_server->stage.doh_upgrade_retry_after_ms = now + DOH_UPGRADE_BACKOFF_BASE_MS;
+        LOGF_INFO("DoH protocol upgrade accepted: host=%s protocol=%s", server->host, doh_tier_name(successful_tier));
+    } else if (attempted_upgrade && successful_tier == forced_tier) {
+        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_failure_total, 1, __ATOMIC_RELAXED);
+        if (mutable_server->stage.doh_upgrade_failures < 255) {
+            mutable_server->stage.doh_upgrade_failures++;
+        }
+        mutable_server->stage.doh_upgrade_retry_after_ms =
+            now + doh_upgrade_backoff_ms(mutable_server->stage.doh_upgrade_failures);
     }
 
     mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;

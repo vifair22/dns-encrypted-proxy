@@ -1125,6 +1125,25 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             &stats_out->doh_http1_responses_total,
             &stats_out->doh_http_other_responses_total);
     }
+
+    for (int i = 0; i < client->server_count; i++) {
+        const upstream_server_t *server = &client->servers[i];
+        if (server->type != UPSTREAM_TYPE_DOH) {
+            continue;
+        }
+        stats_out->doh_downgrade_h3_to_h2_total +=
+            __atomic_load_n(&server->stage.doh_downgrade_h3_to_h2_total, __ATOMIC_RELAXED);
+        stats_out->doh_downgrade_h3_to_h1_total +=
+            __atomic_load_n(&server->stage.doh_downgrade_h3_to_h1_total, __ATOMIC_RELAXED);
+        stats_out->doh_downgrade_h2_to_h1_total +=
+            __atomic_load_n(&server->stage.doh_downgrade_h2_to_h1_total, __ATOMIC_RELAXED);
+        stats_out->doh_upgrade_probe_attempt_total +=
+            __atomic_load_n(&server->stage.doh_upgrade_probe_attempt_total, __ATOMIC_RELAXED);
+        stats_out->doh_upgrade_probe_success_total +=
+            __atomic_load_n(&server->stage.doh_upgrade_probe_success_total, __ATOMIC_RELAXED);
+        stats_out->doh_upgrade_probe_failure_total +=
+            __atomic_load_n(&server->stage.doh_upgrade_probe_failure_total, __ATOMIC_RELAXED);
+    }
 #endif
 
 #if UPSTREAM_DOT_ENABLED
