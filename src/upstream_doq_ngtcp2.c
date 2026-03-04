@@ -138,6 +138,11 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
+static int test_force_getaddrinfo_fail(void) {
+    const char *v = getenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_GETADDRINFO_FAIL");
+    return v != NULL && *v != '\0';
+}
+
 static void fill_random_bytes(uint8_t *buffer, size_t len) {
     if (buffer == NULL || len == 0) {
         return;
@@ -941,7 +946,7 @@ int upstream_doq_ngtcp2_resolve(
     hints.ai_protocol = IPPROTO_UDP;
 
     struct addrinfo *res = NULL;
-    if (result != 0 && (getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL)) {
+    if (result != 0 && (test_force_getaddrinfo_fail() || getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL)) {
         primary_reason = "getaddrinfo_failed";
         LOG_DOQ_ATTEMPT_FAILURE(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
         free(stream_data);

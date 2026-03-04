@@ -27,6 +27,11 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+static int test_force_getaddrinfo_fail(void) {
+    const char *v = getenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_GETADDRINFO_FAIL");
+    return v != NULL && *v != '\0';
+}
+
 static uint16_t read_u16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
@@ -448,7 +453,12 @@ upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *res = NULL;
-    int gai = getaddrinfo(server->host, NULL, &hints, &res);
+    int gai;
+    if (test_force_getaddrinfo_fail()) {
+        gai = EAI_FAIL;
+    } else {
+        gai = getaddrinfo(server->host, NULL, &hints, &res);
+    }
     if (gai != 0 || res == NULL) {
         server->stage.has_stage1_cached_v4 = 0;
         return UPSTREAM_STAGE1_CACHE_MISS;

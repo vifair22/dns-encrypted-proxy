@@ -107,6 +107,11 @@ static void log_dot_attempt_failure_impl(
 #define LOG_DOT_ATTEMPT_FAILURE(server, phase, detail_reason, used_override_v4, override_addr_v4_be, timeout_ms) \
     log_dot_attempt_failure_impl(__func__, server, phase, detail_reason, used_override_v4, override_addr_v4_be, timeout_ms)
 
+static int test_force_getaddrinfo_fail(void) {
+    const char *v = getenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_GETADDRINFO_FAIL");
+    return v != NULL && *v != '\0';
+}
+
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
@@ -124,7 +129,7 @@ static int connect_with_timeout(const char *host, int port, int timeout_ms) {
     snprintf(port_str, sizeof(port_str), "%d", port);
     
     struct addrinfo *res = NULL;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0 || res == NULL) {
+    if (test_force_getaddrinfo_fail() || getaddrinfo(host, port_str, &hints, &res) != 0 || res == NULL) {
         return -1;
     }
     

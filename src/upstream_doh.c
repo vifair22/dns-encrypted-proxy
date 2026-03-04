@@ -620,9 +620,16 @@ int upstream_doh_resolve(
             mutable_server->stage.transport_retry_suppress_until_ms = now + DOH_TRANSPORT_SUPPRESS_MS;
         }
 
-        if (failure_class_is_transport_like(primary_failure_class) &&
+        int bootstrap_fresh =
             server->stage.has_bootstrap_v4 &&
-            server->stage.bootstrap_expires_at_ms > now) {
+            server->stage.bootstrap_expires_at_ms > now;
+        int stage1_cache_available =
+            server->stage.has_stage1_cached_v4 &&
+            server->stage.stage1_cache_expires_at_ms > now;
+
+        if (failure_class_is_transport_like(primary_failure_class) &&
+            bootstrap_fresh &&
+            stage1_cache_available) {
             LOGF_WARN(
                 "DoH retry chain skipped after primary transport-class failure: host=%s class=%d reason=%s budget_ms=%d",
                 server->host,
