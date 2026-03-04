@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+
+FROM alpine:latest
+
+RUN apk add --no-cache \
+    autoconf \
+    automake \
+    cmake \
+    cmocka-dev \
+    curl-dev \
+    gcc \
+    git \
+    libtool \
+    make \
+    musl-dev \
+    openssl-dev \
+    pkgconfig \
+    python3
+
+ARG C_LOG_REF=master
+ARG NGTCP2_REF=v1.12.0
+
+RUN git clone --depth 1 --branch "${C_LOG_REF}" https://git.airies.net/vifair22/c-log /opt/c-log
+
+RUN git clone --depth 1 --branch "${NGTCP2_REF}" https://github.com/ngtcp2/ngtcp2 /tmp/ngtcp2 \
+    && cd /tmp/ngtcp2 \
+    && autoreconf -fi \
+    && ./configure --enable-lib-only --with-openssl \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /tmp/ngtcp2
+
+ENV C_LOG_PATH=/opt/c-log
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+WORKDIR /work
+
+CMD ["sh"]

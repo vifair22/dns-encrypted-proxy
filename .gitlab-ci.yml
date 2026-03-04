@@ -26,32 +26,7 @@ test:
     - export LD_LIBRARY_PATH=/usr/local/lib
     - cd "$CI_PROJECT_DIR"
   script:
-    - |
-      set -euo pipefail
-      mkdir -p build-matrix-ci
-      for doh in OFF ON; do
-        for dot in OFF ON; do
-          for doq in OFF ON; do
-            if [ "$doh" = "OFF" ] && [ "$dot" = "OFF" ] && [ "$doq" = "OFF" ]; then
-              continue
-            fi
-            combo="doh-${doh}_dot-${dot}_doq-${doq}"
-            bdir="build-matrix-ci/$combo"
-            echo "==> Configure $combo"
-            cmake -S . -B "$bdir" \
-              -DC_LOG_PATH=/tmp/c-log \
-              -DBUILD_TESTS=ON \
-              -DBUILD_BENCHMARKS=OFF \
-              -DENABLE_UPSTREAM_DOH="$doh" \
-              -DENABLE_UPSTREAM_DOT="$dot" \
-              -DENABLE_UPSTREAM_DOQ="$doq"
-            echo "==> Build $combo"
-            cmake --build "$bdir" -j
-            echo "==> Test $combo"
-            ctest --test-dir "$bdir" --output-on-failure --timeout 30
-          done
-        done
-      done
+    - sh tools/ci_test_matrix.sh
   artifacts:
     when: on_failure
     paths:

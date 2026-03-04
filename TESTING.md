@@ -67,3 +67,13 @@ cmake -S . -B build -DBUILD_TESTS=ON -DWARNINGS_AS_ERRORS=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+## Docker CI Mirror (Recommended)
+
+Use the dedicated CI test image and run the same matrix script used by GitLab:
+
+```bash
+sh tools/run_ci_tests_docker.sh
+```
+
+This builds `Dockerfile.ci-test`, installs ngtcp2 v1.12.0 and c-log, and runs `tools/ci_test_matrix.sh` across all upstream feature combinations.

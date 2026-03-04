@@ -31,6 +31,8 @@ typedef struct upstream_job {
     struct upstream_job *next;
 } upstream_job_t;
 
+struct upstream_facilitator;
+
 typedef enum {
     UPSTREAM_MEMBER_UNINIT = 0,
     UPSTREAM_MEMBER_CONNECTING = 1,
@@ -53,6 +55,7 @@ typedef struct {
     pthread_t thread;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+    struct upstream_facilitator *facilitator;
 
     upstream_job_t *assigned_head;
     upstream_job_t *assigned_tail;
@@ -72,7 +75,7 @@ typedef struct {
     int slot_index;
 } upstream_member_t;
 
-typedef struct {
+typedef struct upstream_facilitator {
     upstream_client_t *upstream;
 
     pthread_t dispatcher_thread;

@@ -453,20 +453,11 @@ static uint32_t provider_penalty_score(const upstream_facilitator_t *fac, int pr
 }
 
 static void *member_worker_thread_main(void *arg) {
-    upstream_facilitator_t *fac = (upstream_facilitator_t *)arg;
-
-    upstream_member_t *member = NULL;
-    pthread_mutex_lock(&fac->queue_mutex);
-    for (int i = 0; i < fac->member_count; i++) {
-        if (pthread_equal(pthread_self(), fac->members[i].thread)) {
-            member = &fac->members[i];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&fac->queue_mutex);
-    if (member == NULL) {
+    upstream_member_t *member = (upstream_member_t *)arg;
+    if (member == NULL || member->facilitator == NULL) {
         return NULL;
     }
+    upstream_facilitator_t *fac = member->facilitator;
 
     while (1) {
         pthread_mutex_lock(&member->mutex);
@@ -774,6 +765,7 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
         member->index = i;
         member->provider_index = i / facilitator->members_per_provider;
         member->slot_index = i % facilitator->members_per_provider;
+        member->facilitator = facilitator;
         member->running = 1;
         upstream_type_t provider_type = upstream->servers[member->provider_index].type;
         if (provider_type == UPSTREAM_TYPE_DOH) {
@@ -795,7 +787,7 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
         member->transport_suppress_until_ms = 0;
         if (pthread_mutex_init(&member->mutex, NULL) != 0 ||
             pthread_cond_init(&member->cond, NULL) != 0 ||
-            pthread_create(&member->thread, NULL, member_worker_thread_main, facilitator) != 0) {
+            pthread_create(&member->thread, NULL, member_worker_thread_main, member) != 0) {
             facilitator->running = 0;
             for (int j = 0; j <= i; j++) {
                 upstream_member_t *m = &facilitator->members[j];
