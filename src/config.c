@@ -520,8 +520,8 @@ static void set_defaults(proxy_config_t *config) {
     config->cache_capacity = 1024;
 
 #if UPSTREAM_DOH_ENABLED
-    strncpy(config->upstream_urls[0], "https://cloudflare-dns.com/dns-query", MAX_URL_LEN - 1);
-    strncpy(config->upstream_urls[1], "https://dns.google/dns-query", MAX_URL_LEN - 1);
+    strncpy(config->upstream_urls[0], "https://dns.google/dns-query", MAX_URL_LEN - 1);
+    strncpy(config->upstream_urls[1], "https://cloudflare-dns.com/dns-query", MAX_URL_LEN - 1);
     config->upstream_count = 2;
 #elif UPSTREAM_DOT_ENABLED
     strncpy(config->upstream_urls[0], "tls://cloudflare-dns.com:853", MAX_URL_LEN - 1);

@@ -336,7 +336,9 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     out_size,
                     offset,
                     "# HELP dns_encrypted_proxy_upstream_dispatch_inflight Inflight dispatch jobs by upstream provider.\n"
-                    "# TYPE dns_encrypted_proxy_upstream_dispatch_inflight gauge\n")
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_inflight gauge\n"
+                    "# HELP dns_encrypted_proxy_upstream_dispatch_penalty Provider penalty score (higher means more de-prioritized).\n"
+                    "# TYPE dns_encrypted_proxy_upstream_dispatch_penalty gauge\n")
                 != 0) {
                 return -1;
             }
@@ -354,6 +356,19 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                         escaped_url,
                         upstream_protocol_label(server->type),
                         (unsigned long long)inflight)
+                    != 0) {
+                    return -1;
+                }
+                uint64_t penalty = upstream_facilitator_get_provider_penalty(g_facilitator, i);
+                if (appendf(
+                        out,
+                        out_size,
+                        offset,
+                        "dns_encrypted_proxy_upstream_dispatch_penalty{provider=\"%d\",upstream=\"%s\",protocol=\"%s\"} %llu\n",
+                        i,
+                        escaped_url,
+                        upstream_protocol_label(server->type),
+                        (unsigned long long)penalty)
                     != 0) {
                     return -1;
                 }

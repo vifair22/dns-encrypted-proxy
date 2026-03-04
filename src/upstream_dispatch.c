@@ -291,6 +291,8 @@ static int member_is_dispatchable(upstream_member_t *member, uint64_t now) {
     return 1;
 }
 
+static uint32_t provider_penalty_score(const upstream_facilitator_t *fac, int provider, uint64_t now);
+
 static void *allocator_thread_main(void *arg) {
     upstream_facilitator_t *fac = (upstream_facilitator_t *)arg;
     while (1) {
@@ -366,7 +368,35 @@ static int select_member_index(upstream_facilitator_t *fac, uint64_t now) {
         return -1;
     }
 
-    for (int provider = 0; provider < fac->provider_count; provider++) {
+    int provider_order[UPSTREAM_MAX_SERVERS];
+    int provider_used[UPSTREAM_MAX_SERVERS];
+    memset(provider_used, 0, sizeof(provider_used));
+
+    for (int rank = 0; rank < fac->provider_count; rank++) {
+        int best_provider = -1;
+        uint32_t best_score = UINT_MAX;
+
+        for (int provider = 0; provider < fac->provider_count; provider++) {
+            if (provider_used[provider]) {
+                continue;
+            }
+
+            uint32_t score = provider_penalty_score(fac, provider, now);
+            if (best_provider < 0 || score < best_score || (score == best_score && provider < best_provider)) {
+                best_provider = provider;
+                best_score = score;
+            }
+        }
+
+        if (best_provider < 0) {
+            return -1;
+        }
+        provider_used[best_provider] = 1;
+        provider_order[rank] = best_provider;
+    }
+
+    for (int rank = 0; rank < fac->provider_count; rank++) {
+        int provider = provider_order[rank];
         int start = fac->provider_cursors[provider];
         int best_idx = -1;
         unsigned int best_inflight = UINT_MAX;
@@ -392,6 +422,34 @@ static int select_member_index(upstream_facilitator_t *fac, uint64_t now) {
         }
     }
     return -1;
+}
+
+static uint32_t provider_penalty_score(const upstream_facilitator_t *fac, int provider, uint64_t now) {
+    upstream_server_t *server = &fac->upstream->servers[provider];
+    uint32_t score = 0;
+
+    if (!server->health.healthy) {
+        score += 1000;
+    }
+    score += server->health.consecutive_failures * 100;
+
+    if (server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_TRANSPORT ||
+        server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_TIMEOUT ||
+        server->stage.last_failure_class == UPSTREAM_FAILURE_CLASS_TLS) {
+        score += 300;
+        if (server->stage.transport_retry_suppress_until_ms > now) {
+            score += 700;
+        }
+    }
+
+    if (server->health.last_failure_time != 0) {
+        uint64_t age_ms = now > server->health.last_failure_time ? now - server->health.last_failure_time : 0;
+        if (age_ms < 10000) {
+            score += 200;
+        }
+    }
+
+    return score;
 }
 
 static void *member_worker_thread_main(void *arg) {
@@ -1022,4 +1080,16 @@ uint64_t upstream_facilitator_get_provider_inflight(
         }
     }
     return total;
+}
+
+uint64_t upstream_facilitator_get_provider_penalty(
+    const upstream_facilitator_t *facilitator,
+    int provider_index) {
+    if (facilitator == NULL || facilitator->upstream == NULL ||
+        provider_index < 0 || provider_index >= facilitator->provider_count) {
+        return 0;
+    }
+
+    uint64_t now = now_ms();
+    return (uint64_t)provider_penalty_score(facilitator, provider_index, now);
 }

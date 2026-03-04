@@ -14,4 +14,4 @@ metrics_port=9090
 log_level=INFO
 bootstrap_resolvers=8.8.8.8,1.1.1.1
 hosts_a=router.local=192.168.1.1,nas.local=192.168.1.20
-upstreams=https://cloudflare-dns.com/dns-query,https://dns.google/dns-query
+upstreams=https://dns.google/dns-query,https://cloudflare-dns.com/dns-query

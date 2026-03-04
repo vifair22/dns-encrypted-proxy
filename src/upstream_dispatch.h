@@ -168,5 +168,8 @@ int upstream_facilitator_get_stats(
 uint64_t upstream_facilitator_get_provider_inflight(
     const upstream_facilitator_t *facilitator,
     int provider_index);
+uint64_t upstream_facilitator_get_provider_penalty(
+    const upstream_facilitator_t *facilitator,
+    int provider_index);
 
 #endif

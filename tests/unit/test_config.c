@@ -48,8 +48,8 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.hosts_a_override_count, 0);
     assert_int_equal(config.upstream_count, 2);
 #if UPSTREAM_DOH_ENABLED
-    assert_string_equal(config.upstream_urls[0], "https://cloudflare-dns.com/dns-query");
-    assert_string_equal(config.upstream_urls[1], "https://dns.google/dns-query");
+    assert_string_equal(config.upstream_urls[0], "https://dns.google/dns-query");
+    assert_string_equal(config.upstream_urls[1], "https://cloudflare-dns.com/dns-query");
 #elif UPSTREAM_DOT_ENABLED
     assert_string_equal(config.upstream_urls[0], "tls://cloudflare-dns.com:853");
     assert_string_equal(config.upstream_urls[1], "tls://dns.google:853");

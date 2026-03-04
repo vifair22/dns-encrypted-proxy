@@ -125,6 +125,14 @@ uint64_t upstream_facilitator_get_provider_inflight(
     return 0;
 }
 
+uint64_t upstream_facilitator_get_provider_penalty(
+    const upstream_facilitator_t *facilitator,
+    int provider_index) {
+    (void)facilitator;
+    (void)provider_index;
+    return 0;
+}
+
 #define socket metrics_wrap_socket
 #define bind metrics_wrap_bind
 #define listen metrics_wrap_listen
