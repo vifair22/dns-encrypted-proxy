@@ -829,8 +829,17 @@ static int consume_retry_budget(int *budget, const upstream_server_t *server, co
     return 0;
 }
 
-static int should_try_stage2_after_stage1_failure(const upstream_server_t *server) {
+static int should_try_stage2_after_stage1_failure(
+    const upstream_server_t *server,
+    upstream_stage1_cache_result_t stage1_cache) {
     uint64_t now = now_ms();
+
+    if (server->stage.has_bootstrap_v4 && server->stage.bootstrap_expires_at_ms > now) {
+        if (stage1_cache == UPSTREAM_STAGE1_CACHE_MISS) {
+            return 1;
+        }
+    }
+
     if (server->stage.transport_retry_suppress_until_ms != 0 && now < server->stage.transport_retry_suppress_until_ms) {
         return 0;
     }
@@ -916,7 +925,7 @@ static int resolve_server_with_fallback(
 
     note_stage1_failure(client, server);
 
-    if (!should_try_stage2_after_stage1_failure(server)) {
+    if (!should_try_stage2_after_stage1_failure(server, stage1_cache)) {
         uint64_t now = now_ms();
         uint64_t suppress_remaining_ms =
             server->stage.transport_retry_suppress_until_ms > now

@@ -641,7 +641,7 @@ static void test_upstream_stage_metrics_matrix(void **state) {
     }
 }
 
-static void test_upstream_transport_timeout_skips_stage_traversal(void **state) {
+static void test_upstream_transport_timeout_uses_stage2_when_stage1_cache_missing(void **state) {
     (void)state;
     reset_stubs();
 
@@ -671,12 +671,12 @@ static void test_upstream_transport_timeout_skips_stage_traversal(void **state) 
     assert_int_equal(resolve_any_server(&client, q, sizeof(q), &out, &out_len), -1);
     free(out);
 
-    assert_int_equal(g_stage2_calls, 0);
+    assert_true(g_stage2_calls >= 1);
     assert_int_equal(g_stage3_calls, 0);
 
     upstream_runtime_stats_t stats;
     assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
-    assert_int_equal(stats.stage2_attempts, 0);
+    assert_true(stats.stage2_attempts >= 1);
     assert_int_equal(stats.stage3_attempts, 0);
 
     upstream_client_destroy(&client);
@@ -754,7 +754,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_internal_init_and_switch_edges),
         cmocka_unit_test(test_upstream_parse_and_stats_edges),
         cmocka_unit_test(test_upstream_stage_metrics_matrix),
-        cmocka_unit_test(test_upstream_transport_timeout_skips_stage_traversal),
+        cmocka_unit_test(test_upstream_transport_timeout_uses_stage2_when_stage1_cache_missing),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
         cmocka_unit_test(test_upstream_ready_state),
     };
