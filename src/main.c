@@ -72,26 +72,27 @@ int main(int argc, char **argv) {
     LOGF_INFO("Starting DNS listener on %s:%d (UDP+TCP)", config.listen_addr, config.listen_port);
 
     proxy_server_t server;
-    if (proxy_server_init(&server, &config, &g_stop) != 0) {
-        LOGF_ERROR("Failed to initialize server");
+    if (proxy_server_init(&server, &config, &g_stop) != PROXY_OK) {
+        LOGF_ERROR("Failed to initialize server: %s", proxy_error_message());
         return 1;
     }
 
     if (config.metrics_enabled) {
-        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_port) != 0) {
-            LOGF_ERROR("Failed to start metrics server on port %d", config.metrics_port);
+        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_port) != PROXY_OK) {
+            LOGF_ERROR("Failed to start metrics server on port %d: %s", config.metrics_port, proxy_error_message());
             proxy_server_destroy(&server);
             return 1;
         }
         LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_port);
     }
 
-    int rc = proxy_server_run(&server);
+    proxy_status_t rc = proxy_server_run(&server);
 
     metrics_server_stop();
     proxy_server_destroy(&server);
 
-    if (rc != 0) {
+    if (rc != PROXY_OK) {
+        LOGF_ERROR("Proxy server runtime error: %s", proxy_error_message());
         return 1;
     }
 
