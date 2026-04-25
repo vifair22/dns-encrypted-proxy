@@ -2,6 +2,7 @@
 
 #include "upstream.h"
 #include "upstream_doq.h"
+#include "upstream_doq_ngtcp2.h"
 #include "dns_message.h"
 
 #include <stdlib.h>
@@ -20,14 +21,6 @@
 struct upstream_doq_client {
     int pool_size;
 };
-
-int upstream_doq_ngtcp2_resolve(
-    const upstream_server_t *server,
-    int timeout_ms,
-    const uint8_t *query,
-    size_t query_len,
-    uint8_t **response_out,
-    size_t *response_len_out);
 
 int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config) {
     if (client_out == NULL || config == NULL) {

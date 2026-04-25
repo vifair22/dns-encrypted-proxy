@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "upstream_doq_ngtcp2.h"
 #include "logger.h"
 
 #include <ngtcp2/ngtcp2.h>
@@ -71,7 +72,7 @@ static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
     }
     struct in_addr addr;
     addr.s_addr = addr_v4_be;
-    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+    if (inet_ntop(AF_INET, &addr, out, (socklen_t)out_len) == NULL) {
         out[0] = '\0';
     }
 }
@@ -635,7 +636,10 @@ static int doq_ngtcp2_send_stream_data(
         uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_NONE;
 
         if (*stream_offset < stream_data_len) {
-            vec.base = (uint8_t *)(stream_data + *stream_offset);
+            /* ngtcp2_vec.base is non-const; the buffer is read-only in
+             * practice but the API takes uint8_t *. Route through uintptr_t
+             * to drop the qualifier without tripping -Wcast-qual. */
+            vec.base = (uint8_t *)(uintptr_t)(stream_data + *stream_offset);
             vec.len = stream_data_len - *stream_offset;
             vec_ptr = &vec;
             vec_count = 1;
@@ -746,7 +750,7 @@ static int doq_ngtcp2_exchange_on_fd(
     }
 
     int effective_timeout_ms = timeout_ms > 0 ? timeout_ms : 1000;
-    uint64_t deadline = now_ns() + (uint64_t)effective_timeout_ms * 1000000ULL;
+    uint64_t deadline = now_ns() + (uint64_t)effective_timeout_ms * UINT64_C(1000000);
     int result = -1;
 
     while (now_ns() < deadline) {
@@ -881,7 +885,7 @@ int upstream_doq_ngtcp2_resolve(
     int result = -1;
     const char *primary_reason = "not_attempted";
     int total_timeout_ms = timeout_ms > 0 ? timeout_ms : 1000;
-    uint64_t overall_deadline = now_ns() + (uint64_t)total_timeout_ms * 1000000ULL;
+    uint64_t overall_deadline = now_ns() + (uint64_t)total_timeout_ms * UINT64_C(1000000);
 
     if (server->stage.has_stage1_cached_v4) {
         uint64_t now = now_ns();
