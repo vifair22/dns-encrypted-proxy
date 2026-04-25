@@ -184,13 +184,13 @@ int upstream_doh_client_get_pool_stats(
     return 0;
 }
 
-int upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config) {
+proxy_status_t upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config) {
     (void)config;
     if (g_dot_init_rc != 0) {
-        return -1;
+        return PROXY_ERR_RESOURCE;
     }
     *client = (upstream_dot_client_t *)(uintptr_t)0x2222;
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_dot_client_destroy(upstream_dot_client_t *client) {
