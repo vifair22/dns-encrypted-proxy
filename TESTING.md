@@ -62,6 +62,8 @@ Convenience target (when CMake finds `gcovr`):
 cmake --build build/coverage --target coverage
 ```
 
+The `coverage` target runs the full ctest suite, prints the per-file table, gates on the line-coverage threshold (default 80%, configurable via `-DCOVERAGE_LINE_THRESHOLD=<percent>`), and writes `build/coverage/coverage.html` for browsing. Below threshold the build fails before the HTML is regenerated, so the previous report stays available for triage.
+
 ## CI-Equivalent Strict Build
 
 ```bash
