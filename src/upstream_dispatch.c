@@ -193,15 +193,73 @@ static upstream_inflight_entry_t *inflight_remove(upstream_facilitator_t *fac, u
     return NULL;
 }
 
+/*
+ * Detach an entry's job from the member's assigned queue. Caller must hold
+ * the member's mutex. Returns 1 if the job was found and removed, 0 if not
+ * (meaning a worker has already popped the job and is processing it).
+ */
+static int unlink_from_assigned_queue(upstream_member_t *member, upstream_job_t *target) {
+    upstream_job_t *prev = NULL;
+    upstream_job_t *cur = member->assigned_head;
+    while (cur != NULL) {
+        if (cur == target) {
+            if (prev == NULL) {
+                member->assigned_head = cur->next;
+            } else {
+                prev->next = cur->next;
+            }
+            if (member->assigned_tail == cur) {
+                member->assigned_tail = prev;
+            }
+            cur->next = NULL;
+            return 1;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    return 0;
+}
+
+/*
+ * Move all inflight entries for this member into a returned drain list, EXCEPT
+ * those whose jobs are currently held by a worker thread (i.e. already popped
+ * from member->assigned_head). Caller must hold fac->queue_mutex.
+ *
+ * Worker-held jobs cannot be safely finalized here because the worker still
+ * holds the job pointer locally and will write to it after upstream_resolve
+ * returns. The worker's natural completion path (push to completed → completion
+ * thread inflight_remove) cleans those up. Their inflight entries are left in
+ * place; the worker's eventual push to completed will trigger normal handling.
+ *
+ * For jobs still queued (not yet popped by a worker), we additionally remove
+ * them from member->assigned_head so the member's worker thread doesn't try
+ * to process a job that has already been finalized.
+ */
 static upstream_inflight_entry_t *inflight_drain_member(upstream_facilitator_t *fac, int member_index) {
     upstream_inflight_entry_t *drained_head = NULL;
     upstream_inflight_entry_t *drained_tail = NULL;
     upstream_inflight_entry_t *prev = NULL;
     upstream_inflight_entry_t *cur = fac->inflight_head;
 
+    upstream_member_t *member = (member_index >= 0 && member_index < fac->member_count)
+        ? &fac->members[member_index]
+        : NULL;
+    if (member != NULL) {
+        pthread_mutex_lock(&member->mutex);
+    }
+
     while (cur != NULL) {
         upstream_inflight_entry_t *next = cur->next;
+        int drainable = 0;
         if (cur->member_index == member_index) {
+            /* Only drain if the job is still in the assigned queue. If the
+             * worker has already popped it, leave the inflight entry in place
+             * for the worker's natural completion. */
+            if (member != NULL && unlink_from_assigned_queue(member, cur->job)) {
+                drainable = 1;
+            }
+        }
+        if (drainable) {
             if (prev == NULL) {
                 fac->inflight_head = next;
             } else {
@@ -219,6 +277,10 @@ static upstream_inflight_entry_t *inflight_drain_member(upstream_facilitator_t *
             prev = cur;
         }
         cur = next;
+    }
+
+    if (member != NULL) {
+        pthread_mutex_unlock(&member->mutex);
     }
     return drained_head;
 }
@@ -636,11 +698,9 @@ static void *completion_thread_main(void *arg) {
                 MEMBER_SET_STATE(member, UPSTREAM_MEMBER_FAILED, "job_failed");
                 MEMBER_SET_STATE(member, UPSTREAM_MEMBER_DRAINING, "drain_inflight_on_failure");
 
-                pthread_mutex_lock(&member->mutex);
-                member->assigned_head = NULL;
-                member->assigned_tail = NULL;
-                pthread_mutex_unlock(&member->mutex);
-
+                /* inflight_drain_member walks member->assigned_head under
+                 * member->mutex and unlinks each drainable job from it.
+                 * Worker-popped jobs are skipped (they're processed naturally). */
                 drained = inflight_drain_member(fac, member_idx);
             }
         }
