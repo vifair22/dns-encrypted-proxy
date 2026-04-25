@@ -440,7 +440,9 @@ if(BUILD_TESTS)
         apply_target_defaults(test_upstream_internal)
         add_proxy_test(test_upstream_internal)
 
-        add_executable(test_upstream_dispatch_internal tests/unit/test_upstream_dispatch_internal.c)
+        # Amalgamates src/upstream_dispatch.c via #include; pulls in src/errors.c
+        # because upstream_facilitator_init now uses set_error.
+        add_executable(test_upstream_dispatch_internal tests/unit/test_upstream_dispatch_internal.c src/errors.c)
         target_link_libraries(test_upstream_dispatch_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_upstream_dispatch_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_upstream_dispatch_internal)

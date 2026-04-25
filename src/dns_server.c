@@ -1137,7 +1137,8 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
 
     (void)upstream_bootstrap_configure(&server->upstream, config);
 
-    if (upstream_facilitator_init(&server->upstream_facilitator, &server->upstream) != 0) {
+    if (upstream_facilitator_init(&server->upstream_facilitator, &server->upstream) != PROXY_OK) {
+        LOGF_ERROR("Failed to initialize upstream facilitator: %s", proxy_error_message());
         upstream_client_destroy(&server->upstream);
         dns_cache_destroy(&server->cache);
         return -1;

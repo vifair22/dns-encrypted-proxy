@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "errors.h"
 #include "upstream.h"
 
 typedef struct upstream_job {
@@ -150,7 +151,7 @@ typedef struct {
     uint64_t queue_wait_gt_1000ms;
 } upstream_facilitator_stats_t;
 
-int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_client_t *upstream);
+proxy_status_t upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_client_t *upstream);
 void upstream_facilitator_destroy(upstream_facilitator_t *facilitator);
 int upstream_facilitator_resolve(
     upstream_facilitator_t *facilitator,
