@@ -30,7 +30,7 @@ test:
   artifacts:
     when: on_failure
     paths:
-      - build-matrix-ci/
+      - build/matrix/
     expire_in: 1 week
 
 build:

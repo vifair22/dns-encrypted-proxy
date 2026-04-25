@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -346,8 +347,7 @@ static void cache_store(const char *host, uint32_t addr_v4_be, uint32_t ttl_seco
     }
 
     iterative_cache_entry_t *dst = &g_cache[free_idx];
-    strncpy(dst->host, host, sizeof(dst->host) - 1);
-    dst->host[sizeof(dst->host) - 1] = '\0';
+    snprintf(dst->host, sizeof(dst->host), "%s", host);
     dst->addr_v4_be = addr_v4_be;
     dst->expires_at_ms = now + ttl_ms;
     dst->in_use = 1;
