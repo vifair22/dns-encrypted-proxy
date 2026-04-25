@@ -39,7 +39,10 @@ typedef enum {
     UPSTREAM_FAILURE_CLASS_TRANSPORT = 3,
     UPSTREAM_FAILURE_CLASS_TIMEOUT = 4,
     UPSTREAM_FAILURE_CLASS_TLS = 5,
+    UPSTREAM_FAILURE_CLASS_COUNT = 6
 } upstream_failure_class_t;
+
+#define DOH_HTTP_TIER_COUNT 3
 
 typedef struct {
     uint32_t bootstrap_addr_v4_be;
@@ -60,6 +63,7 @@ typedef struct {
 
     uint8_t doh_forced_http_tier;
     uint8_t doh_upgrade_failures;
+    uint8_t doh_h3_consecutive_failures;
     uint64_t doh_upgrade_retry_after_ms;
 
     uint64_t doh_downgrade_h3_to_h2_total;
@@ -68,6 +72,10 @@ typedef struct {
     uint64_t doh_upgrade_probe_attempt_total;
     uint64_t doh_upgrade_probe_success_total;
     uint64_t doh_upgrade_probe_failure_total;
+
+    /* Per-tier per-class attempt failure counts. Indexed [tier][class] using
+     * doh_http_tier_t and upstream_failure_class_t. Updated atomically. */
+    uint64_t doh_attempt_failures_total[DOH_HTTP_TIER_COUNT][UPSTREAM_FAILURE_CLASS_COUNT];
 } upstream_stage_state_t;
 
 typedef struct {

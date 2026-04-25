@@ -19,6 +19,11 @@
 #define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
 #define DOH_UPGRADE_BACKOFF_BASE_MS (10ULL * 60ULL * 1000ULL)
 #define DOH_UPGRADE_BACKOFF_MAX_MS (6ULL * 60ULL * 60ULL * 1000ULL)
+/* Number of consecutive h3 attempt failures required before pinning to h2.
+ * Until the threshold is met, h3 is retried first on every call and h2 is
+ * used only as the in-call fallback. Prevents a single transient h3 blip
+ * (UDP packet drop, brief firewall flap) from costing the long backoff. */
+#define DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD 3
 
 typedef enum {
     DOH_HTTP_TIER_H3 = 0,
@@ -712,6 +717,7 @@ int upstream_doh_resolve(
     int result = -1;
     upstream_failure_class_t final_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
     doh_http_tier_t successful_tier = DOH_HTTP_TIER_H3;
+    int h3_was_attempted = (top_tier == DOH_HTTP_TIER_H3) ? 1 : 0;
 
     for (int route = 0; route < route_count && result != 0; route++) {
         int use_override_v4 = 0;
@@ -766,7 +772,12 @@ int upstream_doh_resolve(
             }
 
             LOG_DOH_ATTEMPT_FAILURE(phase, server, &attempt_err);
-            final_failure_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
+            upstream_failure_class_t attempt_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
+            if ((int)tier >= 0 && (int)tier < DOH_HTTP_TIER_COUNT &&
+                (int)attempt_class >= 0 && (int)attempt_class < UPSTREAM_FAILURE_CLASS_COUNT) {
+                __atomic_add_fetch(&server->stage.doh_attempt_failures_total[(int)tier][(int)attempt_class], 1, __ATOMIC_RELAXED);
+            }
+            final_failure_class = attempt_class;
             server->stage.last_failure_class = (int)final_failure_class;
         }
     }
@@ -797,7 +808,17 @@ int upstream_doh_resolve(
     }
 
     now = now_ms();
-    if (successful_tier > forced_tier) {
+    if (h3_was_attempted) {
+        if (successful_tier == DOH_HTTP_TIER_H3) {
+            server->stage.doh_h3_consecutive_failures = 0;
+        } else if (server->stage.doh_h3_consecutive_failures < 255) {
+            server->stage.doh_h3_consecutive_failures++;
+        }
+    }
+    int h3_to_h2_pin_gated = (forced_tier == DOH_HTTP_TIER_H3 &&
+                              successful_tier == DOH_HTTP_TIER_H2 &&
+                              server->stage.doh_h3_consecutive_failures < DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD);
+    if (successful_tier > forced_tier && !h3_to_h2_pin_gated) {
         if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H2) {
             __atomic_add_fetch(&server->stage.doh_downgrade_h3_to_h2_total, 1, __ATOMIC_RELAXED);
         } else if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H1) {
