@@ -336,15 +336,21 @@ static void mock_tls_server_join_and_destroy(mock_tls_server_t *server) {
 }
 
 static int resolve_test_cert_paths(char *cert_out, size_t cert_out_len, char *key_out, size_t key_out_len) {
+    /* Test cwd depends on which build tree ctest invoked us from:
+     *   repo root             -> tests/certs/...
+     *   build/<variant>/      -> ../../tests/certs/...
+     *   build/matrix/<combo>/ -> ../../../tests/certs/... */
     const char *cert_candidates[] = {
         "tests/certs/localhost.cert.pem",
         "../tests/certs/localhost.cert.pem",
-        "../../tests/certs/localhost.cert.pem"
+        "../../tests/certs/localhost.cert.pem",
+        "../../../tests/certs/localhost.cert.pem"
     };
     const char *key_candidates[] = {
         "tests/certs/localhost.key.pem",
         "../tests/certs/localhost.key.pem",
-        "../../tests/certs/localhost.key.pem"
+        "../../tests/certs/localhost.key.pem",
+        "../../../tests/certs/localhost.key.pem"
     };
 
     int cert_found = 0;
