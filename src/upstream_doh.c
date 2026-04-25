@@ -713,7 +713,11 @@ int upstream_doh_resolve(
             LOGF_WARN("DoH stage1 local resolver failed, trying stage2 bootstrap IPv4: host=%s", server->host);
         }
 
-        for (doh_http_tier_t tier = top_tier; tier <= DOH_HTTP_TIER_H1; tier = (doh_http_tier_t)(tier + 1)) {
+        /* Iterate via int so the post-increment past DOH_HTTP_TIER_H1 doesn't
+         * temporarily hold an out-of-range enum value (clang-analyzer flags
+         * that even though the loop exits before the cast is observed). */
+        for (int tier_idx = (int)top_tier; tier_idx <= (int)DOH_HTTP_TIER_H1; tier_idx++) {
+            doh_http_tier_t tier = (doh_http_tier_t)tier_idx;
             int attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
             if (attempt_timeout_ms < 0) {
                 pool_release(client, slot);

@@ -45,6 +45,9 @@ static const char *upstream_type_name(upstream_type_t type) {
     }
 }
 
+/* clang-tidy can't see through __atomic_fetch_add to know `counter` is
+ * mutated; suppress the false-positive const suggestion. */
+// NOLINTNEXTLINE(readability-non-const-parameter)
 static void client_counter_inc(uint64_t *counter) {
     __atomic_fetch_add(counter, 1ULL, __ATOMIC_RELAXED);
 }

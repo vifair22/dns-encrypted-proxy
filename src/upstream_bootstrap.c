@@ -464,8 +464,14 @@ upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server
         return UPSTREAM_STAGE1_CACHE_MISS;
     }
 
-    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
-    server->stage.stage1_cached_addr_v4_be = sin->sin_addr.s_addr;
+    /* Copy the resolved address through a properly-aligned local rather than
+     * casting from struct sockaddr * to struct sockaddr_in *. The cast
+     * increases required alignment (2 -> 4) which is a portability hazard
+     * on strict-alignment platforms even though glibc happens to align the
+     * getaddrinfo result correctly. */
+    struct sockaddr_in sin;
+    memcpy(&sin, res->ai_addr, sizeof(sin));
+    server->stage.stage1_cached_addr_v4_be = sin.sin_addr.s_addr;
     server->stage.has_stage1_cached_v4 = 1;
     server->stage.stage1_cache_expires_at_ms = now + STAGE1_CACHE_TTL_MS;
     freeaddrinfo(res);
