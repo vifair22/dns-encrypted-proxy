@@ -1,12 +1,13 @@
 #ifndef UPSTREAM_DOH_H
 #define UPSTREAM_DOH_H
 
+#include "errors.h"
 #include "upstream.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
-int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
+proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
 void upstream_doh_client_destroy(upstream_doh_client_t *client);
 int upstream_doh_resolve(
     upstream_doh_client_t *client,

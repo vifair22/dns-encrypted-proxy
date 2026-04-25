@@ -307,7 +307,7 @@ static void test_pool_acquire_wait_and_release_path(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_doh_client_t *client = NULL;
-    assert_int_equal(upstream_doh_client_init(&client, &config), 0);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
     assert_non_null(client);
 
     client->pool_in_use[0] = 1;
@@ -490,32 +490,32 @@ static void test_doh_client_init_failure_paths(void **state) {
     upstream_doh_client_t *client = NULL;
 
     g_calloc_fail_on_call = 1;
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
 
     g_curl_global_init_rc = CURLE_FAILED_INIT;
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_curl_easy_init_fail_at = 2;
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_pthread_mutex_init_fail = 1;
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_pthread_cond_init_fail = 1;
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_calloc_fail_on_call = 2; /* pool_handles alloc */
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_calloc_fail_on_call = 3; /* pool_in_use alloc */
-    assert_int_equal(upstream_doh_client_init(&client, &config), -1);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_ERR_RESOURCE);
 }
 
 static void test_doh_resolve_success_and_validation_failure(void **state) {
@@ -529,7 +529,7 @@ static void test_doh_resolve_success_and_validation_failure(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_doh_client_t *client = NULL;
-    assert_int_equal(upstream_doh_client_init(&client, &config), 0);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
 
     upstream_server_t server;
     memset(&server, 0, sizeof(server));
@@ -567,7 +567,7 @@ static void test_doh_pool_stats_in_use_branch(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_doh_client_t *client = NULL;
-    assert_int_equal(upstream_doh_client_init(&client, &config), 0);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
     assert_non_null(client);
 
     client->pool_in_use[0] = 1;
