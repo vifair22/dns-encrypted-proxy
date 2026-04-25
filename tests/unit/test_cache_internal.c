@@ -109,7 +109,7 @@ static void test_shard_doorkeeper_and_sweep(void **state) {
     reset_alloc_stubs();
 
     cache_shard_t shard;
-    assert_int_equal(shard_init(&shard, 300), 0);
+    assert_int_equal(shard_init(&shard, 300), PROXY_OK);
     assert_non_null(shard.admit_bits);
 
     uint64_t h = 0x1234;
@@ -145,7 +145,7 @@ static void test_shard_rehash_and_growth(void **state) {
     reset_alloc_stubs();
 
     cache_shard_t shard;
-    assert_int_equal(shard_init(&shard, 64), 0);
+    assert_int_equal(shard_init(&shard, 64), PROXY_OK);
     size_t old_bucket_count = shard.bucket_count;
 
     cache_entry_t *entry = calloc(1, sizeof(*entry));
@@ -182,7 +182,7 @@ static void test_cache_randomized_branch_exploration(void **state) {
     reset_alloc_stubs();
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 512), 0);
+    assert_int_equal(dns_cache_init(&cache, 512), PROXY_OK);
 
     uint8_t req_id[2] = {0xAA, 0x55};
     for (int i = 0; i < 20000; i++) {
@@ -243,20 +243,20 @@ static void test_cache_allocation_and_init_failure_paths(void **state) {
     cache_shard_t shard;
 
     g_calloc_fail_on_call = 1;
-    assert_int_equal(shard_init(&shard, 10), -1);
+    assert_int_equal(shard_init(&shard, 10), PROXY_ERR_RESOURCE);
 
     reset_alloc_stubs();
     g_calloc_fail_on_call = 2;
-    assert_int_equal(shard_init(&shard, 300), -1);
+    assert_int_equal(shard_init(&shard, 300), PROXY_ERR_RESOURCE);
 
     reset_alloc_stubs();
     g_mutex_init_fail = 1;
-    assert_int_equal(shard_init(&shard, 10), -1);
+    assert_int_equal(shard_init(&shard, 10), PROXY_ERR_RESOURCE);
 
     reset_alloc_stubs();
     dns_cache_t cache;
     g_calloc_fail_on_call = 2; /* first shard buckets alloc after cache->shards alloc */
-    assert_int_equal(dns_cache_init(&cache, 64), -1);
+    assert_int_equal(dns_cache_init(&cache, 64), PROXY_ERR_RESOURCE);
 }
 
 static void test_cache_lookup_and_store_failure_paths(void **state) {
@@ -264,7 +264,7 @@ static void test_cache_lookup_and_store_failure_paths(void **state) {
     reset_alloc_stubs();
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 1), 0);
+    assert_int_equal(dns_cache_init(&cache, 1), PROXY_OK);
 
     const uint8_t key[] = {0x01, 0x02, 0x03};
     const uint8_t resp[] = {0x12, 0x34, 0x81, 0x80};
@@ -314,7 +314,7 @@ static void test_cache_doorkeeper_drop_path(void **state) {
     reset_alloc_stubs();
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 8192), 0);
+    assert_int_equal(dns_cache_init(&cache, 8192), PROXY_OK);
     assert_int_equal(cache.shard_count, 32);
 
     uint8_t selected[257][2];
@@ -383,7 +383,7 @@ static void test_cache_new_helpers_and_single_thread_mode(void **state) {
     pthread_mutex_destroy(&shard.mutex);
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 64), 0);
+    assert_int_equal(dns_cache_init(&cache, 64), PROXY_OK);
     assert_int_equal(cache.single_thread_mode, 1);
     assert_int_equal(cache.shard_count, 1);
     dns_cache_destroy(&cache);
@@ -397,7 +397,7 @@ static void test_cache_new_branch_paths(void **state) {
 
     setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 64), 0);
+    assert_int_equal(dns_cache_init(&cache, 64), PROXY_OK);
 
     const uint8_t key[] = {0x01};
     uint8_t *out = NULL;
@@ -418,7 +418,7 @@ static void test_cache_new_branch_paths(void **state) {
     assert_int_equal(bytes, 0);
 
     cache_shard_t shard;
-    assert_int_equal(shard_init(&shard, 4), 0);
+    assert_int_equal(shard_init(&shard, 4), PROXY_OK);
     cache_entry_t *e = calloc(1, sizeof(*e));
     assert_non_null(e);
     e->key = (uint8_t *)strdup("x");
@@ -515,7 +515,7 @@ static void test_cache_expired_lookup_in_collision_bucket_keeps_chain_valid(void
     setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 64), 0);
+    assert_int_equal(dns_cache_init(&cache, 64), PROXY_OK);
 
     cache_shard_t *shard = &cache.shards[0];
     uint8_t k1[2] = {0};
@@ -578,7 +578,7 @@ static void test_cache_cycle_guard_prevents_lookup_and_store_lockup(void **state
 
     setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "1", 1);
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 32), 0);
+    assert_int_equal(dns_cache_init(&cache, 32), PROXY_OK);
 
     cache_shard_t *shard = &cache.shards[0];
     const uint8_t key_a[] = {0x11};
@@ -643,7 +643,7 @@ static void test_cache_additional_guard_and_branch_paths(void **state) {
     setenv("DOH_PROXY_CACHE_SINGLE_THREAD", "yes", 1);
     assert_int_equal(env_flag_enabled("DOH_PROXY_CACHE_SINGLE_THREAD"), 1);
 
-    assert_int_equal(dns_cache_init(NULL, 1), -1);
+    assert_int_equal(dns_cache_init(NULL, 1), PROXY_ERR_INVALID_ARG);
 
     dns_cache_t cache;
     memset(&cache, 0, sizeof(cache));
@@ -670,7 +670,7 @@ static void test_cache_additional_guard_and_branch_paths(void **state) {
     shard.bucket_count = (size_t)-1;
     shard_maybe_grow(&shard);
 
-    assert_int_equal(shard_init(&shard, 1), 0);
+    assert_int_equal(shard_init(&shard, 1), PROXY_OK);
     assert_int_equal(key_equals(NULL, 1, key, sizeof(key)), 0);
 
     cache_entry_t *e1 = calloc(1, sizeof(*e1));
