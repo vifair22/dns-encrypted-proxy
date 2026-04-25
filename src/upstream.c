@@ -309,23 +309,26 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
     }
 }
 
-int upstream_client_init(
+proxy_status_t upstream_client_init(
     upstream_client_t *client,
     const char *urls[],
     int url_count,
     const upstream_config_t *config) {
-    
+
     if (client == NULL || urls == NULL || url_count <= 0 || config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "client=%p urls=%p url_count=%d config=%p",
+                         (const void *)client, (const void *)urls,
+                         url_count, (const void *)config);
     }
-    
+
     if (url_count > UPSTREAM_MAX_SERVERS) {
         url_count = UPSTREAM_MAX_SERVERS;
     }
-    
+
     memset(client, 0, sizeof(*client));
     client->config = *config;
-    
+
     /* Set defaults for policy settings */
     if (client->config.max_failures_before_unhealthy <= 0) {
         client->config.max_failures_before_unhealthy = 3;
@@ -345,36 +348,42 @@ int upstream_client_init(
     if (client->config.iterative_bootstrap_enabled != 0) {
         client->config.iterative_bootstrap_enabled = 1;
     }
-    
+
     /*
      * Parse all configured URLs up front so runtime resolution path only
      * handles transport work and health policy, not config validation.
+     * upstream_parse_url is a predicate; bad URLs are silently dropped here
+     * and surface as the "no valid URLs" error below if they were the only
+     * ones in the list.
      */
-    /* Parse all URLs */
     for (int i = 0; i < url_count; i++) {
         if (upstream_parse_url(urls[i], &client->servers[client->server_count]) == 0) {
             client->server_count++;
         }
     }
-    
+
     if (client->server_count == 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "no valid upstream URLs after parsing %d candidates",
+                         url_count);
     }
-    
-    if (pthread_mutex_init(&client->stage1_cache_mutex, NULL) != 0) {
-        return -1;
+
+    int mtx_rc = pthread_mutex_init(&client->stage1_cache_mutex, NULL);
+    if (mtx_rc != 0) {
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_mutex_init stage1_cache_mutex failed (rc=%d)",
+                         mtx_rc);
     }
-    
+
     /*
      * Lazily initialize DoH/DoT/DoQ clients so startup remains lightweight when a
      * protocol is configured but never selected on the active path.
      */
-    /* Initialize protocol-specific clients lazily on first use */
     client->doh_client = NULL;
     client->dot_client = NULL;
     client->doq_client = NULL;
-    
-    return 0;
+
+    return PROXY_OK;
 }
 
 void upstream_client_destroy(upstream_client_t *client) {

@@ -225,9 +225,9 @@ static void test_client_init_mixed_urls(void **state) {
     };
     upstream_client_t client;
 
-    int result = upstream_client_init(&client, urls, (int)(sizeof(urls) / sizeof(urls[0])), &config);
+    proxy_status_t result = upstream_client_init(&client, urls, (int)(sizeof(urls) / sizeof(urls[0])), &config);
 
-    assert_int_equal(result, 0);
+    assert_int_equal(result, PROXY_OK);
     int expected = 0;
 #if UPSTREAM_DOH_ENABLED
     expected++;
@@ -270,7 +270,7 @@ static void test_client_init_all_invalid_urls_fails(void **state) {
     };
     upstream_client_t client;
 
-    assert_int_equal(upstream_client_init(&client, urls, 3, &config), -1);
+    assert_int_equal(upstream_client_init(&client, urls, 3, &config), PROXY_ERR_CONFIG);
 }
 
 static void test_client_init_applies_default_policy_values(void **state) {
@@ -293,7 +293,7 @@ static void test_client_init_applies_default_policy_values(void **state) {
     };
     upstream_client_t client;
 
-    assert_int_equal(upstream_client_init(&client, urls, 1, &config), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), PROXY_OK);
     assert_int_equal(client.config.max_failures_before_unhealthy, 3);
     assert_int_equal(client.config.unhealthy_backoff_ms, 10000);
     upstream_client_destroy(&client);
@@ -398,7 +398,7 @@ static void test_runtime_stats_api_guards_and_basics(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_client_t client;
-    assert_int_equal(upstream_client_init(&client, urls, 1, &config), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), PROXY_OK);
 
     assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
     assert_int_equal(stats.doh_pool_capacity, 0);

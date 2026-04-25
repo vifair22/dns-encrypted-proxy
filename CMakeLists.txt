@@ -434,7 +434,9 @@ if(BUILD_TESTS)
         endif()
 
         # Unit test: upstream orchestrator internals (static/helper branch coverage)
-        add_executable(test_upstream_internal tests/unit/test_upstream_internal.c)
+        # Amalgamates src/upstream.c via #include; pulls in src/errors.c
+        # because upstream_client_init now uses set_error.
+        add_executable(test_upstream_internal tests/unit/test_upstream_internal.c src/errors.c)
         target_link_libraries(test_upstream_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_upstream_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_upstream_internal)

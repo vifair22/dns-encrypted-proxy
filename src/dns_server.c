@@ -1130,7 +1130,8 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
         .iterative_bootstrap_enabled = 1,
     };
     
-    if (upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg) != 0) {
+    if (upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg) != PROXY_OK) {
+        LOGF_ERROR("Failed to initialize upstream client: %s", proxy_error_message());
         dns_cache_destroy(&server->cache);
         return -1;
     }
