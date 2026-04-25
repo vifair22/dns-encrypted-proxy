@@ -15,6 +15,7 @@ RUN apk add --no-cache \
 WORKDIR /src
 
 COPY CMakeLists.txt ./
+COPY release_version ./
 COPY src ./src
 COPY dns-encrypted-proxy.conf.example ./
 
