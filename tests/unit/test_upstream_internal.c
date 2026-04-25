@@ -420,10 +420,10 @@ static void test_upstream_internal_init_and_switch_edges(void **state) {
 
     upstream_client_t client;
     g_mutex_init_fail = 1;
-    assert_int_equal(upstream_client_init(&client, urls, 1, &config), -1);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), PROXY_ERR_RESOURCE);
 
     reset_stubs();
-    assert_int_equal(upstream_client_init(&client, urls, 1, &config), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &config), PROXY_OK);
 
     upstream_server_t bad_server;
     memset(&bad_server, 0, sizeof(bad_server));
