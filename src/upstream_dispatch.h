@@ -166,7 +166,7 @@ int upstream_facilitator_resolve_with_deadline(
     uint8_t **response_out,
     size_t *response_len_out);
 int upstream_facilitator_get_stats(
-    const upstream_facilitator_t *facilitator,
+    upstream_facilitator_t *facilitator,
     upstream_facilitator_stats_t *stats_out);
 uint64_t upstream_facilitator_get_provider_inflight(
     const upstream_facilitator_t *facilitator,

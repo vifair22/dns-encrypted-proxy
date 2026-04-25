@@ -13,6 +13,7 @@
 
 #include "upstream.h"
 #include "upstream_bootstrap.h"
+#include "logger.h"
 
 static int g_resolve_calls[UPSTREAM_MAX_SERVERS];
 static int g_resolve_result[UPSTREAM_MAX_SERVERS];

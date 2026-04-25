@@ -21,6 +21,8 @@
 #include <time.h>
 
 #include "upstream.h"
+#include "dns_message.h"
+#include "logger.h"
 
 static upstream_server_t make_test_server(void) {
     upstream_server_t server;
@@ -168,7 +170,7 @@ CURLcode curl_easy_perform(CURL *curl) {
     if (g_emit_body) {
         size_t idx = curl_slot_index(curl);
         if (g_slots[idx].write_fn != NULL && g_body_ptr != NULL && g_body_len > 0) {
-            (void)g_slots[idx].write_fn((char *)g_body_ptr, 1, g_body_len, g_slots[idx].write_data);
+            (void)g_slots[idx].write_fn((char *)(uintptr_t)g_body_ptr, 1, g_body_len, g_slots[idx].write_data);
         }
     }
     return g_curl_perform_rc;
@@ -258,11 +260,11 @@ static void test_write_callback_growth(void **state) {
     reset_stubs();
 
     buffer_t b = {0};
-    const char chunk1[] = "abc";
-    const char chunk2[] = "defg";
+    char chunk1[] = "abc";
+    char chunk2[] = "defg";
 
-    assert_int_equal((int)write_callback((char *)chunk1, 1, 3, &b), 3);
-    assert_int_equal((int)write_callback((char *)chunk2, 1, 4, &b), 4);
+    assert_int_equal((int)write_callback(chunk1, 1, 3, &b), 3);
+    assert_int_equal((int)write_callback(chunk2, 1, 4, &b), 4);
     assert_int_equal((int)b.len, 7);
     assert_memory_equal(b.data, "abcdefg", 7);
 
@@ -274,9 +276,9 @@ static void test_write_callback_realloc_failure(void **state) {
     reset_stubs();
 
     buffer_t b = {0};
-    const char chunk[] = "abcdef";
+    char chunk[] = "abcdef";
     g_realloc_fail_on_call = 1;
-    assert_int_equal((int)write_callback((char *)chunk, 1, sizeof(chunk) - 1, &b), 0);
+    assert_int_equal((int)write_callback(chunk, 1, sizeof(chunk) - 1, &b), 0);
     assert_null(b.data);
     assert_int_equal((int)b.len, 0);
 }

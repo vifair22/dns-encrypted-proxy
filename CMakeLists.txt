@@ -13,9 +13,33 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/bin")
 
 option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(ENABLE_COVERAGE "Enable gcov/gcovr coverage instrumentation" OFF)
+option(ENABLE_ASAN "Enable AddressSanitizer instrumentation" OFF)
 option(ENABLE_UPSTREAM_DOH "Enable DoH upstream support" ON)
 option(ENABLE_UPSTREAM_DOT "Enable DoT upstream support" ON)
 option(ENABLE_UPSTREAM_DOQ "Enable DoQ upstream support" OFF)
+
+# Default to Release if no build type specified — matches "build what's needed,
+# not what's trendy"; debug builds are explicitly opt-in via -DCMAKE_BUILD_TYPE=Debug
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# Per-build-type flags (override CMake defaults to match standards)
+set(CMAKE_C_FLAGS_RELEASE        "-O3 -DNDEBUG"  CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_DEBUG          "-Og -g"        CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG" CACHE STRING "" FORCE)
+
+# LTO for release builds (link-time optimization). CMake handles the
+# compile/link flag dance via INTERPROCEDURAL_OPTIMIZATION rather than raw -flto
+# so toolchains using gcc-ar/gcc-ranlib stay correct.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+if(IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    message(STATUS "LTO enabled for Release build")
+elseif(NOT IPO_SUPPORTED)
+    message(STATUS "LTO unavailable: ${IPO_ERROR}")
+endif()
 
 set(C_LOG_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../c-log" CACHE PATH "Path to c-log checkout")
 set(C_LOG_HEADER_PATH "${C_LOG_PATH}/log.h")
@@ -29,10 +53,22 @@ if(NOT ENABLE_UPSTREAM_DOH AND NOT ENABLE_UPSTREAM_DOT AND NOT ENABLE_UPSTREAM_D
     message(FATAL_ERROR "At least one upstream provider must be enabled")
 endif()
 
-set(PROJECT_WARNING_FLAGS -Wall -Wextra -Wpedantic)
+set(PROJECT_WARNING_FLAGS
+    -Wall -Wextra -Wpedantic
+    -Wshadow
+    -Wunused -Wunused-function -Wunused-variable -Wunused-parameter -Wunused-result
+    -Wdouble-promotion
+    -Wformat=2 -Wformat-truncation
+    -Wmissing-prototypes -Wstrict-prototypes -Wmissing-declarations
+    -Wcast-align -Wcast-qual
+    -Wnull-dereference
+    -Wconversion -Wsign-conversion)
 if(WARNINGS_AS_ERRORS)
     list(APPEND PROJECT_WARNING_FLAGS -Werror)
 endif()
+
+# Stack hardening — applied to every target alongside warnings
+set(PROJECT_HARDENING_FLAGS -fstack-protector-strong -fstack-clash-protection)
 
 set(COVERAGE_SUPPORTED FALSE)
 if(ENABLE_COVERAGE)
@@ -44,8 +80,20 @@ if(ENABLE_COVERAGE)
     endif()
 endif()
 
+set(ASAN_SUPPORTED FALSE)
+if(ENABLE_ASAN)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        set(ASAN_SUPPORTED TRUE)
+        message(STATUS "AddressSanitizer instrumentation enabled")
+    else()
+        message(WARNING "ENABLE_ASAN requested, but compiler '${CMAKE_C_COMPILER_ID}' is not supported")
+    endif()
+endif()
+
 function(apply_target_defaults target_name)
-    target_compile_options(${target_name} PRIVATE ${PROJECT_WARNING_FLAGS})
+    target_compile_options(${target_name} PRIVATE
+        ${PROJECT_WARNING_FLAGS}
+        ${PROJECT_HARDENING_FLAGS})
     target_compile_definitions(${target_name} PRIVATE
         UPSTREAM_DOH_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOH}>
         UPSTREAM_DOT_ENABLED=$<BOOL:${ENABLE_UPSTREAM_DOT}>
@@ -59,6 +107,16 @@ function(apply_target_defaults target_name)
             target_link_libraries(${target_name} PRIVATE --coverage)
         else()
             target_link_options(${target_name} PRIVATE --coverage)
+        endif()
+    endif()
+
+    if(ENABLE_ASAN AND ASAN_SUPPORTED)
+        target_compile_options(${target_name} PRIVATE
+            -fsanitize=address -fno-omit-frame-pointer)
+        if(CMAKE_VERSION VERSION_LESS 3.13)
+            target_link_libraries(${target_name} PRIVATE -fsanitize=address)
+        else()
+            target_link_options(${target_name} PRIVATE -fsanitize=address)
         endif()
     endif()
 endfunction()
@@ -320,26 +378,29 @@ if(BUILD_TESTS)
         # Integration tests (split by functional boundary)
         add_executable(test_integration_core tests/integration/test_integration.c)
         target_compile_definitions(test_integration_core PRIVATE INTEGRATION_GROUP_CORE)
-        target_compile_options(test_integration_core PRIVATE -Wno-unused-function)
         target_link_libraries(test_integration_core dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto)
         target_include_directories(test_integration_core PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_integration_core)
+        # Group split: each group only exercises a subset of test functions; the rest
+        # are intentionally inert. Suppress -Wunused-function and -Wformat-nonliteral
+        # (used by group-aware vasprintf-style helpers).
+        target_compile_options(test_integration_core PRIVATE -Wno-unused-function -Wno-format-nonliteral)
         add_proxy_test(test_integration_core)
 
         add_executable(test_integration_transport tests/integration/test_integration.c)
         target_compile_definitions(test_integration_transport PRIVATE INTEGRATION_GROUP_TRANSPORT)
-        target_compile_options(test_integration_transport PRIVATE -Wno-unused-function)
         target_link_libraries(test_integration_transport dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto)
         target_include_directories(test_integration_transport PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_integration_transport)
+        target_compile_options(test_integration_transport PRIVATE -Wno-unused-function -Wno-format-nonliteral)
         add_proxy_test(test_integration_transport)
 
         add_executable(test_integration_runtime tests/integration/test_integration.c)
         target_compile_definitions(test_integration_runtime PRIVATE INTEGRATION_GROUP_RUNTIME)
-        target_compile_options(test_integration_runtime PRIVATE -Wno-unused-function)
         target_link_libraries(test_integration_runtime dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES} OpenSSL::SSL OpenSSL::Crypto)
         target_include_directories(test_integration_runtime PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         apply_target_defaults(test_integration_runtime)
+        target_compile_options(test_integration_runtime PRIVATE -Wno-unused-function -Wno-format-nonliteral)
         add_proxy_test(test_integration_runtime)
 
         if(ENABLE_COVERAGE AND COVERAGE_SUPPORTED)
