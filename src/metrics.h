@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "cache.h"
+#include "errors.h"
 #include "upstream.h"
 #include "upstream_dispatch.h"
 
@@ -33,7 +34,7 @@ typedef struct {
 } proxy_metrics_t;
 
 void metrics_init(proxy_metrics_t *m);
-int metrics_server_start(
+proxy_status_t metrics_server_start(
     proxy_metrics_t *m,
     dns_cache_t *cache,
     upstream_client_t *upstream,

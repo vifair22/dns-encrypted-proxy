@@ -760,7 +760,7 @@ static void test_proxy_server_init_and_socket_success_paths(void **state) {
     (void)state;
     reset_stubs();
 
-    assert_int_equal(proxy_server_init(NULL, NULL, NULL), -1);
+    assert_int_equal(proxy_server_init(NULL, NULL, NULL), PROXY_ERR_INVALID_ARG);
 
     proxy_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -774,21 +774,21 @@ static void test_proxy_server_init_and_socket_success_paths(void **state) {
     proxy_server_t server;
 
     g_stub_dns_cache_init_rc = PROXY_ERR_RESOURCE;
-    assert_int_equal(proxy_server_init(&server, &cfg, &stop), -1);
+    assert_int_equal(proxy_server_init(&server, &cfg, &stop), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_stub_upstream_client_init_rc = PROXY_ERR_RESOURCE;
-    assert_int_equal(proxy_server_init(&server, &cfg, &stop), -1);
+    assert_int_equal(proxy_server_init(&server, &cfg, &stop), PROXY_ERR_RESOURCE);
     assert_true(g_stub_dns_cache_destroy_calls >= 1);
 
     reset_stubs();
     g_stub_upstream_facilitator_init_rc = PROXY_ERR_RESOURCE;
-    assert_int_equal(proxy_server_init(&server, &cfg, &stop), -1);
+    assert_int_equal(proxy_server_init(&server, &cfg, &stop), PROXY_ERR_RESOURCE);
     assert_true(g_stub_upstream_client_destroy_calls >= 1);
     assert_true(g_stub_dns_cache_destroy_calls >= 1);
 
     reset_stubs();
-    assert_int_equal(proxy_server_init(&server, &cfg, &stop), 0);
+    assert_int_equal(proxy_server_init(&server, &cfg, &stop), PROXY_OK);
     proxy_server_destroy(&server);
     assert_true(g_stub_upstream_client_destroy_calls >= 1);
     assert_true(g_stub_upstream_facilitator_destroy_calls >= 1);
@@ -901,7 +901,7 @@ static void test_udp_loop_and_proxy_run_thread_failure_paths(void **state) {
 
     /* proxy_server_run: fail first pthread_create */
     g_wrap_pthread_create_fail_on_call = 1;
-    assert_int_equal(proxy_server_run(&server), -1);
+    assert_int_equal(proxy_server_run(&server), PROXY_ERR_RESOURCE);
 
     /* proxy_server_run: fail second pthread_create after udp thread starts */
     reset_stubs();
@@ -911,7 +911,7 @@ static void test_udp_loop_and_proxy_run_thread_failure_paths(void **state) {
     g_wrap_pthread_create_fail_on_call = 2;
     g_wrap_poll_script[0] = 1; /* udp thread exits quickly */
     g_wrap_poll_script_len = 1;
-    assert_int_equal(proxy_server_run(&server), -1);
+    assert_int_equal(proxy_server_run(&server), PROXY_ERR_RESOURCE);
 }
 
 static void test_tcp_client_loop_large_response_and_zero_length_query(void **state) {
@@ -1160,7 +1160,7 @@ static void test_dns_server_socket_and_accept_error_paths(void **state) {
     strcpy(server.config.listen_addr, "127.0.0.1");
     server.config.listen_port = reserve_unused_port_local();
     g_wrap_listen_fail_once = 1;
-    assert_int_equal(proxy_server_run(&server), -1);
+    assert_int_equal(proxy_server_run(&server), PROXY_ERR_NETWORK);
 
     close(listen_fd);
 }
