@@ -14,9 +14,17 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/bin")
 option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(ENABLE_COVERAGE "Enable gcov/gcovr coverage instrumentation" OFF)
 option(ENABLE_ASAN "Enable AddressSanitizer instrumentation" OFF)
+option(ENABLE_ANALYZER "Enable GCC -fanalyzer static analysis pass at compile time" OFF)
+option(ENABLE_STACK_USAGE_CHECK "Emit per-TU stack-usage info (-fstack-usage) for the stack-usage target" OFF)
 option(ENABLE_UPSTREAM_DOH "Enable DoH upstream support" ON)
 option(ENABLE_UPSTREAM_DOT "Enable DoT upstream support" ON)
 option(ENABLE_UPSTREAM_DOQ "Enable DoQ upstream support" OFF)
+
+set(STACK_USAGE_LIMIT_BYTES 65536 CACHE STRING "Per-frame stack usage limit enforced by the stack-usage target (bytes)")
+
+# Always emit compile_commands.json so clang-tidy/static analysis tools work
+# without extra plumbing.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Default to Release if no build type specified — matches "build what's needed,
 # not what's trendy"; debug builds are explicitly opt-in via -DCMAKE_BUILD_TYPE=Debug
@@ -90,6 +98,26 @@ if(ENABLE_ASAN)
     endif()
 endif()
 
+set(ANALYZER_SUPPORTED FALSE)
+if(ENABLE_ANALYZER)
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        set(ANALYZER_SUPPORTED TRUE)
+        message(STATUS "GCC -fanalyzer enabled")
+    else()
+        message(WARNING "ENABLE_ANALYZER requested but only supported on GNU compiler (got '${CMAKE_C_COMPILER_ID}')")
+    endif()
+endif()
+
+set(STACK_USAGE_SUPPORTED FALSE)
+if(ENABLE_STACK_USAGE_CHECK)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        set(STACK_USAGE_SUPPORTED TRUE)
+        message(STATUS "Per-TU stack usage emission enabled (limit: ${STACK_USAGE_LIMIT_BYTES} bytes)")
+    else()
+        message(WARNING "ENABLE_STACK_USAGE_CHECK requested but compiler '${CMAKE_C_COMPILER_ID}' is unsupported")
+    endif()
+endif()
+
 function(apply_target_defaults target_name)
     target_compile_options(${target_name} PRIVATE
         ${PROJECT_WARNING_FLAGS}
@@ -118,6 +146,19 @@ function(apply_target_defaults target_name)
         else()
             target_link_options(${target_name} PRIVATE -fsanitize=address)
         endif()
+    endif()
+
+    if(ENABLE_ANALYZER AND ANALYZER_SUPPORTED)
+        # -fanalyzer chokes on the patterns test code uses (intentional NULL
+        # paths, fault-injected fd states, internal-include amalgamation).
+        # Restrict it to production targets.
+        if(NOT ${target_name} MATCHES "^test_")
+            target_compile_options(${target_name} PRIVATE -fanalyzer)
+        endif()
+    endif()
+
+    if(ENABLE_STACK_USAGE_CHECK AND STACK_USAGE_SUPPORTED)
+        target_compile_options(${target_name} PRIVATE -fstack-usage)
     endif()
 endfunction()
 
@@ -435,4 +476,90 @@ if(BUILD_TESTS)
     else()
         message(WARNING "cmocka not found, tests will not be built. Install with: apt install libcmocka-dev")
     endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Static analysis & lint targets
+#
+# All three are best-effort: if the underlying tool isn't installed, the
+# corresponding target is skipped with a status message rather than failing
+# configure. CI is expected to install the tools and invoke the targets.
+# ---------------------------------------------------------------------------
+
+set(LINTABLE_SOURCES ${DNS_ENCRYPTED_PROXY_SOURCES} src/main.c)
+
+find_program(CLANG_TIDY_EXECUTABLE clang-tidy)
+if(CLANG_TIDY_EXECUTABLE)
+    # 'lint' is advisory — clang-tidy >= 18 returns non-zero on any finding,
+    # which would block CI on the existing backlog. 'lint-strict' is the
+    # gating variant for use after the backlog is cleared.
+    add_custom_target(lint
+        COMMAND ${CMAKE_SOURCE_DIR}/tools/run_clang_tidy.sh advisory ${CMAKE_BINARY_DIR} ${LINTABLE_SOURCES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running clang-tidy over project sources (advisory)"
+        VERBATIM)
+    add_custom_target(lint-strict
+        COMMAND ${CMAKE_SOURCE_DIR}/tools/run_clang_tidy.sh strict ${CMAKE_BINARY_DIR} ${LINTABLE_SOURCES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running clang-tidy strictly (non-zero exit on any finding)"
+        VERBATIM)
+    message(STATUS "lint target available (${CLANG_TIDY_EXECUTABLE}); lint-strict gates on findings")
+else()
+    message(STATUS "clang-tidy not found; 'lint' target unavailable")
+endif()
+
+find_program(CPPCHECK_EXECUTABLE cppcheck)
+if(CPPCHECK_EXECUTABLE)
+    # We don't analyse the external c-log header; cppcheck doesn't model
+    # localtime_s correctly and produces a false uninitvar there. Suppress
+    # noisy 'normalCheckLevelMaxBranches' info messages too — they're
+    # advisories about analysis depth, not findings.
+    add_custom_target(cppcheck
+        COMMAND ${CPPCHECK_EXECUTABLE}
+                --enable=warning,performance,portability
+                --error-exitcode=1
+                --inline-suppr
+                --quiet
+                --suppress=missingIncludeSystem
+                --suppress=normalCheckLevelMaxBranches
+                --suppress=*:${C_LOG_INCLUDE_DIR}/*
+                --std=c11
+                -I${CMAKE_SOURCE_DIR}/src
+                -I${C_LOG_INCLUDE_DIR}
+                ${CMAKE_SOURCE_DIR}/src
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Running cppcheck over src/"
+        VERBATIM)
+    message(STATUS "cppcheck target available (${CPPCHECK_EXECUTABLE})")
+else()
+    message(STATUS "cppcheck not found; 'cppcheck' target unavailable")
+endif()
+
+if(ENABLE_STACK_USAGE_CHECK AND STACK_USAGE_SUPPORTED)
+    add_custom_target(stack-usage
+        COMMAND ${CMAKE_SOURCE_DIR}/tools/check_stack_usage.sh
+                ${CMAKE_BINARY_DIR}
+                ${STACK_USAGE_LIMIT_BYTES}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        DEPENDS dns_encrypted_proxy_lib dns-encrypted-proxy
+        COMMENT "Verifying every function frame fits under ${STACK_USAGE_LIMIT_BYTES} bytes"
+        VERBATIM)
+    message(STATUS "stack-usage target available (limit: ${STACK_USAGE_LIMIT_BYTES} bytes)")
+endif()
+
+# Umbrella target: run everything that's available. Each sub-target either
+# runs or is a no-op if the tool wasn't found at configure time.
+set(ANALYZE_DEPENDS)
+if(CLANG_TIDY_EXECUTABLE)
+    list(APPEND ANALYZE_DEPENDS lint)
+endif()
+if(CPPCHECK_EXECUTABLE)
+    list(APPEND ANALYZE_DEPENDS cppcheck)
+endif()
+if(ENABLE_STACK_USAGE_CHECK AND STACK_USAGE_SUPPORTED)
+    list(APPEND ANALYZE_DEPENDS stack-usage)
+endif()
+if(ANALYZE_DEPENDS)
+    add_custom_target(analyze DEPENDS ${ANALYZE_DEPENDS}
+        COMMENT "Running all available static analysis targets")
 endif()

@@ -1,5 +1,6 @@
 stages:
   - test
+  - analyze
   - build
   - deploy
 
@@ -32,6 +33,32 @@ test:
     paths:
       - build/matrix/
     expire_in: 1 week
+
+analyze:
+  stage: analyze
+  image: alpine:latest
+  tags:
+    - docker
+  needs:
+    - test
+  before_script:
+    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig clang-extra-tools cppcheck git bash
+    - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
+  script:
+    # cppcheck and stack-usage gate; lint is advisory and surfaces findings
+    # without failing the job (clang-tidy ≥ 18 returns non-zero on any
+    # finding; existing backlog tracked separately).
+    - cmake -S . -B build/analyze
+        -DCMAKE_BUILD_TYPE=Debug
+        -DC_LOG_PATH=/tmp/c-log
+        -DENABLE_ANALYZER=ON
+        -DENABLE_STACK_USAGE_CHECK=ON
+        -DENABLE_UPSTREAM_DOQ=OFF
+    - cmake --build build/analyze -j
+    - cmake --build build/analyze --target cppcheck
+    - cmake --build build/analyze --target stack-usage
+    - cmake --build build/analyze --target lint
+  allow_failure: false
 
 build:
   stage: build
