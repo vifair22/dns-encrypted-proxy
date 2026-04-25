@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdint.h>
 
+#include "errors.h"
+
 #define MAX_UPSTREAMS 8
 #define MAX_URL_LEN 512
 #define MAX_HOSTS_A_OVERRIDES 64
@@ -40,7 +42,7 @@ typedef struct {
     int hosts_a_override_count;
 } proxy_config_t;
 
-int config_load(proxy_config_t *config, const char *explicit_path);
+proxy_status_t config_load(proxy_config_t *config, const char *explicit_path);
 void config_print(const proxy_config_t *config, FILE *out);
 int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32_t *addr_v4_be_out);
 
