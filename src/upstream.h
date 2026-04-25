@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <pthread.h>
 
+#include "errors.h"
+
 #define UPSTREAM_MAX_SERVERS 8
 #define UPSTREAM_MAX_URL_LEN 512
 #define UPSTREAM_MAX_BOOTSTRAP_RESOLVERS 8
@@ -211,7 +213,7 @@ typedef struct {
  * @param config      Client configuration
  * @return 0 on success, -1 on error
  */
-int upstream_client_init(
+proxy_status_t upstream_client_init(
     upstream_client_t *client,
     const char *urls[],
     int url_count,

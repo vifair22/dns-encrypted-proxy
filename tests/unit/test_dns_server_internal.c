@@ -41,7 +41,7 @@ static int g_stub_hosts_lookup_hit = 0;
 static uint32_t g_stub_hosts_lookup_addr_be = 0;
 static uint8_t g_huge_response[70000];
 static proxy_status_t g_stub_dns_cache_init_rc = PROXY_OK;
-static int g_stub_upstream_client_init_rc = 0;
+static proxy_status_t g_stub_upstream_client_init_rc = PROXY_OK;
 static proxy_status_t g_stub_upstream_facilitator_init_rc = PROXY_OK;
 static int g_stub_dns_cache_destroy_calls = 0;
 static int g_stub_upstream_client_destroy_calls = 0;
@@ -122,7 +122,7 @@ static void reset_stubs(void) {
     g_stub_hosts_lookup_hit = 0;
     g_stub_hosts_lookup_addr_be = 0;
     g_stub_dns_cache_init_rc = PROXY_OK;
-    g_stub_upstream_client_init_rc = 0;
+    g_stub_upstream_client_init_rc = PROXY_OK;
     g_stub_upstream_facilitator_init_rc = PROXY_OK;
     g_stub_dns_cache_destroy_calls = 0;
     g_stub_upstream_client_destroy_calls = 0;
@@ -387,7 +387,7 @@ void dns_cache_store(
     g_stub_cache_store_calls++;
 }
 
-int upstream_client_init(upstream_client_t *client, const char *urls[], int url_count, const upstream_config_t *config) {
+proxy_status_t upstream_client_init(upstream_client_t *client, const char *urls[], int url_count, const upstream_config_t *config) {
     (void)client;
     (void)urls;
     (void)url_count;
@@ -777,7 +777,7 @@ static void test_proxy_server_init_and_socket_success_paths(void **state) {
     assert_int_equal(proxy_server_init(&server, &cfg, &stop), -1);
 
     reset_stubs();
-    g_stub_upstream_client_init_rc = -1;
+    g_stub_upstream_client_init_rc = PROXY_ERR_RESOURCE;
     assert_int_equal(proxy_server_init(&server, &cfg, &stop), -1);
     assert_true(g_stub_dns_cache_destroy_calls >= 1);
 

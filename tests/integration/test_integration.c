@@ -1304,7 +1304,7 @@ static void test_upstream_transport_doh_success(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
 
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1361,7 +1361,7 @@ static void test_upstream_transport_doh_unreachable(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
 
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1409,7 +1409,7 @@ static void test_upstream_transport_dot(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
 
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1456,7 +1456,7 @@ static void test_upstream_transport_dot_unreachable(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
 
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1507,7 +1507,7 @@ static void test_upstream_transport_dot_zero_length_response(void **state) {
         .max_failures_before_unhealthy = 3,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1559,7 +1559,7 @@ static void test_upstream_transport_dot_malformed_response(void **state) {
         .max_failures_before_unhealthy = 3,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1609,7 +1609,7 @@ static void test_upstream_transport_dot_close_before_length(void **state) {
         .max_failures_before_unhealthy = 3,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1660,7 +1660,7 @@ static void test_upstream_transport_dot_partial_body(void **state) {
         .max_failures_before_unhealthy = 3,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1716,7 +1716,7 @@ static void test_upstream_transport_doq_success(void **state) {
         .max_failures_before_unhealthy = 2,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1761,7 +1761,7 @@ static void test_upstream_transport_doq_unreachable(void **state) {
         .max_failures_before_unhealthy = 1,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1815,7 +1815,7 @@ static void test_upstream_transport_doq_alpn_mismatch(void **state) {
         .max_failures_before_unhealthy = 1,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1870,7 +1870,7 @@ static void test_upstream_transport_doq_malformed_len(void **state) {
         .max_failures_before_unhealthy = 1,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1925,7 +1925,7 @@ static void test_upstream_transport_doq_no_fin(void **state) {
         .max_failures_before_unhealthy = 1,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1980,7 +1980,7 @@ static void test_upstream_transport_doq_close_early(void **state) {
         .max_failures_before_unhealthy = 1,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -2037,7 +2037,7 @@ static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
         .max_failures_before_unhealthy = 3,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -2097,7 +2097,7 @@ static void test_upstream_transport_failover_doh_to_dot(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
 
-    assert_int_equal(upstream_client_init(&client, urls, 2, &cfg), 0);
+    assert_int_equal(upstream_client_init(&client, urls, 2, &cfg), PROXY_OK);
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -2194,7 +2194,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
         .max_failures_before_unhealthy = 2,
         .unhealthy_backoff_ms = 1000,
     };
-    assert_int_equal(upstream_client_init(&upstream, urls, sizeof(urls) / sizeof(urls[0]), &cfg), 0);
+    assert_int_equal(upstream_client_init(&upstream, urls, sizeof(urls) / sizeof(urls[0]), &cfg), PROXY_OK);
 
     int port = reserve_unused_port();
     assert_true(port > 0);
