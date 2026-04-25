@@ -714,7 +714,7 @@ static int parse_opts(int argc, char **argv, bench_opts_t *opts) {
     opts->protocol = PROTO_UDP;
     opts->random_qname = 0;
     opts->direct_upstream = 0;
-    opts->proxy_bin = "./build/dns-encrypted-proxy";
+    opts->proxy_bin = "./build/bin/dns-encrypted-proxy";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--protocol") == 0 && i + 1 < argc) {

@@ -5,6 +5,12 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# All ready-to-run binaries (proxy, tests, benchmarks) land in build/bin/
+# regardless of which build variant (release/debug/asan/coverage) was configured.
+# Last variant built wins — this matches the "build/bin/ holds the binaries you run"
+# convention; per-variant intermediates stay in their own build/<type>/ dir.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/build/bin")
+
 option(WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(ENABLE_COVERAGE "Enable gcov/gcovr coverage instrumentation" OFF)
 option(ENABLE_UPSTREAM_DOH "Enable DoH upstream support" ON)

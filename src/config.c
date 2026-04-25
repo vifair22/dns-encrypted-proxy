@@ -130,8 +130,7 @@ static void hosts_add_or_update(proxy_config_t *config, const char *name, uint32
     }
 
     hosts_a_override_t *entry = &config->hosts_a_overrides[free_slot];
-    strncpy(entry->name, name, sizeof(entry->name) - 1);
-    entry->name[sizeof(entry->name) - 1] = '\0';
+    snprintf(entry->name, sizeof(entry->name), "%s", name);
     entry->addr_v4_be = addr_v4_be;
     entry->name_hash = hash;
     entry->in_use = 1;
@@ -606,8 +605,7 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
      * through a temporary buffer to avoid undefined overlap behavior.
      */
     char selected_path[sizeof(config->config_path)];
-    strncpy(selected_path, path, sizeof(selected_path) - 1);
-    selected_path[sizeof(selected_path) - 1] = '\0';
+    snprintf(selected_path, sizeof(selected_path), "%s", path);
     memcpy(config->config_path, selected_path, sizeof(selected_path));
 
     load_config_file(config, config->config_path);

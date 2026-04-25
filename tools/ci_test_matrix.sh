@@ -16,7 +16,7 @@ if [ -z "${C_LOG_PATH:-}" ]; then
   fi
 fi
 
-BUILD_ROOT="${BUILD_ROOT:-build-matrix-ci}"
+BUILD_ROOT="${BUILD_ROOT:-build/matrix}"
 BUILD_TESTS="${BUILD_TESTS:-ON}"
 BUILD_BENCHMARKS="${BUILD_BENCHMARKS:-OFF}"
 
