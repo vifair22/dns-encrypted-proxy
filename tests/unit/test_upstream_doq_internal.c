@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include "upstream.h"
+#include "upstream_doq_ngtcp2.h"
+#include "dns_message.h"
 
 static int g_backend_rc = -1;
 static uint8_t *g_backend_resp = NULL;

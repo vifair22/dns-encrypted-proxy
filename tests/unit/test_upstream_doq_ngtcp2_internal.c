@@ -8,6 +8,8 @@
 
 #include <string.h>
 
+#include "logger.h"
+
 void logger_logf(const char *func, const char *level, const char *fmt, ...) {
     (void)func;
     (void)level;
