@@ -250,6 +250,7 @@ if(ENABLE_UPSTREAM_DOQ)
 endif()
 
 set(DNS_ENCRYPTED_PROXY_SOURCES
+    src/errors.c
     src/config.c
     src/cache.c
     src/dns_message.c
@@ -334,6 +335,13 @@ if(BUILD_TESTS)
         message(STATUS "cmocka found, building tests")
         find_package(OpenSSL REQUIRED)
         
+        # Unit test: errors infrastructure (thread-local buffer + macros)
+        add_executable(test_errors tests/unit/test_errors.c)
+        target_link_libraries(test_errors dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES} Threads::Threads)
+        target_include_directories(test_errors PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        apply_target_defaults(test_errors)
+        add_proxy_test(test_errors)
+
         # Unit test: config
         add_executable(test_config tests/unit/test_config.c)
         target_link_libraries(test_config dns_encrypted_proxy_lib ${CMOCKA_LIBRARIES})
@@ -483,7 +491,7 @@ if(BUILD_TESTS)
             find_program(GCOVR_EXECUTABLE gcovr)
             if(GCOVR_EXECUTABLE)
                 set(COVERAGE_TEST_DEPS
-                    test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_iterative_resolver_internal test_upstream_bootstrap_internal test_upstream_internal test_upstream_dispatch_internal test_integration_core test_integration_transport test_integration_runtime)
+                    test_errors test_config test_cache test_cache_internal test_dns_message test_dns_message_internal test_upstream test_metrics_internal test_dns_server_internal test_iterative_resolver_internal test_upstream_bootstrap_internal test_upstream_internal test_upstream_dispatch_internal test_integration_core test_integration_transport test_integration_runtime)
                 if(ENABLE_UPSTREAM_DOH)
                     list(APPEND COVERAGE_TEST_DEPS test_upstream_doh_internal)
                 endif()
