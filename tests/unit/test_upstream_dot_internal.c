@@ -518,27 +518,27 @@ static void test_dot_client_init_failure_paths(void **state) {
     upstream_dot_client_t *client = NULL;
 
     g_ssl_ctx_value = NULL;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), -1);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_ssl_default_verify_paths_rc = 0;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), -1);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_pthread_mutex_init_fail = 1;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), -1);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_pthread_cond_init_fail = 1;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), -1);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_calloc_fail_on_call = 1;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), -1);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_ERR_RESOURCE);
 
     reset_stubs();
     g_calloc_fail_on_call = 2;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), -1);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_ERR_RESOURCE);
 }
 
 static void test_establish_tls_connection_paths(void **state) {
@@ -590,7 +590,7 @@ static void test_dot_resolve_success_and_failures(void **state) {
     };
 
     upstream_dot_client_t *client = NULL;
-    assert_int_equal(upstream_dot_client_init(&client, &cfg), 0);
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_OK);
     assert_non_null(client);
 
     upstream_server_t server;

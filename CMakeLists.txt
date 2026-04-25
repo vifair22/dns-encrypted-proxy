@@ -446,7 +446,9 @@ if(BUILD_TESTS)
 
         if(ENABLE_UPSTREAM_DOT)
             # Unit test: upstream DoT internals (static helper branch coverage)
-            add_executable(test_upstream_dot_internal tests/unit/test_upstream_dot_internal.c)
+            # Amalgamates src/upstream_dot.c via #include; pulls in src/errors.c
+            # because upstream_dot_client_init now uses set_error.
+            add_executable(test_upstream_dot_internal tests/unit/test_upstream_dot_internal.c src/errors.c)
             target_link_libraries(test_upstream_dot_internal ${CMOCKA_LIBRARIES} Threads::Threads)
             target_include_directories(test_upstream_dot_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
             apply_target_defaults(test_upstream_dot_internal)
