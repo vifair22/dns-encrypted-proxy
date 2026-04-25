@@ -54,8 +54,8 @@ int main(int argc, char **argv) {
     }
 
     proxy_config_t config;
-    if (config_load(&config, config_path) != 0) {
-        LOGF_ERROR("Failed to load configuration");
+    if (config_load(&config, config_path) != PROXY_OK) {
+        LOGF_ERROR("Failed to load configuration: %s", proxy_error_message());
         return 1;
     }
 
