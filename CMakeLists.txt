@@ -35,6 +35,7 @@ option(ENABLE_UPSTREAM_DOT "Enable DoT upstream support" ON)
 option(ENABLE_UPSTREAM_DOQ "Enable DoQ upstream support" OFF)
 
 set(STACK_USAGE_LIMIT_BYTES 65536 CACHE STRING "Per-frame stack usage limit enforced by the stack-usage target (bytes)")
+set(COVERAGE_LINE_THRESHOLD 80 CACHE STRING "Minimum line coverage % required by the coverage target (gcovr --fail-under-line)")
 
 # Always emit compile_commands.json so clang-tidy/static analysis tools work
 # without extra plumbing.
@@ -494,15 +495,20 @@ if(BUILD_TESTS)
                     list(APPEND COVERAGE_TEST_DEPS test_upstream_doq_ngtcp2_internal)
                 endif()
 
+                # Two gcovr passes: the first prints the per-file table and
+                # gates on the line-coverage threshold; the second emits the
+                # browsable HTML report. Failing the gate aborts before the
+                # HTML is regenerated, so the previous report is preserved
+                # for triage.
                 add_custom_target(coverage
                     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure --timeout 30
-                    COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --merge-mode-functions merge-use-line-min --gcov-ignore-parse-errors negative_hits.warn_once_per_file --print-summary
+                    COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --merge-mode-functions merge-use-line-min --gcov-ignore-parse-errors negative_hits.warn_once_per_file --fail-under-line ${COVERAGE_LINE_THRESHOLD} --print-summary
                     COMMAND ${GCOVR_EXECUTABLE} -r ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR} --exclude ${CMAKE_SOURCE_DIR}/tests --exclude ${CMAKE_SOURCE_DIR}/tools --merge-mode-functions merge-use-line-min --gcov-ignore-parse-errors negative_hits.warn_once_per_file --html-details -o ${CMAKE_BINARY_DIR}/coverage.html
                     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
                     USES_TERMINAL
                     DEPENDS dns-encrypted-proxy ${COVERAGE_TEST_DEPS}
-                    COMMENT "Run tests and generate coverage report")
-                message(STATUS "Coverage target available: cmake --build <build-dir> --target coverage")
+                    COMMENT "Run tests and generate coverage report (gates at ${COVERAGE_LINE_THRESHOLD}% lines)")
+                message(STATUS "Coverage target available (line threshold: ${COVERAGE_LINE_THRESHOLD}%): cmake --build <build-dir> --target coverage")
             else()
                 message(WARNING "gcovr not found; install gcovr to enable the 'coverage' target")
             endif()
