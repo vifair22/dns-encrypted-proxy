@@ -70,6 +70,58 @@ cmake --build build/release -j
 ctest --test-dir build/release --output-on-failure
 ```
 
+## Static Analysis
+
+The build defines four analysis targets; each is independent.
+
+### `cppcheck`
+
+Runs cppcheck with `--enable=warning,performance,portability` over `src/`. Gates the build (non-zero exit on any finding).
+
+```bash
+cmake --build build/release --target cppcheck
+```
+
+### `lint` and `lint-strict`
+
+Both run `clang-tidy` against the project's `compile_commands.json` using rules in `.clang-tidy`.
+
+- `lint` is advisory — surfaces findings, exits 0 regardless. Use during development.
+- `lint-strict` propagates clang-tidy's exit code. Use to gate.
+
+```bash
+cmake --build build/release --target lint
+cmake --build build/release --target lint-strict
+```
+
+### `stack-usage`
+
+Per-function frame-size check against a 64KB limit (configurable via `-DSTACK_USAGE_LIMIT_BYTES=...`). Requires `-DENABLE_STACK_USAGE_CHECK=ON` at configure time so the compiler emits `.su` files.
+
+```bash
+cmake -S . -B build/analyze -DCMAKE_BUILD_TYPE=Debug -DENABLE_STACK_USAGE_CHECK=ON
+cmake --build build/analyze
+cmake --build build/analyze --target stack-usage
+```
+
+### GCC `-fanalyzer`
+
+`-DENABLE_ANALYZER=ON` adds `-fanalyzer` to production-source compilation (skipped on test targets, where it false-positives heavily). Findings surface as warnings during the build itself; with `-Werror` they fail compilation.
+
+```bash
+cmake -S . -B build/analyze -DCMAKE_BUILD_TYPE=Debug -DENABLE_ANALYZER=ON
+cmake --build build/analyze
+```
+
+### `analyze`
+
+Umbrella target that runs `lint`, `cppcheck`, and (when stack-usage is enabled) `stack-usage`.
+
+```bash
+cmake -S . -B build/analyze -DCMAKE_BUILD_TYPE=Debug -DENABLE_ANALYZER=ON -DENABLE_STACK_USAGE_CHECK=ON
+cmake --build build/analyze --target analyze
+```
+
 ## Docker CI Mirror (Recommended)
 
 Use the dedicated CI test image and run the same matrix script used by GitLab:
