@@ -1,0 +1,18 @@
+#ifndef VERSION_H
+#define VERSION_H
+
+/*
+ * Generated at configure time from release_version + the configure timestamp +
+ * the active build type. Format: SEMVER_YYYYMMDD.HHMM.TYPE
+ *   SEMVER  - bumped manually in the release_version file at repo root
+ *   YYYYMMDD.HHMM - UTC configure-time stamp
+ *   TYPE    - release | debug | relwithdebinfo | asan | coverage | static
+ *             (ASAN/coverage take precedence over the build type if enabled)
+ */
+
+#define PROXY_VERSION_SEMVER     "@PROXY_VERSION_SEMVER@"
+#define PROXY_VERSION_TIMESTAMP  "@PROXY_VERSION_TIMESTAMP@"
+#define PROXY_VERSION_BUILD_TYPE "@PROXY_VERSION_BUILD_TYPE@"
+#define PROXY_VERSION_FULL       "@PROXY_VERSION_FULL@"
+
+#endif /* VERSION_H */

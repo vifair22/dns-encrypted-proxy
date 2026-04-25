@@ -5,6 +5,20 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# ---------------------------------------------------------------------------
+# Version identity
+#
+# release_version holds the bumped-by-hand semver. The compile-time string
+# "SEMVER_YYYYMMDD.HHMM.TYPE" is generated into a header that main.c includes
+# so the binary can self-identify on --version and at startup.
+# ---------------------------------------------------------------------------
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/release_version" PROXY_VERSION_SEMVER LIMIT_COUNT 1)
+if(NOT PROXY_VERSION_SEMVER)
+    message(FATAL_ERROR "release_version file is empty or missing at ${CMAKE_CURRENT_SOURCE_DIR}/release_version")
+endif()
+string(STRIP "${PROXY_VERSION_SEMVER}" PROXY_VERSION_SEMVER)
+string(TIMESTAMP PROXY_VERSION_TIMESTAMP "%Y%m%d.%H%M" UTC)
+
 # All ready-to-run binaries (proxy, tests, benchmarks) land in build/bin/
 # regardless of which build variant (release/debug/asan/coverage) was configured.
 # Last variant built wins — this matches the "build/bin/ holds the binaries you run"
@@ -117,6 +131,25 @@ if(ENABLE_STACK_USAGE_CHECK)
         message(WARNING "ENABLE_STACK_USAGE_CHECK requested but compiler '${CMAKE_C_COMPILER_ID}' is unsupported")
     endif()
 endif()
+
+# Determine the build-type tag for the version string. Sanitizer/coverage
+# variants take precedence over the raw CMAKE_BUILD_TYPE since they're the
+# more interesting fact about a binary you'd hand someone for triage.
+if(ENABLE_ASAN AND ASAN_SUPPORTED)
+    set(PROXY_VERSION_BUILD_TYPE "asan")
+elseif(ENABLE_COVERAGE AND COVERAGE_SUPPORTED)
+    set(PROXY_VERSION_BUILD_TYPE "coverage")
+elseif(CMAKE_BUILD_TYPE)
+    string(TOLOWER "${CMAKE_BUILD_TYPE}" PROXY_VERSION_BUILD_TYPE)
+else()
+    set(PROXY_VERSION_BUILD_TYPE "unknown")
+endif()
+set(PROXY_VERSION_FULL "${PROXY_VERSION_SEMVER}_${PROXY_VERSION_TIMESTAMP}.${PROXY_VERSION_BUILD_TYPE}")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/version.h"
+    @ONLY)
+message(STATUS "Version: ${PROXY_VERSION_FULL}")
 
 function(apply_target_defaults target_name)
     target_compile_options(${target_name} PRIVATE
@@ -260,6 +293,7 @@ apply_target_defaults(dns_encrypted_proxy_lib)
 # Main executable
 add_executable(dns-encrypted-proxy src/main.c)
 target_link_libraries(dns-encrypted-proxy PRIVATE dns_encrypted_proxy_lib)
+target_include_directories(dns-encrypted-proxy PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 apply_target_defaults(dns-encrypted-proxy)
 
 # Benchmark utility

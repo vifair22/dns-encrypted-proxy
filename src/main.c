@@ -4,6 +4,7 @@
 #include "dns_server.h"
 #include "logger.h"
 #include "metrics.h"
+#include "version.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -16,10 +17,40 @@ static void handle_signal(int sig) {
     g_stop = 1;
 }
 
+static void print_version(void) {
+    /* stdout: tools that scrape --version output expect normal-channel data */
+    printf("dns-encrypted-proxy %s\n", PROXY_VERSION_FULL);
+}
+
+static void print_usage(const char *progname) {
+    printf("Usage: %s [OPTIONS] [CONFIG_PATH]\n", progname);
+    printf("\n");
+    printf("Encrypted-DNS forward proxy: serves classic DNS over UDP/TCP and\n");
+    printf("forwards to DoH/DoT/DoQ upstreams.\n");
+    printf("\n");
+    printf("Positional:\n");
+    printf("  CONFIG_PATH         Path to a TOML/INI config file. If omitted,\n");
+    printf("                      the value of $DNS_ENCRYPTED_PROXY_CONFIG is used,\n");
+    printf("                      falling back to ./dns-encrypted-proxy.conf.\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  -h, --help          Show this help and exit.\n");
+    printf("  -v, --version       Print version and exit.\n");
+}
+
 int main(int argc, char **argv) {
     const char *config_path = NULL;
     if (argc > 1) {
-        config_path = argv[1];
+        const char *arg = argv[1];
+        if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
+            print_version();
+            return 0;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+        config_path = arg;
     }
 
     proxy_config_t config;
@@ -36,6 +67,7 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    LOGF_INFO("dns-encrypted-proxy %s starting", PROXY_VERSION_FULL);
     LOGF_INFO("Loaded configuration from %s", config.config_path);
     LOGF_INFO("Starting DNS listener on %s:%d (UDP+TCP)", config.listen_addr, config.listen_port);
 
