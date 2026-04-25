@@ -293,19 +293,19 @@ static void test_metrics_server_start_failure_paths(void **state) {
     metrics_init(&g_test_metrics);
 
     g_fail_socket = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), PROXY_ERR_NETWORK);
     g_fail_socket = 0;
 
     g_fail_bind = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), PROXY_ERR_NETWORK);
     g_fail_bind = 0;
 
     g_fail_listen = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), PROXY_ERR_NETWORK);
     g_fail_listen = 0;
 
     g_fail_pthread_create = 1;
-    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), -1);
+    assert_int_equal(metrics_server_start(&g_test_metrics, &dummy_cache, NULL, NULL, 9099), PROXY_ERR_RESOURCE);
     g_fail_pthread_create = 0;
 }
 

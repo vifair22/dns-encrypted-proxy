@@ -1098,19 +1098,21 @@ static void *tcp_accept_loop(void *arg) {
     return NULL;
 }
 
-int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, volatile sig_atomic_t *stop_flag) {
+proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *config, volatile sig_atomic_t *stop_flag) {
     if (server == NULL || config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "server=%p config=%p",
+                         (const void *)server, (const void *)config);
     }
-    
+
     memset(server, 0, sizeof(*server));
     server->config = *config;
     server->stop_flag = stop_flag;
-    
+
     /* Initialize cache */
-    if (dns_cache_init(&server->cache, (size_t)config->cache_capacity) != PROXY_OK) {
-        LOGF_ERROR("Failed to initialize cache: %s", proxy_error_message());
-        return -1;
+    proxy_status_t cache_rc = dns_cache_init(&server->cache, (size_t)config->cache_capacity);
+    if (cache_rc != PROXY_OK) {
+        return cache_rc;
     }
     
     /* Initialize upstream client */
@@ -1130,19 +1132,19 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
         .iterative_bootstrap_enabled = 1,
     };
     
-    if (upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg) != PROXY_OK) {
-        LOGF_ERROR("Failed to initialize upstream client: %s", proxy_error_message());
+    proxy_status_t upstream_rc = upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg);
+    if (upstream_rc != PROXY_OK) {
         dns_cache_destroy(&server->cache);
-        return -1;
+        return upstream_rc;
     }
 
     (void)upstream_bootstrap_configure(&server->upstream, config);
 
-    if (upstream_facilitator_init(&server->upstream_facilitator, &server->upstream) != PROXY_OK) {
-        LOGF_ERROR("Failed to initialize upstream facilitator: %s", proxy_error_message());
+    proxy_status_t facilitator_rc = upstream_facilitator_init(&server->upstream_facilitator, &server->upstream);
+    if (facilitator_rc != PROXY_OK) {
         upstream_client_destroy(&server->upstream);
         dns_cache_destroy(&server->cache);
-        return -1;
+        return facilitator_rc;
     }
 
     LOGF_INFO("Upstream fallback configuration:");
@@ -1153,8 +1155,8 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
     
     /* Initialize metrics */
     metrics_init(&server->metrics);
-    
-    return 0;
+
+    return PROXY_OK;
 }
 
 void proxy_server_destroy(proxy_server_t *server) {
@@ -1168,22 +1170,24 @@ void proxy_server_destroy(proxy_server_t *server) {
     memset(server, 0, sizeof(*server));
 }
 
-int proxy_server_run(proxy_server_t *server) {
+proxy_status_t proxy_server_run(proxy_server_t *server) {
     if (server == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG, "server=NULL");
     }
 
     int udp_fd = create_udp_socket(&server->config);
     if (udp_fd < 0) {
-        LOGF_ERROR("Failed to create/bind UDP socket on %s:%d", server->config.listen_addr, server->config.listen_port);
-        return -1;
+        return set_error(PROXY_ERR_NETWORK,
+                         "create/bind UDP socket on %s:%d failed",
+                         server->config.listen_addr, server->config.listen_port);
     }
 
     int tcp_fd = create_tcp_socket(&server->config);
     if (tcp_fd < 0) {
-        LOGF_ERROR("Failed to create/bind TCP socket on %s:%d", server->config.listen_addr, server->config.listen_port);
         close(udp_fd);
-        return -1;
+        return set_error(PROXY_ERR_NETWORK,
+                         "create/bind TCP socket on %s:%d failed",
+                         server->config.listen_addr, server->config.listen_port);
     }
 
     socket_loop_ctx_t udp_ctx = {.server = server, .fd = udp_fd};
@@ -1196,19 +1200,23 @@ int proxy_server_run(proxy_server_t *server) {
      * Both loops run until shared stop flag is set. We join both threads to
      * guarantee sockets and worker lifecycle are fully drained on shutdown.
      */
-    if (pthread_create(&udp_thread, NULL, udp_loop, &udp_ctx) != 0) {
-        LOGF_ERROR("Failed to create UDP loop thread");
+    int udp_rc = pthread_create(&udp_thread, NULL, udp_loop, &udp_ctx);
+    if (udp_rc != 0) {
         close(udp_fd);
         close(tcp_fd);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_create UDP loop failed (rc=%d)",
+                         udp_rc);
     }
 
-    if (pthread_create(&tcp_thread, NULL, tcp_accept_loop, &tcp_ctx) != 0) {
-        LOGF_ERROR("Failed to create TCP accept loop thread");
+    int tcp_rc = pthread_create(&tcp_thread, NULL, tcp_accept_loop, &tcp_ctx);
+    if (tcp_rc != 0) {
         close(udp_fd);
         close(tcp_fd);
         pthread_join(udp_thread, NULL);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_create TCP accept loop failed (rc=%d)",
+                         tcp_rc);
     }
 
     pthread_join(udp_thread, NULL);
@@ -1219,5 +1227,5 @@ int proxy_server_run(proxy_server_t *server) {
 
     LOGF_INFO("Proxy server shutdown complete");
 
-    return 0;
+    return PROXY_OK;
 }

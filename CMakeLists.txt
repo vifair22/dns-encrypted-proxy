@@ -388,7 +388,9 @@ if(BUILD_TESTS)
         add_proxy_test(test_upstream)
 
         # Unit test: metrics internals (static helper branch coverage)
-        add_executable(test_metrics_internal tests/unit/test_metrics_internal.c)
+        # Amalgamates src/metrics.c via #include; pulls in src/errors.c
+        # because metrics_server_start now uses set_error.
+        add_executable(test_metrics_internal tests/unit/test_metrics_internal.c src/errors.c)
         target_link_libraries(test_metrics_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_metrics_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_metrics_internal)

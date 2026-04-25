@@ -6,6 +6,7 @@
 
 #include "cache.h"
 #include "config.h"
+#include "errors.h"
 #include "upstream.h"
 #include "upstream_dispatch.h"
 #include "metrics.h"
@@ -20,8 +21,8 @@ typedef struct {
     atomic_int active_tcp_clients;
 } proxy_server_t;
 
-int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, volatile sig_atomic_t *stop_flag);
+proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *config, volatile sig_atomic_t *stop_flag);
 void proxy_server_destroy(proxy_server_t *server);
-int proxy_server_run(proxy_server_t *server);
+proxy_status_t proxy_server_run(proxy_server_t *server);
 
 #endif

@@ -992,19 +992,22 @@ void metrics_init(proxy_metrics_t *m) {
     atomic_store(&m->metrics_http_in_flight, 0);
 }
 
-int metrics_server_start(
+proxy_status_t metrics_server_start(
     proxy_metrics_t *m,
     dns_cache_t *cache,
     upstream_client_t *upstream,
     upstream_facilitator_t *facilitator,
     int port) {
     if (m == NULL || port <= 0 || port > 65535) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "m=%p port=%d (expected 1..65535)",
+                         (const void *)m, port);
     }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-        return -1;
+        return set_error_errno(PROXY_ERR_NETWORK,
+                               "socket(AF_INET, SOCK_STREAM)");
     }
 
     int reuse = 1;
@@ -1018,11 +1021,15 @@ int metrics_server_start(
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
-        return -1;
+        return set_error_errno(PROXY_ERR_NETWORK,
+                               "bind metrics socket on 0.0.0.0:%d",
+                               port);
     }
     if (listen(fd, 32) != 0) {
         close(fd);
-        return -1;
+        return set_error_errno(PROXY_ERR_NETWORK,
+                               "listen on metrics port %d",
+                               port);
     }
 
     g_metrics = m;
@@ -1035,7 +1042,8 @@ int metrics_server_start(
     g_listen_fd = fd;
     atomic_store(&g_stop, 0);
 
-    if (pthread_create(&g_thread, NULL, metrics_thread_main, NULL) != 0) {
+    int thread_rc = pthread_create(&g_thread, NULL, metrics_thread_main, NULL);
+    if (thread_rc != 0) {
         close(fd);
         g_listen_fd = -1;
         g_metrics = NULL;
@@ -1043,11 +1051,13 @@ int metrics_server_start(
         g_upstream = NULL;
         g_facilitator = NULL;
         g_start_monotonic_ms = 0;
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_create metrics thread failed (rc=%d)",
+                         thread_rc);
     }
 
     g_thread_started = 1;
-    return 0;
+    return PROXY_OK;
 }
 
 void metrics_server_stop(void) {
