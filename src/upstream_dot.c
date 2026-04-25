@@ -400,74 +400,88 @@ static int ssl_write_all(SSL *ssl, const uint8_t *buffer, size_t len) {
     return 0;
 }
 
-int upstream_dot_client_init(upstream_dot_client_t **client_out, const upstream_config_t *config) {
+proxy_status_t upstream_dot_client_init(upstream_dot_client_t **client_out, const upstream_config_t *config) {
     if (client_out == NULL || config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "client_out=%p config=%p",
+                         (const void *)client_out, (const void *)config);
     }
-    
+
     upstream_dot_client_t *client = calloc(1, sizeof(*client));
     if (client == NULL) {
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc upstream_dot_client_t");
     }
-    
+
     client->pool_size = config->pool_size > 0 ? config->pool_size : 4;
-    
+
     /* Initialize OpenSSL */
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
-    
+
     /* Create SSL context */
     client->ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (client->ssl_ctx == NULL) {
         free(client);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "SSL_CTX_new(TLS_client_method) failed");
     }
-    
+
     /* Set minimum TLS version to 1.2 */
     SSL_CTX_set_min_proto_version(client->ssl_ctx, TLS1_2_VERSION);
-    
+
     /* Enable certificate verification */
     SSL_CTX_set_verify(client->ssl_ctx, SSL_VERIFY_PEER, NULL);
-    
+
     /* Load system CA certificates */
     if (SSL_CTX_set_default_verify_paths(client->ssl_ctx) != 1) {
         SSL_CTX_free(client->ssl_ctx);
         free(client);
-        return -1;
-    }
-    
-    if (pthread_mutex_init(&client->pool_mutex, NULL) != 0) {
-        SSL_CTX_free(client->ssl_ctx);
-        free(client);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "SSL_CTX_set_default_verify_paths failed (no system CAs)");
     }
 
-    if (pthread_cond_init(&client->pool_cond, NULL) != 0) {
+    int mtx_rc = pthread_mutex_init(&client->pool_mutex, NULL);
+    if (mtx_rc != 0) {
+        SSL_CTX_free(client->ssl_ctx);
+        free(client);
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_mutex_init failed (rc=%d)",
+                         mtx_rc);
+    }
+
+    int cond_rc = pthread_cond_init(&client->pool_cond, NULL);
+    if (cond_rc != 0) {
         pthread_mutex_destroy(&client->pool_mutex);
         SSL_CTX_free(client->ssl_ctx);
         free(client);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_cond_init failed (rc=%d)",
+                         cond_rc);
     }
-    
-    client->pool = calloc((size_t)client->pool_size, sizeof(*client->pool));
+
+    int pool_size = client->pool_size;
+    client->pool = calloc((size_t)pool_size, sizeof(*client->pool));
     if (client->pool == NULL) {
         pthread_cond_destroy(&client->pool_cond);
         pthread_mutex_destroy(&client->pool_mutex);
         SSL_CTX_free(client->ssl_ctx);
         free(client);
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc DoT pool (size=%d)",
+                               pool_size);
     }
-    
-    for (int i = 0; i < client->pool_size; i++) {
+
+    for (int i = 0; i < pool_size; i++) {
         client->pool[i].fd = -1;
         client->pool[i].ssl = NULL;
         client->pool[i].in_use = 0;
     }
-    
+
     client->initialized = 1;
     *client_out = client;
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_dot_client_destroy(upstream_dot_client_t *client) {

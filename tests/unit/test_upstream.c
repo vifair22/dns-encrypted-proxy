@@ -35,7 +35,7 @@ int upstream_doh_client_get_pool_stats(
 #endif
 
 #if UPSTREAM_DOT_ENABLED
-int upstream_dot_client_init(upstream_dot_client_t **client_out, const upstream_config_t *config);
+proxy_status_t upstream_dot_client_init(upstream_dot_client_t **client_out, const upstream_config_t *config);
 void upstream_dot_client_destroy(upstream_dot_client_t *client);
 int upstream_dot_resolve(
     upstream_dot_client_t *client,
@@ -468,7 +468,7 @@ static void test_dot_protocol_guard_paths(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_dot_client_t *client = NULL;
-    assert_int_equal(upstream_dot_client_init(&client, &config), 0);
+    assert_int_equal(upstream_dot_client_init(&client, &config), PROXY_OK);
     assert_non_null(client);
 
     upstream_server_t server;
@@ -535,8 +535,8 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
     assert_int_equal(upstream_doh_client_init(&doh_client, NULL), PROXY_ERR_INVALID_ARG);
 #endif
 #if UPSTREAM_DOT_ENABLED
-    assert_int_equal(upstream_dot_client_init(NULL, &config), -1);
-    assert_int_equal(upstream_dot_client_init(&dot_client, NULL), -1);
+    assert_int_equal(upstream_dot_client_init(NULL, &config), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(upstream_dot_client_init(&dot_client, NULL), PROXY_ERR_INVALID_ARG);
 #endif
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(upstream_doq_client_init(NULL, &config), -1);
@@ -547,7 +547,7 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
     assert_int_equal(upstream_doh_client_init(&doh_client, &config), PROXY_OK);
 #endif
 #if UPSTREAM_DOT_ENABLED
-    assert_int_equal(upstream_dot_client_init(&dot_client, &config), 0);
+    assert_int_equal(upstream_dot_client_init(&dot_client, &config), PROXY_OK);
 #endif
 #if UPSTREAM_DOQ_ENABLED
     assert_int_equal(upstream_doq_client_init(&doq_client, &config), 0);
