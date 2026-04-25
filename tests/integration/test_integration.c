@@ -617,23 +617,19 @@ static int send_tcp_query_on_fd(int fd, const uint8_t *query, size_t query_len, 
 }
 
 static const char *resolve_proxy_binary_path(void) {
-    if (access("./dns-encrypted-proxy", X_OK) == 0) {
-        return "./dns-encrypted-proxy";
-    }
-    if (access("./build-no-doh/dns-encrypted-proxy", X_OK) == 0) {
-        return "./build-no-doh/dns-encrypted-proxy";
-    }
-    if (access("./build-doq-ngtcp2/dns-encrypted-proxy", X_OK) == 0) {
-        return "./build-doq-ngtcp2/dns-encrypted-proxy";
-    }
-    if (access("./build/dns-encrypted-proxy", X_OK) == 0) {
-        return "./build/dns-encrypted-proxy";
-    }
-    if (access("../dns-encrypted-proxy", X_OK) == 0) {
-        return "../dns-encrypted-proxy";
-    }
-    if (access("../build/dns-encrypted-proxy", X_OK) == 0) {
-        return "../build/dns-encrypted-proxy";
+    /* All ready-to-run binaries live in <repo>/build/bin/ regardless of which
+     * variant (release/debug/asan/coverage) was configured. The relative path
+     * depends on the test's working directory at the time ctest invokes it. */
+    static const char *const candidates[] = {
+        "./dns-encrypted-proxy",            /* cwd = build/bin/ */
+        "../bin/dns-encrypted-proxy",       /* cwd = build/<variant>/ */
+        "./build/bin/dns-encrypted-proxy",  /* cwd = repo root */
+        "../../bin/dns-encrypted-proxy",    /* cwd = build/matrix/<combo>/ */
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        if (access(candidates[i], X_OK) == 0) {
+            return candidates[i];
+        }
     }
     return NULL;
 }

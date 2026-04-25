@@ -54,17 +54,23 @@ Notes on DoH HTTP version selection:
 
 ## Quick Start
 
-Build:
+Build (release):
 
 ```bash
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
+cmake --build build/release
 ```
+
+Build artifacts land under `build/`:
+
+- `build/release/`, `build/debug/`, `build/asan/`, `build/coverage/` — per-variant CMake trees (intermediates, `Makefile`, `CMakeFiles/`)
+- `build/bin/` — ready-to-run binaries (`dns-encrypted-proxy`, all `test_*`, benchmark tools). Shared across variants; last build wins.
+- `build/matrix/<combo>/` — protocol feature-matrix builds produced by `tools/ci_test_matrix.sh`
 
 Optional upstream provider build flags (DoH/DoT ON by default, DoQ OFF by default):
 
 ```bash
-cmake -S . -B build \
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_UPSTREAM_DOH=ON \
   -DENABLE_UPSTREAM_DOT=ON \
   -DENABLE_UPSTREAM_DOQ=ON
@@ -85,13 +91,13 @@ Current DoQ status: experimental and disabled by default; implementation exists 
 Run:
 
 ```bash
-./build/dns-encrypted-proxy
+./build/bin/dns-encrypted-proxy
 ```
 
 Local non-privileged port:
 
 ```bash
-LISTEN_PORT=5353 ./build/dns-encrypted-proxy
+LISTEN_PORT=5353 ./build/bin/dns-encrypted-proxy
 ```
 
 ## Configuration
@@ -99,7 +105,7 @@ LISTEN_PORT=5353 ./build/dns-encrypted-proxy
 By default the proxy reads `dns-encrypted-proxy.conf` if present. You can also pass an explicit config path:
 
 ```bash
-./build/dns-encrypted-proxy /path/to/dns-encrypted-proxy.conf
+./build/bin/dns-encrypted-proxy /path/to/dns-encrypted-proxy.conf
 ```
 
 Main config keys:
