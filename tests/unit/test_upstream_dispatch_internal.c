@@ -145,7 +145,7 @@ static void test_priority_fallback_to_second_provider(void **state) {
     g_resolve_result[1] = 0;
 
     upstream_facilitator_t fac;
-    assert_int_equal(upstream_facilitator_init(&fac, &client), 0);
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
 
     uint8_t q[] = {0x01, 0x02};
     uint8_t *resp = NULL;
@@ -176,7 +176,7 @@ static void test_deadline_expired_fails_fast(void **state) {
     g_resolve_result[0] = -1;
 
     upstream_facilitator_t fac;
-    assert_int_equal(upstream_facilitator_init(&fac, &client), 0);
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
 
     uint8_t q[] = {0x01};
     uint8_t *resp = NULL;
@@ -204,7 +204,7 @@ static void test_dispatch_stats_exposed(void **state) {
     g_resolve_result[1] = 0;
 
     upstream_facilitator_t fac;
-    assert_int_equal(upstream_facilitator_init(&fac, &client), 0);
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
 
     upstream_facilitator_stats_t stats;
     assert_int_equal(upstream_facilitator_get_stats(&fac, &stats), 0);
@@ -243,7 +243,7 @@ static void test_cooldown_skips_failed_provider_member(void **state) {
     g_resolve_result[1] = 0;
 
     upstream_facilitator_t fac;
-    assert_int_equal(upstream_facilitator_init(&fac, &client), 0);
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
 
     uint8_t q[] = {0x11, 0x22};
     uint8_t *resp = NULL;
@@ -281,7 +281,7 @@ static void test_inflight_failure_drain_no_job_loss(void **state) {
     g_resolve_sleep_ms = 25;
 
     upstream_facilitator_t fac;
-    assert_int_equal(upstream_facilitator_init(&fac, &client), 0);
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
 
     enum { THREADS = 4 };
     pthread_t threads[THREADS];
