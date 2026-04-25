@@ -96,7 +96,7 @@ static int normalize_hostname(const char *in, char *out, size_t out_len) {
     while (n > 0 && isspace((unsigned char)in[n - 1])) {
         n--;
     }
-    while (*in != '\0' && isspace((unsigned char)*in)) {
+    while (n > 0 && isspace((unsigned char)*in)) {
         in++;
         n--;
     }
