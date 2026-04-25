@@ -40,6 +40,9 @@ static int g_curl_easy_init_calls = 0;
 static int g_curl_slist_fail_on_call = 0;
 static int g_curl_slist_calls = 0;
 static CURLcode g_curl_perform_rc = CURLE_OK;
+static CURLcode g_curl_perform_rc_seq[8];
+static int g_curl_perform_seq_len = 0;
+static int g_curl_perform_seq_idx = 0;
 static long g_curl_response_code = 200;
 static long g_curl_http_version = 0;
 static int g_emit_body = 0;
@@ -69,6 +72,9 @@ static void reset_stubs(void) {
     g_curl_slist_fail_on_call = 0;
     g_curl_slist_calls = 0;
     g_curl_perform_rc = CURLE_OK;
+    memset(g_curl_perform_rc_seq, 0, sizeof(g_curl_perform_rc_seq));
+    g_curl_perform_seq_len = 0;
+    g_curl_perform_seq_idx = 0;
     g_curl_response_code = 200;
     g_curl_http_version = 0;
     g_emit_body = 0;
@@ -167,13 +173,22 @@ CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
 }
 
 CURLcode curl_easy_perform(CURL *curl) {
-    if (g_emit_body) {
+    CURLcode rc;
+    if (g_curl_perform_seq_len > 0 && g_curl_perform_seq_idx < g_curl_perform_seq_len) {
+        rc = g_curl_perform_rc_seq[g_curl_perform_seq_idx++];
+    } else {
+        rc = g_curl_perform_rc;
+    }
+    /* Only emit the body on success — the consumer discards buffer on failure
+     * paths but a stale body across multiple sequenced attempts would corrupt
+     * the eventual successful read. */
+    if (rc == CURLE_OK && g_emit_body) {
         size_t idx = curl_slot_index(curl);
         if (g_slots[idx].write_fn != NULL && g_body_ptr != NULL && g_body_len > 0) {
             (void)g_slots[idx].write_fn((char *)(uintptr_t)g_body_ptr, 1, g_body_len, g_slots[idx].write_data);
         }
     }
-    return g_curl_perform_rc;
+    return rc;
 }
 
 CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...) {
@@ -585,6 +600,189 @@ static void test_doh_pool_stats_in_use_branch(void **state) {
     upstream_doh_client_destroy(client);
 }
 
+static upstream_server_t make_resolve_server(void) {
+    upstream_server_t server;
+    memset(&server, 0, sizeof(server));
+    server.type = UPSTREAM_TYPE_DOH;
+    strcpy(server.url, "https://example.test/dns-query");
+    return server;
+}
+
+static void test_doh_h3_failure_no_pin_below_threshold(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 200,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    /* First perform = h3 attempt fails; second = h2 fallback succeeds. */
+    g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[1] = CURLE_OK;
+    g_curl_perform_seq_len = 2;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H3);
+    assert_int_equal((int)server.stage.doh_h3_consecutive_failures, 1);
+    assert_int_equal((int)server.stage.doh_downgrade_h3_to_h2_total, 0);
+    assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TIMEOUT], 1);
+
+    upstream_doh_client_destroy(client);
+}
+
+static void test_doh_h3_pin_engages_at_threshold(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 200,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    for (int call = 0; call < DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD; call++) {
+        g_curl_perform_seq_idx = 0;
+        g_curl_perform_rc_seq[0] = CURLE_COULDNT_CONNECT;
+        g_curl_perform_rc_seq[1] = CURLE_OK;
+        g_curl_perform_seq_len = 2;
+
+        uint8_t *resp = NULL;
+        size_t resp_len = 0;
+        assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+        free(resp);
+    }
+
+    assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H2);
+    assert_int_equal((int)server.stage.doh_downgrade_h3_to_h2_total, 1);
+    assert_int_equal((int)server.stage.doh_upgrade_failures, 1);
+    assert_true(server.stage.doh_upgrade_retry_after_ms > 0);
+    assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TRANSPORT], DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD);
+
+    upstream_doh_client_destroy(client);
+}
+
+static void test_doh_h3_success_resets_consecutive_counter(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 200,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    /* Two failed h3 attempts (each with h2 fallback succeeding) → counter = 2. */
+    for (int call = 0; call < 2; call++) {
+        g_curl_perform_seq_idx = 0;
+        g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+        g_curl_perform_rc_seq[1] = CURLE_OK;
+        g_curl_perform_seq_len = 2;
+
+        uint8_t *resp = NULL;
+        size_t resp_len = 0;
+        assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+        free(resp);
+    }
+    assert_int_equal((int)server.stage.doh_h3_consecutive_failures, 2);
+
+    /* Third call: h3 succeeds. Counter must reset to 0, no pin engaged. */
+    g_curl_perform_seq_idx = 0;
+    g_curl_perform_rc_seq[0] = CURLE_OK;
+    g_curl_perform_seq_len = 1;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    assert_int_equal((int)server.stage.doh_h3_consecutive_failures, 0);
+    assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H3);
+    assert_int_equal((int)server.stage.doh_downgrade_h3_to_h2_total, 0);
+
+    upstream_doh_client_destroy(client);
+}
+
+static void test_doh_attempt_failure_counter_per_class(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 200,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    /* Call 1: h3 = TIMEOUT, h2 = OK */
+    g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[1] = CURLE_OK;
+    g_curl_perform_seq_len = 2;
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    /* Call 2: h3 = TLS error, h2 = OK */
+    g_curl_perform_seq_idx = 0;
+    g_curl_perform_rc_seq[0] = CURLE_SSL_CONNECT_ERROR;
+    g_curl_perform_rc_seq[1] = CURLE_OK;
+    g_curl_perform_seq_len = 2;
+    resp = NULL;
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TIMEOUT], 1);
+    assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TLS], 1);
+    assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H2][UPSTREAM_FAILURE_CLASS_TIMEOUT], 0);
+
+    upstream_doh_client_destroy(client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_write_callback_growth),
@@ -597,6 +795,10 @@ int main(void) {
         cmocka_unit_test(test_doh_client_init_failure_paths),
         cmocka_unit_test(test_doh_resolve_success_and_validation_failure),
         cmocka_unit_test(test_doh_pool_stats_in_use_branch),
+        cmocka_unit_test(test_doh_h3_failure_no_pin_below_threshold),
+        cmocka_unit_test(test_doh_h3_pin_engages_at_threshold),
+        cmocka_unit_test(test_doh_h3_success_resets_consecutive_counter),
+        cmocka_unit_test(test_doh_attempt_failure_counter_per_class),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
