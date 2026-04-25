@@ -588,9 +588,9 @@ static void load_config_file(proxy_config_t *config, const char *path) {
     fclose(fp);
 }
 
-int config_load(proxy_config_t *config, const char *explicit_path) {
+proxy_status_t config_load(proxy_config_t *config, const char *explicit_path) {
     if (config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG, "config pointer is NULL");
     }
 
     set_defaults(config);
@@ -617,38 +617,54 @@ int config_load(proxy_config_t *config, const char *explicit_path) {
     apply_env_overrides(config);
 
     if (config->upstream_count <= 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG, "no upstream URLs configured");
     }
 
     if (config->listen_port <= 0 || config->listen_port > 65535) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "listen_port out of range (got %d, expected 1..65535)",
+                         config->listen_port);
     }
 
     if (config->upstream_timeout_ms <= 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "upstream_timeout_ms must be > 0 (got %d)",
+                         config->upstream_timeout_ms);
     }
 
     if (config->upstream_pool_size <= 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "upstream_pool_size must be > 0 (got %d)",
+                         config->upstream_pool_size);
     }
 
     if (config->max_inflight_doh <= 0 || config->max_inflight_dot <= 0 || config->max_inflight_doq <= 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "max_inflight_* must be > 0 (doh=%d dot=%d doq=%d)",
+                         config->max_inflight_doh,
+                         config->max_inflight_dot,
+                         config->max_inflight_doq);
     }
 
     if (config->cache_capacity <= 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "cache_capacity must be > 0 (got %d)",
+                         config->cache_capacity);
     }
 
     if (config->metrics_port <= 0 || config->metrics_port > 65535) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "metrics_port out of range (got %d, expected 1..65535)",
+                         config->metrics_port);
     }
 
     if (config->metrics_enabled != 0 && config->metrics_enabled != 1) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "metrics_enabled must be 0 or 1 (got %d)",
+                         config->metrics_enabled);
     }
 
-    return 0;
+    return PROXY_OK;
 }
 
 void config_print(const proxy_config_t *config, FILE *out) {
