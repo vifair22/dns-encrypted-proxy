@@ -31,6 +31,7 @@ Checks: >
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -clang-analyzer-security.insecureAPI.strcpy,
   -concurrency-mt-unsafe,
+  -performance-enum-size,
   -misc-include-cleaner,
   -misc-no-recursion,
   -misc-static-assert,
