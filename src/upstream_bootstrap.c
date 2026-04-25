@@ -421,7 +421,7 @@ int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms, con
     server->stage.iterative_last_attempt_ms = now;
 
     uint32_t addr_be = 0;
-    if (iterative_resolve_a(server->host, timeout_ms, &addr_be) != 0) {
+    if (iterative_resolve_a(server->host, timeout_ms, &addr_be) != PROXY_OK) {
         if (reason_out != NULL) {
             *reason_out = "iterative_resolve_failed";
         }

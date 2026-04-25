@@ -405,7 +405,9 @@ if(BUILD_TESTS)
         add_proxy_test(test_dns_server_internal)
 
         # Unit test: iterative resolver internals (parser/cache behavior)
-        add_executable(test_iterative_resolver_internal tests/unit/test_iterative_resolver_internal.c)
+        # Amalgamates src/iterative_resolver.c via #include; pulls in
+        # src/errors.c because iterative_resolve_a now uses set_error.
+        add_executable(test_iterative_resolver_internal tests/unit/test_iterative_resolver_internal.c src/errors.c)
         target_link_libraries(test_iterative_resolver_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_iterative_resolver_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_iterative_resolver_internal)
