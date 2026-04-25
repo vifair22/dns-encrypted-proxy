@@ -60,6 +60,35 @@ analyze:
     - cmake --build build/analyze --target lint
   allow_failure: false
 
+coverage:
+  stage: analyze
+  image: alpine:latest
+  tags:
+    - docker
+  needs:
+    - test
+  before_script:
+    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig gcovr git
+    - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
+  script:
+    # Coverage build runs the full ctest suite under gcov instrumentation,
+    # then gcovr enforces the line-coverage threshold (default 80%, set
+    # via -DCOVERAGE_LINE_THRESHOLD on the configure line).
+    - cmake -S . -B build/coverage
+        -DCMAKE_BUILD_TYPE=Debug
+        -DC_LOG_PATH=/tmp/c-log
+        -DENABLE_COVERAGE=ON
+        -DENABLE_UPSTREAM_DOQ=OFF
+    - cmake --build build/coverage -j
+    - cmake --build build/coverage --target coverage
+  artifacts:
+    when: always
+    paths:
+      - build/coverage/coverage.html
+      - build/coverage/coverage.*.html
+    expire_in: 1 week
+  allow_failure: false
+
 build:
   stage: build
   image: docker:24
