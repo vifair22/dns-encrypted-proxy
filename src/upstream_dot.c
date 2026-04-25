@@ -299,7 +299,9 @@ static int establish_tls_connection(
         return -1;
     }
     
-    /* Set SNI hostname */
+    /* The OpenSSL SNI macro internally casts the const-qualified host to
+     * void * for the underlying control op; we don't get to write around it. */
+    // NOLINTNEXTLINE(clang-diagnostic-cast-qual)
     SSL_set_tlsext_host_name(conn->ssl, host);
     
     /* Set hostname for verification */
@@ -523,12 +525,12 @@ int upstream_dot_resolve(
         return -1;
     }
     
-    /* Check if we need to establish/re-establish connection */
+    /* Check if we need to establish/re-establish connection. We need to
+     * connect if there's no live SSL/socket OR the cached connection is for
+     * a different server than the current request targets. */
     int need_connect = 0;
-    if (conn->ssl == NULL || conn->fd < 0) {
-        need_connect = 1;
-    } else if (strcmp(conn->host, server->host) != 0 || conn->port != server->port) {
-        /* Different server, need new connection */
+    if (conn->ssl == NULL || conn->fd < 0
+        || strcmp(conn->host, server->host) != 0 || conn->port != server->port) {
         need_connect = 1;
     }
     
@@ -582,7 +584,6 @@ int upstream_dot_resolve(
                     server->stage.bootstrap_addr_v4_be,
                     &attempt_reason)
                     == 0) {
-                connected = 1;
                 stage2_used = 1;
             } else {
                 if (server->stage.has_bootstrap_v4) {

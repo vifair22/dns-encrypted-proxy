@@ -419,7 +419,7 @@ static void *allocator_thread_main(void *arg) {
             }
         }
 
-        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10 * 1000 * 1000};
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 10L * 1000 * 1000};
         nanosleep(&ts, NULL);
     }
     return NULL;
@@ -617,7 +617,7 @@ static void *dispatcher_thread_main(void *arg) {
             }
             pthread_mutex_unlock(&fac->queue_mutex);
             if (remain_ms > 0) {
-                struct timespec ts = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+                struct timespec ts = {.tv_sec = 0, .tv_nsec = 2L * 1000 * 1000};
                 nanosleep(&ts, NULL);
             }
             continue;

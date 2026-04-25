@@ -208,6 +208,11 @@ static void split_bootstrap_resolvers(proxy_config_t *config, const char *value)
 
 static void trim_in_place(char *s) {
     char *start = s;
+    /* clang-analyzer-security.ArrayBound flags the isspace() ctype-table
+     * lookup as a tainted-index access. The (unsigned char) cast bounds
+     * the index to 0..255, which is the standard safe-indexing idiom for
+     * ctype.h macros — the analyzer just can't see it. */
+    // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound)
     while (*start != '\0' && isspace((unsigned char)*start)) {
         start++;
     }
