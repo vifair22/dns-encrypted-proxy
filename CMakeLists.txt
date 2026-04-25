@@ -457,7 +457,9 @@ if(BUILD_TESTS)
 
         if(ENABLE_UPSTREAM_DOQ)
             # Unit test: upstream DoQ internals (validation and backend handoff)
-            add_executable(test_upstream_doq_internal tests/unit/test_upstream_doq_internal.c)
+            # Amalgamates src/upstream_doq.c via #include; pulls in src/errors.c
+            # because upstream_doq_client_init now uses set_error.
+            add_executable(test_upstream_doq_internal tests/unit/test_upstream_doq_internal.c src/errors.c)
             target_link_libraries(test_upstream_doq_internal ${CMOCKA_LIBRARIES} Threads::Threads)
             target_include_directories(test_upstream_doq_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
             apply_target_defaults(test_upstream_doq_internal)

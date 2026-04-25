@@ -233,13 +233,13 @@ int upstream_dot_client_get_pool_stats(
     return 0;
 }
 
-int upstream_doq_client_init(upstream_doq_client_t **client, const upstream_config_t *config) {
+proxy_status_t upstream_doq_client_init(upstream_doq_client_t **client, const upstream_config_t *config) {
     (void)config;
     if (g_doq_init_rc != 0) {
-        return -1;
+        return PROXY_ERR_RESOURCE;
     }
     *client = (upstream_doq_client_t *)(uintptr_t)0x3333;
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_doq_client_destroy(upstream_doq_client_t *client) {

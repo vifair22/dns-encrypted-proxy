@@ -1,12 +1,13 @@
 #ifndef UPSTREAM_DOQ_H
 #define UPSTREAM_DOQ_H
 
+#include "errors.h"
 #include "upstream.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
-int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config);
+proxy_status_t upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config);
 void upstream_doq_client_destroy(upstream_doq_client_t *client);
 int upstream_doq_resolve(
     upstream_doq_client_t *client,
