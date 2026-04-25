@@ -290,9 +290,11 @@ static int stage2_query_resolver(
     return parse_recursive_a_answer(resp, (size_t)n, addr_be_out, ttl_out, reason_out);
 }
 
-int upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t *config) {
+proxy_status_t upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t *config) {
     if (client == NULL || config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "client=%p config=%p",
+                         (const void *)client, (const void *)config);
     }
 
     client->bootstrap_resolver_count = 0;
@@ -302,7 +304,7 @@ int upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t
         client->bootstrap_resolver_count++;
     }
 
-    return 0;
+    return PROXY_OK;
 }
 
 int upstream_bootstrap_try_stage2(upstream_client_t *client, upstream_server_t *server, int timeout_ms, const char **reason_out) {

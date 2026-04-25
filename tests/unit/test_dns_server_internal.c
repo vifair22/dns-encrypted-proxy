@@ -407,10 +407,10 @@ int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *ho
     return 0;
 }
 
-int upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t *config) {
+proxy_status_t upstream_bootstrap_configure(upstream_client_t *client, const proxy_config_t *config) {
     (void)client;
     (void)config;
-    return 0;
+    return PROXY_OK;
 }
 
 int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_client_t *upstream) {
