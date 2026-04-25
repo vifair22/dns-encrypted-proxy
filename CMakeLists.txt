@@ -422,7 +422,9 @@ if(BUILD_TESTS)
 
         if(ENABLE_UPSTREAM_DOH)
             # Unit test: upstream DoH internals (static helper branch coverage)
-            add_executable(test_upstream_doh_internal tests/unit/test_upstream_doh_internal.c)
+            # Amalgamates src/upstream_doh.c via #include; pulls in src/errors.c
+            # because upstream_doh_client_init now uses set_error.
+            add_executable(test_upstream_doh_internal tests/unit/test_upstream_doh_internal.c src/errors.c)
             target_link_libraries(test_upstream_doh_internal ${CMOCKA_LIBRARIES} Threads::Threads)
             target_include_directories(test_upstream_doh_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
             apply_target_defaults(test_upstream_doh_internal)
