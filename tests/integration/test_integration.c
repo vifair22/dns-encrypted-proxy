@@ -2138,7 +2138,7 @@ static void test_metrics_endpoint_http_paths(void **state) {
     atomic_fetch_add(&metrics.queries_udp, 3);
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 32), 0);
+    assert_int_equal(dns_cache_init(&cache, 32), PROXY_OK);
 
     int port = reserve_unused_port();
     assert_true(port > 0);
@@ -2174,7 +2174,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
     metrics_init(&metrics);
 
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 16), 0);
+    assert_int_equal(dns_cache_init(&cache, 16), PROXY_OK);
 
     const char *urls[] = {
 #if UPSTREAM_DOH_ENABLED
@@ -2867,7 +2867,7 @@ static void test_runtime_api_invalid_arguments(void **state) {
     proxy_metrics_t metrics;
     metrics_init(&metrics);
     dns_cache_t cache;
-    assert_int_equal(dns_cache_init(&cache, 8), 0);
+    assert_int_equal(dns_cache_init(&cache, 8), PROXY_OK);
 
     assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, 9090), -1);
     assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 0), -1);

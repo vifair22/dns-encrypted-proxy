@@ -296,9 +296,11 @@ static void shard_maybe_grow(cache_shard_t *shard) {
     (void)shard_rehash(shard, new_bucket_count);
 }
 
-static int shard_init(cache_shard_t *shard, size_t max_entries) {
+static proxy_status_t shard_init(cache_shard_t *shard, size_t max_entries) {
     if (shard == NULL || max_entries == 0) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "shard=%p max_entries=%zu",
+                         (const void *)shard, max_entries);
     }
 
     memset(shard, 0, sizeof(*shard));
@@ -310,14 +312,18 @@ static int shard_init(cache_shard_t *shard, size_t max_entries) {
     }
     shard->bucket_count = next_pow2(desired_buckets);
     if (shard->bucket_count == 0) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "next_pow2 overflow for %zu entries",
+                         max_entries);
     }
     shard->bucket_mask = shard->bucket_count - 1;
 
     shard->buckets = calloc(shard->bucket_count, sizeof(*shard->buckets));
     if (shard->buckets == NULL) {
         memset(shard, 0, sizeof(*shard));
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc %zu buckets",
+                               shard->bucket_count);
     }
 
     shard->sweep_bucket_cursor = 0;
@@ -333,19 +339,24 @@ static int shard_init(cache_shard_t *shard, size_t max_entries) {
         if (shard->admit_bits == NULL) {
             free(shard->buckets);
             memset(shard, 0, sizeof(*shard));
-            return -1;
+            return set_error_errno(PROXY_ERR_RESOURCE,
+                                   "calloc %zu admit-bit bytes",
+                                   byte_count);
         }
         shard->admit_bit_count = bit_count;
     }
 
-    if (pthread_mutex_init(&shard->mutex, NULL) != 0) {
+    int mtx_rc = pthread_mutex_init(&shard->mutex, NULL);
+    if (mtx_rc != 0) {
         free(shard->admit_bits);
         free(shard->buckets);
         memset(shard, 0, sizeof(*shard));
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_mutex_init failed (rc=%d)",
+                         mtx_rc);
     }
 
-    return 0;
+    return PROXY_OK;
 }
 
 static void shard_destroy(cache_shard_t *shard) {
@@ -376,9 +387,11 @@ static void shard_destroy(cache_shard_t *shard) {
     memset(shard, 0, sizeof(*shard));
 }
 
-int dns_cache_init(dns_cache_t *cache, size_t capacity) {
+proxy_status_t dns_cache_init(dns_cache_t *cache, size_t capacity) {
     if (cache == NULL || capacity == 0) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "cache=%p capacity=%zu",
+                         (const void *)cache, capacity);
     }
 
     memset(cache, 0, sizeof(*cache));
@@ -396,12 +409,16 @@ int dns_cache_init(dns_cache_t *cache, size_t capacity) {
         shard_count = capacity;
     }
     if (shard_count == 0) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "shard_count rounded to 0 (capacity=%zu)",
+                         capacity);
     }
 
     cache->shards = calloc(shard_count, sizeof(*cache->shards));
     if (cache->shards == NULL) {
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc %zu shards",
+                               shard_count);
     }
 
     cache->shard_count = shard_count;
@@ -416,17 +433,19 @@ int dns_cache_init(dns_cache_t *cache, size_t capacity) {
         if (shard_capacity == 0) {
             shard_capacity = 1;
         }
-        if (shard_init(&cache->shards[i], shard_capacity) != 0) {
+        proxy_status_t rc = shard_init(&cache->shards[i], shard_capacity);
+        if (rc != PROXY_OK) {
             for (size_t j = 0; j < i; j++) {
                 shard_destroy(&cache->shards[j]);
             }
             free(cache->shards);
             memset(cache, 0, sizeof(*cache));
-            return -1;
+            /* shard_init already set the error buffer; propagate as-is. */
+            return rc;
         }
     }
 
-    return 0;
+    return PROXY_OK;
 }
 
 void dns_cache_destroy(dns_cache_t *cache) {

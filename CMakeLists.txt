@@ -357,7 +357,10 @@ if(BUILD_TESTS)
         add_proxy_test(test_cache)
 
         # Unit test: cache internals
-        add_executable(test_cache_internal tests/unit/test_cache_internal.c)
+        # Amalgamates src/cache.c via #include; pulls in src/errors.c too
+        # because cache.c now uses set_error() macros that need
+        # proxy_set_error_impl from errors.c.
+        add_executable(test_cache_internal tests/unit/test_cache_internal.c src/errors.c)
         target_link_libraries(test_cache_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_cache_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_cache_internal)
@@ -392,7 +395,10 @@ if(BUILD_TESTS)
         add_proxy_test(test_metrics_internal)
 
         # Unit test: dns_server internals (static helper branch coverage)
-        add_executable(test_dns_server_internal tests/unit/test_dns_server_internal.c)
+        # Amalgamates src/dns_server.c via #include; pulls in src/errors.c
+        # because dns_server.c now reads proxy_error_message() when
+        # dns_cache_init returns non-PROXY_OK.
+        add_executable(test_dns_server_internal tests/unit/test_dns_server_internal.c src/errors.c)
         target_link_libraries(test_dns_server_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_dns_server_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_dns_server_internal)

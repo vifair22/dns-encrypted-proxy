@@ -1108,7 +1108,8 @@ int proxy_server_init(proxy_server_t *server, const proxy_config_t *config, vola
     server->stop_flag = stop_flag;
     
     /* Initialize cache */
-    if (dns_cache_init(&server->cache, (size_t)config->cache_capacity) != 0) {
+    if (dns_cache_init(&server->cache, (size_t)config->cache_capacity) != PROXY_OK) {
+        LOGF_ERROR("Failed to initialize cache: %s", proxy_error_message());
         return -1;
     }
     
