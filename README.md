@@ -192,6 +192,7 @@ docker run --rm -p 53:53/udp -p 53:53/tcp \
 
 ## Project Guides
 
+- Operations manual: `Manual.md` — config keys, state machines, metrics taxonomy, troubleshooting
 - Testing guide: `TESTING.md`
 - Benchmarking guide: `BENCHMARKING.md`
 - Performance step notes: `CACHE_PERF_STEPS.md`
