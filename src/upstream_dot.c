@@ -255,10 +255,16 @@ static int establish_tls_connection(
     int use_bootstrap_v4,
     uint32_t bootstrap_addr_v4_be,
     const char **reason_out) {
+    if (conn == NULL || client == NULL || host == NULL) {
+        if (reason_out != NULL) {
+            *reason_out = "invalid_arguments";
+        }
+        return -1;
+    }
     if (reason_out != NULL) {
         *reason_out = "connect_failed";
     }
-    
+
     /* Close existing connection if any */
     close_connection(conn);
     
