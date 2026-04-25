@@ -766,9 +766,11 @@ static void *completion_thread_main(void *arg) {
     return NULL;
 }
 
-int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_client_t *upstream) {
+proxy_status_t upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_client_t *upstream) {
     if (facilitator == NULL || upstream == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "facilitator=%p upstream=%p",
+                         (const void *)facilitator, (const void *)upstream);
     }
 
     memset(facilitator, 0, sizeof(*facilitator));
@@ -777,7 +779,9 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
 
     facilitator->provider_count = upstream->server_count;
     if (facilitator->provider_count <= 0) {
-        return -1;
+        return set_error(PROXY_ERR_CONFIG,
+                         "no upstream providers (server_count=%d)",
+                         upstream->server_count);
     }
 
     int desired_slots = upstream->config.pool_size;
@@ -797,27 +801,38 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
 
     facilitator->members = calloc((size_t)facilitator->member_count, sizeof(*facilitator->members));
     if (facilitator->members == NULL) {
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc %d members",
+                               facilitator->member_count);
     }
     facilitator->provider_cursors = calloc((size_t)facilitator->provider_count, sizeof(*facilitator->provider_cursors));
     if (facilitator->provider_cursors == NULL) {
+        int provider_count = facilitator->provider_count;
         free(facilitator->members);
         memset(facilitator, 0, sizeof(*facilitator));
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc %d provider cursors",
+                               provider_count);
     }
 
-    if (pthread_mutex_init(&facilitator->queue_mutex, NULL) != 0) {
+    int mtx_rc = pthread_mutex_init(&facilitator->queue_mutex, NULL);
+    if (mtx_rc != 0) {
         free(facilitator->provider_cursors);
         free(facilitator->members);
         memset(facilitator, 0, sizeof(*facilitator));
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_mutex_init queue_mutex failed (rc=%d)",
+                         mtx_rc);
     }
-    if (pthread_cond_init(&facilitator->queue_cond, NULL) != 0) {
+    int cond_rc = pthread_cond_init(&facilitator->queue_cond, NULL);
+    if (cond_rc != 0) {
         pthread_mutex_destroy(&facilitator->queue_mutex);
         free(facilitator->provider_cursors);
         free(facilitator->members);
         memset(facilitator, 0, sizeof(*facilitator));
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_cond_init queue_cond failed (rc=%d)",
+                         cond_rc);
     }
 
     for (int i = 0; i < facilitator->member_count; i++) {
@@ -848,6 +863,7 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
         if (pthread_mutex_init(&member->mutex, NULL) != 0 ||
             pthread_cond_init(&member->cond, NULL) != 0 ||
             pthread_create(&member->thread, NULL, member_worker_thread_main, member) != 0) {
+            int failed_member_index = i;
             facilitator->running = 0;
             for (int j = 0; j <= i; j++) {
                 upstream_member_t *m = &facilitator->members[j];
@@ -866,7 +882,9 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
             free(facilitator->provider_cursors);
             free(facilitator->members);
             memset(facilitator, 0, sizeof(*facilitator));
-            return -1;
+            return set_error(PROXY_ERR_RESOURCE,
+                             "member %d init failed (mutex/cond/thread)",
+                             failed_member_index);
         }
     }
 
@@ -874,7 +892,8 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
         pthread_create(&facilitator->dispatcher_thread, NULL, dispatcher_thread_main, facilitator) != 0 ||
         pthread_create(&facilitator->completion_thread, NULL, completion_thread_main, facilitator) != 0) {
         upstream_facilitator_destroy(facilitator);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_create allocator/dispatcher/completion thread failed");
     }
 
     LOGF_INFO(
@@ -882,7 +901,7 @@ int upstream_facilitator_init(upstream_facilitator_t *facilitator, upstream_clie
         facilitator->provider_count,
         facilitator->members_per_provider,
         facilitator->member_count);
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_facilitator_destroy(upstream_facilitator_t *facilitator) {
