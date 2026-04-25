@@ -107,7 +107,7 @@ int upstream_is_ready(const upstream_client_t *client) {
 }
 
 int upstream_facilitator_get_stats(
-    const upstream_facilitator_t *facilitator,
+    upstream_facilitator_t *facilitator,
     upstream_facilitator_stats_t *stats_out) {
     (void)facilitator;
     if (stats_out == NULL) {

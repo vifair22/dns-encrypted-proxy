@@ -249,7 +249,7 @@ static int reserve_local_port(void) {
 }
 
 static int wait_tcp_listen(int port, int timeout_ms) {
-    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * UINT64_C(1000000);
     while (now_ns() < deadline) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
@@ -515,7 +515,7 @@ static int send_one_udp_upgrade_query(
 }
 
 static int wait_proxy_ready(int proxy_port, int timeout_ms) {
-    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * 1000000ULL;
+    uint64_t deadline = now_ns() + (uint64_t)timeout_ms * UINT64_C(1000000);
     while (now_ns() < deadline) {
         if (send_one_udp_query(proxy_port, 250, 0xBEEF, 0, 0, NULL) == 0) {
             return 0;
@@ -938,7 +938,7 @@ int main(int argc, char **argv) {
     printf("  proxy_port=%d upstream_port=%d\n", proxy_port, upstream_port);
     printf("  completed=%zu failed=%zu error_rate=%.2f%%\n", ok, fail, opts.requests > 0 ? (100.0 * (double)fail / (double)opts.requests) : 0.0);
     printf("  duration=%.3fs throughput=%.0f req/s\n", sec, rps);
-    printf("  latency_us p50=%.2f p95=%.2f p99=%.2f max=%.2f\n", p50 / 1000.0, p95 / 1000.0, p99 / 1000.0, pmax / 1000.0);
+    printf("  latency_us p50=%.2f p95=%.2f p99=%.2f max=%.2f\n", (double)p50 / 1000.0, (double)p95 / 1000.0, (double)p99 / 1000.0, (double)pmax / 1000.0);
 
     free(succ);
     free(lat_ns);

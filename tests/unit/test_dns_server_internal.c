@@ -18,9 +18,11 @@
 #include "config.h"
 #include "cache.h"
 #include "upstream.h"
+#include "upstream_bootstrap.h"
 #include "metrics.h"
 #include "dns_message.h"
 #include "dns_server.h"
+#include "logger.h"
 #include "test_fixtures.h"
 
 static int g_stub_key_ok = 0;

@@ -12,6 +12,7 @@
 #include <pthread.h>
 
 #include "cache.h"
+#include "dns_message.h"
 
 static uint32_t cache_rng_state = 0x12345678u;
 static uint32_t cache_next_rand(void) {

@@ -4,6 +4,16 @@
 #include "upstream_bootstrap.h"
 #include "logger.h"
 
+#if UPSTREAM_DOH_ENABLED
+#include "upstream_doh.h"
+#endif
+#if UPSTREAM_DOT_ENABLED
+#include "upstream_dot.h"
+#endif
+#if UPSTREAM_DOQ_ENABLED
+#include "upstream_doq.h"
+#endif
+
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -15,64 +25,6 @@
 
 #define UPSTREAM_MAX_STAGE_ATTEMPTS_PER_QUERY 12
 #define UPSTREAM_MIN_USEFUL_BUDGET_MS 25
-
-/* Forward declarations for protocol-specific functions */
-#if UPSTREAM_DOH_ENABLED
-int upstream_doh_client_init(upstream_doh_client_t **client, const upstream_config_t *config);
-void upstream_doh_client_destroy(upstream_doh_client_t *client);
-int upstream_doh_resolve(
-    upstream_doh_client_t *client,
-    const upstream_server_t *server,
-    int timeout_ms,
-    const uint8_t *query,
-    size_t query_len,
-    uint8_t **response_out,
-    size_t *response_len_out);
-int upstream_doh_client_get_pool_stats(
-    upstream_doh_client_t *client,
-    int *capacity_out,
-    int *in_use_out,
-    uint64_t *http3_total_out,
-    uint64_t *http2_total_out,
-    uint64_t *http1_total_out,
-    uint64_t *http_other_total_out);
-#endif
-
-#if UPSTREAM_DOT_ENABLED
-int upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config);
-void upstream_dot_client_destroy(upstream_dot_client_t *client);
-int upstream_dot_resolve(
-    upstream_dot_client_t *client,
-    const upstream_server_t *server,
-    int timeout_ms,
-    const uint8_t *query,
-    size_t query_len,
-    uint8_t **response_out,
-    size_t *response_len_out);
-int upstream_dot_client_get_pool_stats(
-    upstream_dot_client_t *client,
-    int *capacity_out,
-    int *in_use_out,
-    int *alive_out);
-#endif
-
-#if UPSTREAM_DOQ_ENABLED
-int upstream_doq_client_init(upstream_doq_client_t **client, const upstream_config_t *config);
-void upstream_doq_client_destroy(upstream_doq_client_t *client);
-int upstream_doq_resolve(
-    upstream_doq_client_t *client,
-    const upstream_server_t *server,
-    int timeout_ms,
-    const uint8_t *query,
-    size_t query_len,
-    uint8_t **response_out,
-    size_t *response_len_out);
-int upstream_doq_client_get_pool_stats(
-    upstream_doq_client_t *client,
-    int *capacity_out,
-    int *in_use_out,
-    int *alive_out);
-#endif
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -754,7 +706,7 @@ static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
     }
     struct in_addr addr;
     addr.s_addr = addr_v4_be;
-    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+    if (inet_ntop(AF_INET, &addr, out, (socklen_t)out_len) == NULL) {
         out[0] = '\0';
     }
 }

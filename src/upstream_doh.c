@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "upstream_doh.h"
 #include "dns_message.h"
 #include "logger.h"
 
@@ -62,7 +63,7 @@ static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
     }
     struct in_addr addr;
     addr.s_addr = addr_v4_be;
-    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+    if (inet_ntop(AF_INET, &addr, out, (socklen_t)out_len) == NULL) {
         out[0] = '\0';
     }
 }
@@ -634,27 +635,26 @@ void upstream_doh_client_destroy(upstream_doh_client_t *client) {
 
 int upstream_doh_resolve(
     upstream_doh_client_t *client,
-    const upstream_server_t *server,
+    upstream_server_t *server,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
-    
+
     if (client == NULL || server == NULL || query == NULL || query_len == 0 ||
         response_out == NULL || response_len_out == NULL) {
         return -1;
     }
-    
+
     if (server->type != UPSTREAM_TYPE_DOH) {
         return -1;
     }
-    
+
     *response_out = NULL;
     *response_len_out = 0;
 
-    upstream_server_t *mutable_server = (upstream_server_t *)server;
-    mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
 
     CURL *curl = NULL;
     int slot = -1;
@@ -667,16 +667,16 @@ int upstream_doh_resolve(
     doh_attempt_error_t attempt_err;
 
     uint64_t now = now_ms();
-    doh_http_tier_t forced_tier = (doh_http_tier_t)mutable_server->stage.doh_forced_http_tier;
+    doh_http_tier_t forced_tier = (doh_http_tier_t)server->stage.doh_forced_http_tier;
     if (forced_tier < DOH_HTTP_TIER_H3 || forced_tier > DOH_HTTP_TIER_H1) {
         forced_tier = DOH_HTTP_TIER_H3;
-        mutable_server->stage.doh_forced_http_tier = (uint8_t)forced_tier;
+        server->stage.doh_forced_http_tier = (uint8_t)forced_tier;
     }
 
     doh_http_tier_t top_tier = forced_tier;
     int attempted_upgrade = 0;
     if (forced_tier > DOH_HTTP_TIER_H3 &&
-        now >= mutable_server->stage.doh_upgrade_retry_after_ms) {
+        now >= server->stage.doh_upgrade_retry_after_ms) {
         top_tier = (doh_http_tier_t)(forced_tier - 1);
         attempted_upgrade = 1;
     }
@@ -717,7 +717,7 @@ int upstream_doh_resolve(
             int attempt_timeout_ms = next_attempt_timeout_ms(deadline_ms, attempts_left > 0 ? attempts_left : 1);
             if (attempt_timeout_ms < 0) {
                 pool_release(client, slot);
-                mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+                server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
                 return -1;
             }
 
@@ -746,7 +746,7 @@ int upstream_doh_resolve(
 
             LOG_DOH_ATTEMPT_FAILURE(phase, server, &attempt_err);
             final_failure_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
-            mutable_server->stage.last_failure_class = (int)final_failure_class;
+            server->stage.last_failure_class = (int)final_failure_class;
         }
     }
     
@@ -755,15 +755,15 @@ int upstream_doh_resolve(
     if (result != 0) {
         now = now_ms();
         if (failure_class_is_transport_like(final_failure_class)) {
-            mutable_server->stage.transport_retry_suppress_until_ms = now + DOH_TRANSPORT_SUPPRESS_MS;
+            server->stage.transport_retry_suppress_until_ms = now + DOH_TRANSPORT_SUPPRESS_MS;
             if (attempted_upgrade) {
-                __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
-                __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_failure_total, 1, __ATOMIC_RELAXED);
-                if (mutable_server->stage.doh_upgrade_failures < 255) {
-                    mutable_server->stage.doh_upgrade_failures++;
+                __atomic_add_fetch(&server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
+                __atomic_add_fetch(&server->stage.doh_upgrade_probe_failure_total, 1, __ATOMIC_RELAXED);
+                if (server->stage.doh_upgrade_failures < 255) {
+                    server->stage.doh_upgrade_failures++;
                 }
-                mutable_server->stage.doh_upgrade_retry_after_ms =
-                    now + doh_upgrade_backoff_ms(mutable_server->stage.doh_upgrade_failures);
+                server->stage.doh_upgrade_retry_after_ms =
+                    now + doh_upgrade_backoff_ms(server->stage.doh_upgrade_failures);
             }
         }
         return -1;
@@ -778,43 +778,43 @@ int upstream_doh_resolve(
     now = now_ms();
     if (successful_tier > forced_tier) {
         if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H2) {
-            __atomic_add_fetch(&mutable_server->stage.doh_downgrade_h3_to_h2_total, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&server->stage.doh_downgrade_h3_to_h2_total, 1, __ATOMIC_RELAXED);
         } else if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H1) {
-            __atomic_add_fetch(&mutable_server->stage.doh_downgrade_h3_to_h1_total, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&server->stage.doh_downgrade_h3_to_h1_total, 1, __ATOMIC_RELAXED);
         } else if (forced_tier == DOH_HTTP_TIER_H2 && successful_tier == DOH_HTTP_TIER_H1) {
-            __atomic_add_fetch(&mutable_server->stage.doh_downgrade_h2_to_h1_total, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&server->stage.doh_downgrade_h2_to_h1_total, 1, __ATOMIC_RELAXED);
         }
-        mutable_server->stage.doh_forced_http_tier = (uint8_t)successful_tier;
-        if (mutable_server->stage.doh_upgrade_failures < 255) {
-            mutable_server->stage.doh_upgrade_failures++;
+        server->stage.doh_forced_http_tier = (uint8_t)successful_tier;
+        if (server->stage.doh_upgrade_failures < 255) {
+            server->stage.doh_upgrade_failures++;
         }
-        mutable_server->stage.doh_upgrade_retry_after_ms =
-            now + doh_upgrade_backoff_ms(mutable_server->stage.doh_upgrade_failures);
+        server->stage.doh_upgrade_retry_after_ms =
+            now + doh_upgrade_backoff_ms(server->stage.doh_upgrade_failures);
         LOGF_WARN(
             "DoH protocol downgrade pinned: host=%s forced=%s retry_after_ms=%llu failures=%u",
             server->host,
             doh_tier_name(successful_tier),
-            (unsigned long long)mutable_server->stage.doh_upgrade_retry_after_ms,
-            (unsigned)mutable_server->stage.doh_upgrade_failures);
+            (unsigned long long)server->stage.doh_upgrade_retry_after_ms,
+            (unsigned)server->stage.doh_upgrade_failures);
     } else if (attempted_upgrade && successful_tier < forced_tier) {
-        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_success_total, 1, __ATOMIC_RELAXED);
-        mutable_server->stage.doh_forced_http_tier = (uint8_t)successful_tier;
-        mutable_server->stage.doh_upgrade_failures = 0;
-        mutable_server->stage.doh_upgrade_retry_after_ms = now + DOH_UPGRADE_BACKOFF_BASE_MS;
+        __atomic_add_fetch(&server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&server->stage.doh_upgrade_probe_success_total, 1, __ATOMIC_RELAXED);
+        server->stage.doh_forced_http_tier = (uint8_t)successful_tier;
+        server->stage.doh_upgrade_failures = 0;
+        server->stage.doh_upgrade_retry_after_ms = now + DOH_UPGRADE_BACKOFF_BASE_MS;
         LOGF_INFO("DoH protocol upgrade accepted: host=%s protocol=%s", server->host, doh_tier_name(successful_tier));
     } else if (attempted_upgrade && successful_tier == forced_tier) {
-        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&mutable_server->stage.doh_upgrade_probe_failure_total, 1, __ATOMIC_RELAXED);
-        if (mutable_server->stage.doh_upgrade_failures < 255) {
-            mutable_server->stage.doh_upgrade_failures++;
+        __atomic_add_fetch(&server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&server->stage.doh_upgrade_probe_failure_total, 1, __ATOMIC_RELAXED);
+        if (server->stage.doh_upgrade_failures < 255) {
+            server->stage.doh_upgrade_failures++;
         }
-        mutable_server->stage.doh_upgrade_retry_after_ms =
-            now + doh_upgrade_backoff_ms(mutable_server->stage.doh_upgrade_failures);
+        server->stage.doh_upgrade_retry_after_ms =
+            now + doh_upgrade_backoff_ms(server->stage.doh_upgrade_failures);
     }
 
-    mutable_server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
-    mutable_server->stage.transport_retry_suppress_until_ms = 0;
+    server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    server->stage.transport_retry_suppress_until_ms = 0;
     
     *response_out = response;
     *response_len_out = response_len;
