@@ -22,19 +22,22 @@ struct upstream_doq_client {
     int pool_size;
 };
 
-int upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config) {
+proxy_status_t upstream_doq_client_init(upstream_doq_client_t **client_out, const upstream_config_t *config) {
     if (client_out == NULL || config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "client_out=%p config=%p",
+                         (const void *)client_out, (const void *)config);
     }
 
     upstream_doq_client_t *client = calloc(1, sizeof(*client));
     if (client == NULL) {
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc upstream_doq_client_t");
     }
 
     client->pool_size = config->pool_size > 0 ? config->pool_size : 1;
     *client_out = client;
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_doq_client_destroy(upstream_doq_client_t *client) {
