@@ -825,26 +825,33 @@ static int iterative_resolve_a_internal(
     return -1;
 }
 
-int iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
+proxy_status_t iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
     if (hostname == NULL || addr_v4_be_out == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "hostname=%p addr_v4_be_out=%p",
+                         (const void *)hostname, (const void *)addr_v4_be_out);
     }
 
     char normalized[256];
     if (normalize_hostname(hostname, normalized, sizeof(normalized)) != 0) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "invalid hostname '%s'",
+                         hostname);
     }
 
     if (cache_lookup(normalized, addr_v4_be_out)) {
-        return 0;
+        return PROXY_OK;
     }
 
     int budget_ms = timeout_ms > 0 ? timeout_ms : 2500;
     uint64_t deadline = now_ms() + (uint64_t)budget_ms;
     uint32_t ttl = 0;
     int rc = iterative_resolve_a_internal(normalized, deadline, 0, addr_v4_be_out, &ttl);
-    if (rc == 0) {
-        cache_store(normalized, *addr_v4_be_out, ttl);
+    if (rc != 0) {
+        return set_error(PROXY_ERR_NETWORK,
+                         "could not resolve A record for '%s' within %d ms",
+                         normalized, budget_ms);
     }
-    return rc;
+    cache_store(normalized, *addr_v4_be_out, ttl);
+    return PROXY_OK;
 }

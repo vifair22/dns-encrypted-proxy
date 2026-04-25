@@ -154,10 +154,10 @@ static void test_build_query_and_iterative_cache_hit(void **state) {
     cache_store("example.com", a.s_addr, 30);
 
     uint32_t out = 0;
-    assert_int_equal(iterative_resolve_a("example.com", 200, &out), 0);
+    assert_int_equal(iterative_resolve_a("example.com", 200, &out), PROXY_OK);
     assert_int_equal(out, a.s_addr);
 
-    assert_int_equal(iterative_resolve_a("", 200, &out), -1);
+    assert_int_equal(iterative_resolve_a("", 200, &out), PROXY_ERR_INVALID_ARG);
 }
 
 static void test_skip_and_read_name_error_paths(void **state) {
@@ -422,8 +422,8 @@ static void test_iterative_guard_paths(void **state) {
     assert_int_equal(parse_response_for_name(namebuf, 0, "example.com", &parsed), -1);
 
     uint32_t a = 0;
-    assert_int_equal(iterative_resolve_a(NULL, 10, &a), -1);
-    assert_int_equal(iterative_resolve_a("example.com", 10, NULL), -1);
+    assert_int_equal(iterative_resolve_a(NULL, 10, &a), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(iterative_resolve_a("example.com", 10, NULL), PROXY_ERR_INVALID_ARG);
 }
 
 int main(void) {

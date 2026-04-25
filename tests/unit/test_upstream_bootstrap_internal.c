@@ -19,13 +19,13 @@
 #include "upstream.h"
 #include "iterative_resolver.h"
 
-static int g_iter_rc = -1;
+static proxy_status_t g_iter_rc = PROXY_ERR_NETWORK;
 static uint32_t g_iter_addr = 0;
 
-int iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
+proxy_status_t iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
     (void)hostname;
     (void)timeout_ms;
-    if (g_iter_rc == 0 && addr_v4_be_out != NULL) {
+    if (g_iter_rc == PROXY_OK && addr_v4_be_out != NULL) {
         *addr_v4_be_out = g_iter_addr;
     }
     return g_iter_rc;

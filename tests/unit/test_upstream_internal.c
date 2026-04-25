@@ -282,11 +282,11 @@ int upstream_doq_client_get_pool_stats(
     return 0;
 }
 
-int iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
+proxy_status_t iterative_resolve_a(const char *hostname, int timeout_ms, uint32_t *addr_v4_be_out) {
     (void)hostname;
     (void)timeout_ms;
     (void)addr_v4_be_out;
-    return -1;
+    return PROXY_ERR_NETWORK;
 }
 
 int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms, const char **reason_out) {
