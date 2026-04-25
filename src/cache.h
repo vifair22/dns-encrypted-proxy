@@ -6,6 +6,8 @@
 
 #include <pthread.h>
 
+#include "errors.h"
+
 typedef struct cache_entry {
     uint8_t *key;
     size_t key_len;
@@ -47,7 +49,7 @@ typedef struct {
     int single_thread_mode;
 } dns_cache_t;
 
-int dns_cache_init(dns_cache_t *cache, size_t capacity);
+proxy_status_t dns_cache_init(dns_cache_t *cache, size_t capacity);
 void dns_cache_destroy(dns_cache_t *cache);
 
 int dns_cache_lookup(

@@ -15,6 +15,7 @@
 #include <pthread.h>
 
 #include "cache.h"
+#include "errors.h"
 #include "test_helpers.h"
 #include "test_fixtures.h"
 
@@ -25,9 +26,9 @@ static void test_cache_init_destroy(void **state) {
     (void)state;
     
     dns_cache_t cache;
-    
-    int result = dns_cache_init(&cache, 100);
-    assert_int_equal(result, 0);
+
+    proxy_status_t result = dns_cache_init(&cache, 100);
+    assert_int_equal(result, PROXY_OK);
     size_t capacity = 0;
     size_t entries = 0;
     dns_cache_get_stats(&cache, &capacity, &entries);
@@ -49,12 +50,12 @@ static void test_cache_init_invalid(void **state) {
     dns_cache_t cache;
     
     /* NULL cache pointer */
-    int result = dns_cache_init(NULL, 100);
-    assert_int_equal(result, -1);
-    
+    proxy_status_t result = dns_cache_init(NULL, 100);
+    assert_int_equal(result, PROXY_ERR_INVALID_ARG);
+
     /* Zero capacity */
     result = dns_cache_init(&cache, 0);
-    assert_int_equal(result, -1);
+    assert_int_equal(result, PROXY_ERR_INVALID_ARG);
 }
 
 /*
