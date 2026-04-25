@@ -100,6 +100,15 @@ Local non-privileged port:
 LISTEN_PORT=5353 ./build/bin/dns-encrypted-proxy
 ```
 
+Version and help:
+
+```bash
+./build/bin/dns-encrypted-proxy --version    # prints SEMVER_YYYYMMDD.HHMM.TYPE
+./build/bin/dns-encrypted-proxy --help
+```
+
+The version string embeds the semver from `release_version`, the configure-time UTC timestamp, and the build variant (`release`, `debug`, `asan`, `coverage`, …). It also prints on the first INFO line at startup so crash logs self-identify.
+
 ## Configuration
 
 By default the proxy reads `dns-encrypted-proxy.conf` if present. You can also pass an explicit config path:
