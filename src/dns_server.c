@@ -7,6 +7,7 @@
 #include "upstream_bootstrap.h"
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -576,6 +577,13 @@ finalize:
         }
     }
 
+    /* include_end is always >= 12 here (DNS header size): initialized to 12,
+     * only ever set to rr_end (>= header) or back to 12 in the malformed
+     * branch. The assert documents the invariant for future readers; the
+     * NOLINT below covers the same write_u16 calls because clang-analyzer
+     * can't propagate the assert through the call chain.
+     */
+    assert(include_end >= 12);
     size_t total_size = include_end + (include_opt ? opt_size : 0);
     uint8_t *truncated = malloc(total_size);
     if (truncated == NULL) {
@@ -591,12 +599,16 @@ finalize:
 
     uint16_t flags = read_u16(truncated + 2);
     flags = (uint16_t)(flags | 0x0200u); /* TC */
+    /* total_size is always >= 12 (asserted above); writing the 12-byte DNS
+     * header is safe but clang-analyzer can't propagate the invariant
+     * through the call chain into write_u16. */
+    // NOLINTBEGIN(clang-analyzer-security.ArrayBound)
     write_u16(truncated + 2, flags);
-
     write_u16(truncated + 4, include_qd);
     write_u16(truncated + 6, include_an);
     write_u16(truncated + 8, include_ns);
     write_u16(truncated + 10, include_ar);
+    // NOLINTEND(clang-analyzer-security.ArrayBound)
 
     *truncated_out = truncated;
     *truncated_len_out = total_size;
