@@ -154,13 +154,13 @@ static void test_configure_paths(void **state) {
     strcpy(cfg.bootstrap_resolvers[0], "8.8.8.8");
     strcpy(cfg.bootstrap_resolvers[1], "1.1.1.1");
 
-    assert_int_equal(upstream_bootstrap_configure(&client, &cfg), 0);
+    assert_int_equal(upstream_bootstrap_configure(&client, &cfg), PROXY_OK);
     assert_int_equal(client.bootstrap_resolver_count, 2);
     assert_string_equal(client.bootstrap_resolvers[0], "8.8.8.8");
     assert_string_equal(client.bootstrap_resolvers[1], "1.1.1.1");
 
-    assert_int_equal(upstream_bootstrap_configure(NULL, &cfg), -1);
-    assert_int_equal(upstream_bootstrap_configure(&client, NULL), -1);
+    assert_int_equal(upstream_bootstrap_configure(NULL, &cfg), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(upstream_bootstrap_configure(&client, NULL), PROXY_ERR_INVALID_ARG);
 }
 
 static void test_stage2_no_resolvers(void **state) {

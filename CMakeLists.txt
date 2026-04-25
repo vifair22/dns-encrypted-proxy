@@ -414,7 +414,9 @@ if(BUILD_TESTS)
         add_proxy_test(test_iterative_resolver_internal)
 
         # Unit test: upstream bootstrap internals (config apply + stage3)
-        add_executable(test_upstream_bootstrap_internal tests/unit/test_upstream_bootstrap_internal.c)
+        # Amalgamates src/upstream_bootstrap.c via #include; pulls in src/errors.c
+        # because upstream_bootstrap_configure now uses set_error.
+        add_executable(test_upstream_bootstrap_internal tests/unit/test_upstream_bootstrap_internal.c src/errors.c)
         target_link_libraries(test_upstream_bootstrap_internal ${CMOCKA_LIBRARIES} Threads::Threads)
         target_include_directories(test_upstream_bootstrap_internal PRIVATE ${CMOCKA_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests ${CMAKE_CURRENT_SOURCE_DIR}/src)
         apply_target_defaults(test_upstream_bootstrap_internal)
