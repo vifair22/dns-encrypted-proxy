@@ -17,6 +17,7 @@
 
 #include "config.h"
 #include "upstream.h"
+#include "iterative_resolver.h"
 
 static int g_iter_rc = -1;
 static uint32_t g_iter_addr = 0;

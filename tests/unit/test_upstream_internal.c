@@ -13,6 +13,11 @@
 
 #include "upstream.h"
 #include "upstream_bootstrap.h"
+#include "upstream_doh.h"
+#include "upstream_dot.h"
+#include "upstream_doq.h"
+#include "iterative_resolver.h"
+#include "logger.h"
 
 static int g_mutex_init_fail = 0;
 static uint64_t g_now_ms = 0;
@@ -137,22 +142,20 @@ void upstream_doh_client_destroy(upstream_doh_client_t *client) {
 
 int upstream_doh_resolve(
     upstream_doh_client_t *client,
-    const upstream_server_t *server,
+    upstream_server_t *server,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)client;
-    (void)server;
     (void)timeout_ms;
     (void)query;
     (void)query_len;
     if (g_doh_resolve_rc != 0 || g_resp_len == 0) {
-        upstream_server_t *mutable_server = (upstream_server_t *)server;
-        mutable_server->stage.last_failure_class = g_doh_failure_class;
+        server->stage.last_failure_class = g_doh_failure_class;
         if (g_doh_transport_suppress_ms > 0) {
-            mutable_server->stage.transport_retry_suppress_until_ms = g_now_ms + g_doh_transport_suppress_ms;
+            server->stage.transport_retry_suppress_until_ms = g_now_ms + g_doh_transport_suppress_ms;
         }
         return -1;
     }
@@ -197,7 +200,7 @@ void upstream_dot_client_destroy(upstream_dot_client_t *client) {
 
 int upstream_dot_resolve(
     upstream_dot_client_t *client,
-    const upstream_server_t *server,
+    upstream_server_t *server,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,
@@ -246,7 +249,7 @@ void upstream_doq_client_destroy(upstream_doq_client_t *client) {
 
 int upstream_doq_resolve(
     upstream_doq_client_t *client,
-    const upstream_server_t *server,
+    upstream_server_t *server,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,

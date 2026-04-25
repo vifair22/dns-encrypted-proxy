@@ -425,7 +425,7 @@ static int send_udp_query(
     addr.sin_addr.s_addr = ns_ip_be;
 
     uint8_t query[512];
-    uint16_t txid = (uint16_t)(rand() & 0xffffu);
+    uint16_t txid = (uint16_t)((unsigned int)rand() & 0xffffu);
     size_t qlen = 0;
     if (build_query_packet(name, qtype, txid, query, sizeof(query), &qlen) != 0) {
         close(fd);
@@ -571,7 +571,7 @@ static int send_tcp_query(
     }
 
     uint8_t query[512];
-    uint16_t txid = (uint16_t)(rand() & 0xffffu);
+    uint16_t txid = (uint16_t)((unsigned int)rand() & 0xffffu);
     size_t qlen = 0;
     if (build_query_packet(name, qtype, txid, query, sizeof(query), &qlen) != 0) {
         close(fd);

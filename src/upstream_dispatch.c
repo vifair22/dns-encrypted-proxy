@@ -998,7 +998,7 @@ int upstream_facilitator_resolve(
 }
 
 int upstream_facilitator_get_stats(
-    const upstream_facilitator_t *facilitator,
+    upstream_facilitator_t *facilitator,
     upstream_facilitator_stats_t *stats_out) {
     if (facilitator == NULL || stats_out == NULL) {
         return -1;
@@ -1023,7 +1023,7 @@ int upstream_facilitator_get_stats(
     stats_out->queue_wait_le_1000ms = (uint64_t)atomic_load(&facilitator->queue_wait_le_1000ms);
     stats_out->queue_wait_gt_1000ms = (uint64_t)atomic_load(&facilitator->queue_wait_gt_1000ms);
 
-    pthread_mutex_lock((pthread_mutex_t *)&facilitator->queue_mutex);
+    pthread_mutex_lock(&facilitator->queue_mutex);
     for (upstream_job_t *j = facilitator->submit_head; j != NULL; j = j->next) {
         stats_out->submit_queue_depth++;
     }
@@ -1033,7 +1033,7 @@ int upstream_facilitator_get_stats(
     for (upstream_job_t *j = facilitator->completed_head; j != NULL; j = j->next) {
         stats_out->completed_queue_depth++;
     }
-    pthread_mutex_unlock((pthread_mutex_t *)&facilitator->queue_mutex);
+    pthread_mutex_unlock(&facilitator->queue_mutex);
 
     for (int i = 0; i < facilitator->member_count; i++) {
         int state = atomic_load(&facilitator->members[i].state);

@@ -205,7 +205,7 @@ static int stage2_query_resolver(
 
     uint8_t query[512];
     memset(query, 0, sizeof(query));
-    uint16_t txid = (uint16_t)(rand() & 0xffffu);
+    uint16_t txid = (uint16_t)((unsigned int)rand() & 0xffffu);
     write_u16(query + 0, txid);
     write_u16(query + 2, 0x0100u); /* RD=1 */
     write_u16(query + 4, 1);

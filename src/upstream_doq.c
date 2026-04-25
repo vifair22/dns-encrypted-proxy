@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "upstream_doq.h"
 #include "dns_message.h"
 
 #include <stdlib.h>
@@ -49,7 +50,7 @@ void upstream_doq_client_destroy(upstream_doq_client_t *client) {
 
 int upstream_doq_resolve(
     upstream_doq_client_t *client,
-    const upstream_server_t *server,
+    upstream_server_t *server,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,

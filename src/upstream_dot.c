@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "upstream.h"
+#include "upstream_dot.h"
 #include "dns_message.h"
 #include "logger.h"
 
@@ -60,7 +61,7 @@ static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
     }
     struct in_addr addr;
     addr.s_addr = addr_v4_be;
-    if (inet_ntop(AF_INET, &addr, out, out_len) == NULL) {
+    if (inet_ntop(AF_INET, &addr, out, (socklen_t)out_len) == NULL) {
         out[0] = '\0';
     }
 }
@@ -487,7 +488,7 @@ void upstream_dot_client_destroy(upstream_dot_client_t *client) {
 
 int upstream_dot_resolve(
     upstream_dot_client_t *client,
-    const upstream_server_t *server,
+    upstream_server_t *server,
     int timeout_ms,
     const uint8_t *query,
     size_t query_len,

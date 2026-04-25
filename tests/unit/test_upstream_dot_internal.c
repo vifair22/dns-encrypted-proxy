@@ -40,6 +40,8 @@
 #endif
 
 #include "upstream.h"
+#include "dns_message.h"
+#include "logger.h"
 
 static int g_getaddrinfo_rc = 0;
 static int g_socket_fd = 42;
@@ -163,7 +165,7 @@ static void *dot_wrap_malloc(size_t size) {
     return malloc(size);
 }
 
-int dot_test_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+static int dot_test_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
     (void)node;
     (void)service;
     (void)hints;
@@ -174,18 +176,18 @@ int dot_test_getaddrinfo(const char *node, const char *service, const struct add
     return 0;
 }
 
-void dot_test_freeaddrinfo(struct addrinfo *res) {
+static void dot_test_freeaddrinfo(struct addrinfo *res) {
     (void)res;
 }
 
-int dot_test_socket(int domain, int type, int protocol) {
+static int dot_test_socket(int domain, int type, int protocol) {
     (void)domain;
     (void)type;
     (void)protocol;
     return g_socket_fd;
 }
 
-int dot_test_fcntl(int fd, int cmd, ...) {
+static int dot_test_fcntl(int fd, int cmd, ...) {
     (void)fd;
     va_list ap;
     va_start(ap, cmd);
@@ -198,7 +200,7 @@ int dot_test_fcntl(int fd, int cmd, ...) {
     return g_fcntl_setfl_rc;
 }
 
-int dot_test_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+static int dot_test_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     (void)sockfd;
     (void)addr;
     (void)addrlen;
@@ -206,7 +208,7 @@ int dot_test_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
     return g_connect_rc;
 }
 
-int dot_test_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+static int dot_test_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     (void)timeout;
     if (nfds > 0) {
         fds[0].revents = g_poll_revents;
@@ -214,7 +216,7 @@ int dot_test_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     return g_poll_rc;
 }
 
-int dot_test_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
+static int dot_test_getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
     (void)sockfd;
     (void)level;
     (void)optname;
@@ -224,58 +226,53 @@ int dot_test_getsockopt(int sockfd, int level, int optname, void *optval, sockle
     return g_getsockopt_rc;
 }
 
-int dot_test_close(int fd) {
+static int dot_test_close(int fd) {
     (void)fd;
     g_close_calls++;
     return 0;
 }
 
-const SSL_METHOD *dot_test_TLS_client_method(void) {
+static const SSL_METHOD *dot_test_TLS_client_method(void) {
     return (const SSL_METHOD *)(uintptr_t)0x11;
 }
 
-int dot_test_SSL_library_init(void) {
+static int dot_test_SSL_library_init(void) {
     return 1;
 }
 
-void dot_test_SSL_load_error_strings(void) {
+static void dot_test_SSL_load_error_strings(void) {
 }
 
-void dot_test_OpenSSL_add_all_algorithms(void) {
+static void dot_test_OpenSSL_add_all_algorithms(void) {
 }
 
-SSL_CTX *dot_test_SSL_CTX_new(const SSL_METHOD *meth) {
+static SSL_CTX *dot_test_SSL_CTX_new(const SSL_METHOD *meth) {
     (void)meth;
     return g_ssl_ctx_value;
 }
 
-void dot_test_SSL_CTX_free(SSL_CTX *ctx) {
+static void dot_test_SSL_CTX_free(SSL_CTX *ctx) {
     (void)ctx;
 }
 
-int dot_test_SSL_CTX_set_default_verify_paths(SSL_CTX *ctx) {
+static int dot_test_SSL_CTX_set_default_verify_paths(SSL_CTX *ctx) {
     (void)ctx;
     return g_ssl_default_verify_paths_rc;
 }
 
-long dot_test_SSL_CTX_set_options(SSL_CTX *ctx, long op) {
-    (void)ctx;
-    return op;
-}
-
-int dot_test_SSL_CTX_set_min_proto_version(SSL_CTX *ctx, int version) {
+static int dot_test_SSL_CTX_set_min_proto_version(SSL_CTX *ctx, int version) {
     (void)ctx;
     (void)version;
     return 1;
 }
 
-void dot_test_SSL_CTX_set_verify(SSL_CTX *ctx, int mode, int (*cb)(int, X509_STORE_CTX *)) {
+static void dot_test_SSL_CTX_set_verify(SSL_CTX *ctx, int mode, int (*cb)(int, X509_STORE_CTX *)) {
     (void)ctx;
     (void)mode;
     (void)cb;
 }
 
-SSL *dot_test_SSL_new(SSL_CTX *ctx) {
+static SSL *dot_test_SSL_new(SSL_CTX *ctx) {
     (void)ctx;
     if (g_ssl_new_fail) {
         return NULL;
@@ -283,46 +280,46 @@ SSL *dot_test_SSL_new(SSL_CTX *ctx) {
     return (SSL *)(uintptr_t)0x21;
 }
 
-void dot_test_SSL_free(SSL *ssl) {
+static void dot_test_SSL_free(SSL *ssl) {
     (void)ssl;
     g_ssl_free_calls++;
 }
 
-int dot_test_SSL_shutdown(SSL *ssl) {
+static int dot_test_SSL_shutdown(SSL *ssl) {
     (void)ssl;
     g_ssl_shutdown_calls++;
     return 1;
 }
 
-int dot_test_SSL_set_tlsext_host_name(SSL *ssl, const char *name) {
+static int dot_test_SSL_set_tlsext_host_name(SSL *ssl, const char *name) {
     (void)ssl;
     (void)name;
     return 1;
 }
 
-int dot_test_SSL_set1_host(SSL *ssl, const char *hostname) {
+static int dot_test_SSL_set1_host(SSL *ssl, const char *hostname) {
     (void)ssl;
     (void)hostname;
     return 1;
 }
 
-int dot_test_SSL_set_fd(SSL *ssl, int fd) {
+static int dot_test_SSL_set_fd(SSL *ssl, int fd) {
     (void)ssl;
     (void)fd;
     return 1;
 }
 
-int dot_test_SSL_connect(SSL *ssl) {
+static int dot_test_SSL_connect(SSL *ssl) {
     (void)ssl;
     return g_ssl_connect_rc;
 }
 
-int dot_test_SSL_get_fd(const SSL *ssl) {
+static int dot_test_SSL_get_fd(const SSL *ssl) {
     (void)ssl;
     return g_ssl_get_fd;
 }
 
-int dot_test_SSL_read(SSL *ssl, void *buf, int num) {
+static int dot_test_SSL_read(SSL *ssl, void *buf, int num) {
     (void)ssl;
     if (g_ssl_read_script_idx < g_ssl_read_script_len) {
         int step = g_ssl_read_script[g_ssl_read_script_idx++];
@@ -345,7 +342,7 @@ int dot_test_SSL_read(SSL *ssl, void *buf, int num) {
     return -1;
 }
 
-int dot_test_SSL_write(SSL *ssl, const void *buf, int num) {
+static int dot_test_SSL_write(SSL *ssl, const void *buf, int num) {
     (void)ssl;
     (void)buf;
     if (g_ssl_write_script_idx < g_ssl_write_script_len) {
