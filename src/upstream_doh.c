@@ -545,38 +545,51 @@ static int doh_post_with_handle(
     return 0;
 }
 
-int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config) {
+proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config) {
     if (client_out == NULL || config == NULL) {
-        return -1;
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "client_out=%p config=%p",
+                         (const void *)client_out, (const void *)config);
     }
-    
+
     upstream_doh_client_t *client = calloc(1, sizeof(*client));
     if (client == NULL) {
-        return -1;
-    }
-    
-    client->pool_size = config->pool_size > 0 ? config->pool_size : 6;
-    
-    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-        free(client);
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc upstream_doh_client_t");
     }
 
-    if (pthread_mutex_init(&client->pool_mutex, NULL) != 0) {
+    client->pool_size = config->pool_size > 0 ? config->pool_size : 6;
+
+    CURLcode curl_rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (curl_rc != CURLE_OK) {
+        free(client);
+        return set_error(PROXY_ERR_RESOURCE,
+                         "curl_global_init failed (CURLcode=%d)",
+                         (int)curl_rc);
+    }
+
+    int mtx_rc = pthread_mutex_init(&client->pool_mutex, NULL);
+    if (mtx_rc != 0) {
         curl_global_cleanup();
         free(client);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_mutex_init failed (rc=%d)",
+                         mtx_rc);
     }
 
-    if (pthread_cond_init(&client->pool_cond, NULL) != 0) {
+    int cond_rc = pthread_cond_init(&client->pool_cond, NULL);
+    if (cond_rc != 0) {
         pthread_mutex_destroy(&client->pool_mutex);
         curl_global_cleanup();
         free(client);
-        return -1;
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_cond_init failed (rc=%d)",
+                         cond_rc);
     }
 
-    client->pool_handles = calloc((size_t)client->pool_size, sizeof(*client->pool_handles));
-    client->pool_in_use = calloc((size_t)client->pool_size, sizeof(*client->pool_in_use));
+    int pool_size = client->pool_size;
+    client->pool_handles = calloc((size_t)pool_size, sizeof(*client->pool_handles));
+    client->pool_in_use = calloc((size_t)pool_size, sizeof(*client->pool_in_use));
     if (client->pool_handles == NULL || client->pool_in_use == NULL) {
         free(client->pool_handles);
         free(client->pool_in_use);
@@ -584,10 +597,12 @@ int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_
         pthread_mutex_destroy(&client->pool_mutex);
         curl_global_cleanup();
         free(client);
-        return -1;
+        return set_error_errno(PROXY_ERR_RESOURCE,
+                               "calloc DoH pool (size=%d)",
+                               pool_size);
     }
 
-    for (int i = 0; i < client->pool_size; i++) {
+    for (int i = 0; i < pool_size; i++) {
         client->pool_handles[i] = curl_easy_init();
         if (client->pool_handles[i] == NULL) {
             for (int j = 0; j < i; j++) {
@@ -599,13 +614,15 @@ int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_
             pthread_mutex_destroy(&client->pool_mutex);
             curl_global_cleanup();
             free(client);
-            return -1;
+            return set_error(PROXY_ERR_RESOURCE,
+                             "curl_easy_init failed for pool slot %d/%d",
+                             i, pool_size);
         }
     }
 
     client->initialized = 1;
     *client_out = client;
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_doh_client_destroy(upstream_doh_client_t *client) {

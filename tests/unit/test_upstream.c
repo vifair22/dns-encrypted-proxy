@@ -9,11 +9,12 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include "errors.h"
 #include "upstream.h"
 
 /* Protocol-specific functions under test (implemented in upstream_*.c) */
 #if UPSTREAM_DOH_ENABLED
-int upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
+proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
 void upstream_doh_client_destroy(upstream_doh_client_t *client);
 int upstream_doh_resolve(
     upstream_doh_client_t *client,
@@ -421,7 +422,7 @@ static void test_doh_protocol_guard_paths(void **state) {
         .unhealthy_backoff_ms = 1000,
     };
     upstream_doh_client_t *client = NULL;
-    assert_int_equal(upstream_doh_client_init(&client, &config), 0);
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
     assert_non_null(client);
 
     upstream_server_t server;
@@ -530,8 +531,8 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
 #endif
 
 #if UPSTREAM_DOH_ENABLED
-    assert_int_equal(upstream_doh_client_init(NULL, &config), -1);
-    assert_int_equal(upstream_doh_client_init(&doh_client, NULL), -1);
+    assert_int_equal(upstream_doh_client_init(NULL, &config), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(upstream_doh_client_init(&doh_client, NULL), PROXY_ERR_INVALID_ARG);
 #endif
 #if UPSTREAM_DOT_ENABLED
     assert_int_equal(upstream_dot_client_init(NULL, &config), -1);
@@ -543,7 +544,7 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
 #endif
 
 #if UPSTREAM_DOH_ENABLED
-    assert_int_equal(upstream_doh_client_init(&doh_client, &config), 0);
+    assert_int_equal(upstream_doh_client_init(&doh_client, &config), PROXY_OK);
 #endif
 #if UPSTREAM_DOT_ENABLED
     assert_int_equal(upstream_dot_client_init(&dot_client, &config), 0);

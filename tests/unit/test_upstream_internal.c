@@ -126,13 +126,13 @@ static int upstream_wrap_clock_gettime(clockid_t clk, struct timespec *ts) {
     return 0;
 }
 
-int upstream_doh_client_init(upstream_doh_client_t **client, const upstream_config_t *config) {
+proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client, const upstream_config_t *config) {
     (void)config;
     if (g_doh_init_rc != 0) {
-        return -1;
+        return PROXY_ERR_RESOURCE;
     }
     *client = (upstream_doh_client_t *)(uintptr_t)0x1111;
-    return 0;
+    return PROXY_OK;
 }
 
 void upstream_doh_client_destroy(upstream_doh_client_t *client) {
