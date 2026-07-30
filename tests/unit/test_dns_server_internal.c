@@ -33,6 +33,14 @@ static size_t g_stub_cache_lookup_resp_len = 0;
 static int g_stub_upstream_rc = -1;
 static const uint8_t *g_stub_upstream_resp = NULL;
 static size_t g_stub_upstream_resp_len = 0;
+static int g_stub_upstream_resolve_calls = 0;
+/* When set, the dns_cache stubs treat this pointer as the failure cache and
+ * route lookups/stores through the g_stub_failure_cache_* controls. */
+static const void *g_stub_failure_cache_ptr = NULL;
+static int g_stub_failure_cache_lookup_hit = 0;
+static const uint8_t *g_stub_failure_cache_lookup_resp = NULL;
+static size_t g_stub_failure_cache_lookup_resp_len = 0;
+static int g_stub_failure_cache_store_calls = 0;
 static int g_stub_cacheable = 0;
 static int g_stub_ttl_ok = 0;
 static uint32_t g_stub_min_ttl = 0;
@@ -115,6 +123,12 @@ static void reset_stubs(void) {
     g_stub_upstream_rc = -1;
     g_stub_upstream_resp = NULL;
     g_stub_upstream_resp_len = 0;
+    g_stub_upstream_resolve_calls = 0;
+    g_stub_failure_cache_ptr = NULL;
+    g_stub_failure_cache_lookup_hit = 0;
+    g_stub_failure_cache_lookup_resp = NULL;
+    g_stub_failure_cache_lookup_resp_len = 0;
+    g_stub_failure_cache_store_calls = 0;
     g_stub_cacheable = 0;
     g_stub_ttl_ok = 0;
     g_stub_min_ttl = 0;
@@ -351,23 +365,26 @@ int dns_cache_lookup(
     const uint8_t request_id[2],
     uint8_t **response_out,
     size_t *response_len_out) {
-    (void)cache;
     (void)key;
     (void)key_len;
-    if (!g_stub_cache_lookup_hit) {
+    int is_failure_cache = (g_stub_failure_cache_ptr != NULL && (const void *)cache == g_stub_failure_cache_ptr);
+    int hit = is_failure_cache ? g_stub_failure_cache_lookup_hit : g_stub_cache_lookup_hit;
+    const uint8_t *resp = is_failure_cache ? g_stub_failure_cache_lookup_resp : g_stub_cache_lookup_resp;
+    size_t resp_len = is_failure_cache ? g_stub_failure_cache_lookup_resp_len : g_stub_cache_lookup_resp_len;
+    if (!hit) {
         return 0;
     }
-    if (response_out == NULL || response_len_out == NULL || g_stub_cache_lookup_resp == NULL || g_stub_cache_lookup_resp_len == 0) {
+    if (response_out == NULL || response_len_out == NULL || resp == NULL || resp_len == 0) {
         return 0;
     }
-    *response_out = malloc(g_stub_cache_lookup_resp_len);
+    *response_out = malloc(resp_len);
     if (*response_out == NULL) {
         return 0;
     }
-    memcpy(*response_out, g_stub_cache_lookup_resp, g_stub_cache_lookup_resp_len);
+    memcpy(*response_out, resp, resp_len);
     (*response_out)[0] = request_id[0];
     (*response_out)[1] = request_id[1];
-    *response_len_out = g_stub_cache_lookup_resp_len;
+    *response_len_out = resp_len;
     return 1;
 }
 
@@ -378,12 +395,15 @@ void dns_cache_store(
     const uint8_t *response,
     size_t response_len,
     uint32_t ttl_seconds) {
-    (void)cache;
     (void)key;
     (void)key_len;
     (void)response;
     (void)response_len;
     (void)ttl_seconds;
+    if (g_stub_failure_cache_ptr != NULL && (const void *)cache == g_stub_failure_cache_ptr) {
+        g_stub_failure_cache_store_calls++;
+        return;
+    }
     g_stub_cache_store_calls++;
 }
 
@@ -433,6 +453,7 @@ int upstream_facilitator_resolve(
     (void)facilitator;
     (void)query;
     (void)query_len;
+    g_stub_upstream_resolve_calls++;
     if (g_stub_upstream_rc != 0) {
         return -1;
     }
@@ -754,6 +775,63 @@ static void test_process_query_branches(void **state) {
     free(out);
     assert_true((uint64_t)atomic_load(&server.metrics.upstream_failures) >= 1);
     assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
+}
+
+static void test_process_query_failure_cache(void **state) {
+    (void)state;
+    reset_stubs();
+
+    proxy_server_t server;
+    memset(&server, 0, sizeof(server));
+    server.config.failure_cache_ttl_seconds = 30;
+    g_stub_failure_cache_ptr = &server.failure_cache;
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+
+    /* Upstream fails (stub default rc=-1): the synthesized SERVFAIL must be
+     * stored in the failure cache. */
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    out = NULL;
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal(g_stub_failure_cache_store_calls, 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.servfail_sent), 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.cache_misses), 1);
+
+    /* A repeat of the failing question answers from the failure cache: no
+     * upstream attempt, no cache-miss accounting, instant SERVFAIL. */
+    g_stub_failure_cache_lookup_hit = 1;
+    g_stub_failure_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_failure_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    out = NULL;
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.failure_cache_hits), 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.servfail_sent), 2);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.cache_misses), 1);
+
+    /* failure_cache_ttl_seconds=0 disables both lookup and store. */
+    reset_stubs();
+    proxy_server_t disabled;
+    memset(&disabled, 0, sizeof(disabled));
+    disabled.config.failure_cache_ttl_seconds = 0;
+    g_stub_failure_cache_ptr = &disabled.failure_cache;
+    g_stub_failure_cache_lookup_hit = 1;
+    g_stub_failure_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_failure_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+    assert_int_equal(process_query(&disabled, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal(g_stub_failure_cache_store_calls, 0);
+    assert_int_equal((uint64_t)atomic_load(&disabled.metrics.failure_cache_hits), 0);
 }
 
 static void test_proxy_server_init_and_socket_success_paths(void **state) {
@@ -1624,6 +1702,7 @@ int main(void) {
         cmocka_unit_test(test_servfail_and_truncated_builders),
         cmocka_unit_test(test_io_and_socket_helpers),
         cmocka_unit_test(test_process_query_branches),
+        cmocka_unit_test(test_process_query_failure_cache),
         cmocka_unit_test(test_tcp_client_loop_large_response_and_zero_length_query),
         cmocka_unit_test(test_dns_server_additional_edge_paths),
         cmocka_unit_test(test_tcp_accept_loop_additional_paths),

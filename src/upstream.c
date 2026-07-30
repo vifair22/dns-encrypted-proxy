@@ -288,6 +288,19 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
         return;
     }
 
+    /* A slow answer over a working transport is evidence about the query,
+     * not the server - the same lesson RFC 4697 draws for lame delegations:
+     * zone-specific breakage must not poison server selection. One
+     * pathological domain polled on a timer would otherwise flip a healthy
+     * upstream unhealthy and starve unrelated queries. Keep the failure
+     * bookkeeping, skip the health penalty. */
+    if (server->stage.last_failure_slow_response) {
+        server->health.last_failure_time = now_ms();
+        server->health.total_queries++;
+        server->health.total_failures++;
+        return;
+    }
+
     int was_healthy = server->health.healthy;
     
     server->health.consecutive_failures++;

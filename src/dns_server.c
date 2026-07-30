@@ -24,6 +24,7 @@
 
 #define DNS_MAX_MESSAGE_SIZE 65535
 #define CACHE_KEY_MAX_SIZE 4096
+#define FAILURE_CACHE_CAPACITY 512
 
 typedef struct {
     proxy_server_t *server;
@@ -660,6 +661,16 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
         atomic_fetch_add(&server->metrics.cache_hits, 1);
         return 0;
     }
+
+    /* RFC 2308 7.1: a recently failed question answers SERVFAIL from cache
+     * instead of re-burning the full upstream budget on a name that is
+     * known to be unresolvable right now. */
+    if (server->config.failure_cache_ttl_seconds > 0 &&
+        dns_cache_lookup(&server->failure_cache, key, key_len, request_id, response_out, response_len_out)) {
+        atomic_fetch_add(&server->metrics.failure_cache_hits, 1);
+        atomic_fetch_add(&server->metrics.servfail_sent, 1);
+        return 0;
+    }
     atomic_fetch_add(&server->metrics.cache_misses, 1);
 
     int upstream_budget_ms = server->config.upstream_timeout_ms;
@@ -700,6 +711,16 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
     if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
         RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "query_len=%zu", query_len);
         return -1;
+    }
+
+    if (server->config.failure_cache_ttl_seconds > 0) {
+        dns_cache_store(
+            &server->failure_cache,
+            key,
+            key_len,
+            *response_out,
+            *response_len_out,
+            (uint32_t)server->config.failure_cache_ttl_seconds);
     }
     return 0;
 }
@@ -1114,7 +1135,15 @@ proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *c
     if (cache_rc != PROXY_OK) {
         return cache_rc;
     }
-    
+
+    /* Failure-cache entries are tiny (header-only SERVFAILs) and short-lived,
+     * so a small fixed capacity bounds memory without a config knob. */
+    proxy_status_t failure_cache_rc = dns_cache_init(&server->failure_cache, FAILURE_CACHE_CAPACITY);
+    if (failure_cache_rc != PROXY_OK) {
+        dns_cache_destroy(&server->cache);
+        return failure_cache_rc;
+    }
+
     /* Initialize upstream client */
     const char *urls[MAX_UPSTREAMS];
     for (int i = 0; i < config->upstream_count; i++) {
@@ -1134,6 +1163,7 @@ proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *c
     
     proxy_status_t upstream_rc = upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg);
     if (upstream_rc != PROXY_OK) {
+        dns_cache_destroy(&server->failure_cache);
         dns_cache_destroy(&server->cache);
         return upstream_rc;
     }
@@ -1143,6 +1173,7 @@ proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *c
     proxy_status_t facilitator_rc = upstream_facilitator_init(&server->upstream_facilitator, &server->upstream);
     if (facilitator_rc != PROXY_OK) {
         upstream_client_destroy(&server->upstream);
+        dns_cache_destroy(&server->failure_cache);
         dns_cache_destroy(&server->cache);
         return facilitator_rc;
     }
@@ -1166,6 +1197,7 @@ void proxy_server_destroy(proxy_server_t *server) {
     
     upstream_facilitator_destroy(&server->upstream_facilitator);
     upstream_client_destroy(&server->upstream);
+    dns_cache_destroy(&server->failure_cache);
     dns_cache_destroy(&server->cache);
     memset(server, 0, sizeof(*server));
 }

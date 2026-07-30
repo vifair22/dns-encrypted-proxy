@@ -76,6 +76,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 | Key | Default | Unit | Env override | Notes |
 |---|---|---|---|---|
 | `cache_capacity` | `1024` | entries | `CACHE_CAPACITY` | Hash-bucketed LRU cache. |
+| `failure_cache_ttl_seconds` | `30` | seconds | `FAILURE_CACHE_TTL_SECONDS` | RFC 2308 7.1 failure caching: a question that just failed answers SERVFAIL from cache for this long instead of re-burning the upstream budget. `0` disables; capped at `300` (the RFC maximum). Capacity is fixed at 512 entries. |
 | `hosts_a` | (empty) | comma-separated `name=ipv4` or `name:ipv4` | `HOSTS_A` | Local A-record overrides, returned with TTL 60. |
 
 ### 3.4 Metrics & logging
@@ -200,6 +201,7 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 |---|---|---|
 | `dns_encrypted_proxy_cache_hits_total` | counter | |
 | `dns_encrypted_proxy_cache_misses_total` | counter | |
+| `dns_encrypted_proxy_failure_cache_hits_total` | counter | SERVFAILs answered from the RFC 2308 failure cache without an upstream attempt. |
 | `dns_encrypted_proxy_cache_evictions_total` | counter | LRU pressure events. |
 | `dns_encrypted_proxy_cache_expirations_total` | counter | TTL-aged-out reads/sweeps. |
 | `dns_encrypted_proxy_cache_entries` | gauge | Current entry count. |

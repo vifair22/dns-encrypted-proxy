@@ -730,6 +730,42 @@ static void test_upstream_guard_and_limit_edges(void **state) {
     upstream_client_destroy(&client);
 }
 
+static void test_record_failure_slow_response_not_health_attributed(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t cfg = {
+        .timeout_ms = 50,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+
+    upstream_server_t s;
+    memset(&s, 0, sizeof(s));
+    s.health.healthy = 1;
+    s.stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+    s.stage.last_failure_slow_response = 1;
+
+    /* Far past the unhealthy threshold: slow-response failures are evidence
+     * about the query, never accumulate strikes, never flip health. */
+    for (int i = 0; i < 10; i++) {
+        upstream_server_record_failure(&s, &cfg);
+    }
+    assert_int_equal(s.health.healthy, 1);
+    assert_int_equal((int)s.health.consecutive_failures, 0);
+    assert_int_equal((int)s.health.total_failures, 10);
+    assert_int_equal((int)s.health.total_queries, 10);
+
+    /* The same failure class without the slow-response verdict counts. */
+    s.stage.last_failure_slow_response = 0;
+    for (int i = 0; i < 3; i++) {
+        upstream_server_record_failure(&s, &cfg);
+    }
+    assert_int_equal(s.health.healthy, 0);
+    assert_int_equal((int)s.health.consecutive_failures, 3);
+}
+
 static void test_upstream_ready_state(void **state) {
     (void)state;
     reset_stubs();
@@ -759,6 +795,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_stage_metrics_matrix),
         cmocka_unit_test(test_upstream_transport_timeout_uses_stage2_when_stage1_cache_missing),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
+        cmocka_unit_test(test_record_failure_slow_response_not_health_attributed),
         cmocka_unit_test(test_upstream_ready_state),
     };
 

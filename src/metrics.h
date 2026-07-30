@@ -14,6 +14,7 @@ typedef struct {
     atomic_uint_fast64_t queries_tcp;
     atomic_uint_fast64_t cache_hits;
     atomic_uint_fast64_t cache_misses;
+    atomic_uint_fast64_t failure_cache_hits;
     atomic_uint_fast64_t upstream_success;
     atomic_uint_fast64_t upstream_failures;
     atomic_uint_fast64_t servfail_sent;

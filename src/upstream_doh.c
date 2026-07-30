@@ -23,10 +23,12 @@
  * typical cold-recursion latency; the ladder simply runs fewer attempts
  * within the same total budget. */
 #define DOH_MIN_ATTEMPT_TIMEOUT_MS 800
-/* Minimum leftover budget worth spending on the slow-response retry. Below
- * this the retry could only succeed on an upstream cache hit primed by the
- * failed attempt, which the regular tail attempts already cover. */
-#define DOH_SLOW_RETRY_MIN_TIMEOUT_MS 100
+/* Minimum budget on which launching any attempt makes sense: below one
+ * DNS-over-HTTPS round trip the attempt cannot succeed, so firing it only
+ * spams logs and pollutes the per-tier failure counters (production showed
+ * 1-28 ms attempts when dispatch handed over nearly-expired deadlines).
+ * next_attempt_timeout_ms reports budget exhaustion instead. */
+#define DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS 100
 #define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
 #define DOH_UPGRADE_BACKOFF_BASE_MS (10ULL * 60ULL * 1000ULL)
 #define DOH_UPGRADE_BACKOFF_MAX_MS (6ULL * 60ULL * 60ULL * 1000ULL)
@@ -179,6 +181,9 @@ static int next_attempt_timeout_ms(uint64_t deadline_ms, int attempts_left) {
         return -1;
     }
     uint64_t remaining = deadline_ms - now;
+    if (remaining < DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS) {
+        return -1;
+    }
     int t = (int)(remaining / (uint64_t)attempts_left);
     if (t < DOH_MIN_ATTEMPT_TIMEOUT_MS && remaining >= DOH_MIN_ATTEMPT_TIMEOUT_MS) {
         t = DOH_MIN_ATTEMPT_TIMEOUT_MS;
@@ -703,6 +708,7 @@ int upstream_doh_resolve(
     *response_len_out = 0;
 
     server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    server->stage.last_failure_slow_response = 0;
 
     CURL *curl = NULL;
     int slot = -1;
@@ -745,6 +751,7 @@ int upstream_doh_resolve(
     doh_http_tier_t successful_tier = DOH_HTTP_TIER_H3;
     int h3_was_attempted = (top_tier == DOH_HTTP_TIER_H3) ? 1 : 0;
     int slow_response = 0;
+    int attempts_made = 0;
     doh_http_tier_t slow_tier = DOH_HTTP_TIER_H3;
     int slow_use_override_v4 = 0;
     uint32_t slow_override_addr_v4_be = 0;
@@ -776,6 +783,10 @@ int upstream_doh_resolve(
             if (attempt_timeout_ms < 0) {
                 pool_release(client, slot);
                 server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+                /* Budget exhausted before a single attempt ran: the caller
+                 * handed over a nearly-expired deadline. No evidence about
+                 * this server was gathered, so keep health out of it. */
+                server->stage.last_failure_slow_response = (attempts_made == 0);
                 return -1;
             }
 
@@ -793,6 +804,7 @@ int upstream_doh_resolve(
                 &response_len,
                 &attempt_err);
             attempts_left--;
+            attempts_made++;
 
             if (result == 0) {
                 successful_tier = tier;
@@ -828,8 +840,12 @@ int upstream_doh_resolve(
     }
 
     if (result != 0 && slow_response) {
+        /* Assume the resolve fails as a slow response; the retry outcome
+         * below refines this (a transport error on the retry re-attributes
+         * the failure to the server). */
+        server->stage.last_failure_slow_response = 1;
         int retry_timeout_ms = next_attempt_timeout_ms(deadline_ms, 1);
-        if (retry_timeout_ms >= DOH_SLOW_RETRY_MIN_TIMEOUT_MS) {
+        if (retry_timeout_ms > 0) {
             __atomic_add_fetch(&server->stage.doh_slow_retry_attempt_total, 1, __ATOMIC_RELAXED);
             result = doh_post_with_handle(
                 client,
@@ -861,6 +877,9 @@ int upstream_doh_resolve(
                 }
                 final_failure_class = attempt_class;
                 server->stage.last_failure_class = (int)final_failure_class;
+                if (!(attempt_err.curl_rc == CURLE_OPERATION_TIMEDOUT && attempt_err.request_sent)) {
+                    server->stage.last_failure_slow_response = 0;
+                }
             }
         }
     }

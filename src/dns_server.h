@@ -14,6 +14,10 @@
 typedef struct {
     proxy_config_t config;
     dns_cache_t cache;
+    /* RFC 2308 7.1 negative-failure cache: SERVFAILs keyed by question so a
+     * known-failing name answers instantly instead of re-burning the full
+     * upstream budget on every retry. */
+    dns_cache_t failure_cache;
     upstream_client_t upstream;
     upstream_facilitator_t upstream_facilitator;
     proxy_metrics_t metrics;
