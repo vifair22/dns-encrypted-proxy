@@ -518,11 +518,29 @@ int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *ke
     return 0;
 }
 
+/* Mirrors the real parser's shape (walk QDCOUNT names + fixed fields) so
+ * EDNS queries do not leak the OPT record into the question length the way
+ * the old message_len-12 shortcut did. Compression is not needed for test
+ * fixtures. */
 int dns_question_section_length(const uint8_t *message, size_t message_len, size_t *section_len_out) {
     if (message == NULL || message_len < 12 || section_len_out == NULL) {
         return -1;
     }
-    *section_len_out = message_len - 12;
+    uint16_t qdcount = (uint16_t)((message[4] << 8) | message[5]);
+    size_t off = 12;
+    for (uint16_t i = 0; i < qdcount; i++) {
+        while (off < message_len && message[off] != 0 && (message[off] & 0xC0u) == 0) {
+            off += (size_t)message[off] + 1;
+        }
+        if (off >= message_len || message[off] != 0) {
+            return -1;
+        }
+        off += 1 + 4;
+        if (off > message_len) {
+            return -1;
+        }
+    }
+    *section_len_out = off - 12;
     return 0;
 }
 
@@ -623,6 +641,7 @@ static void test_servfail_and_truncated_builders(void **state) {
         build_servfail_response(
             DNS_QUERY_WWW_EXAMPLE_COM_A,
             DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            -1,
             &servfail,
             &servfail_len),
         0);
@@ -777,6 +796,77 @@ static void test_process_query_branches(void **state) {
     assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
 }
 
+static void test_build_servfail_ede(void **state) {
+    (void)state;
+    reset_stubs();
+
+    /* EDNS query: SERVFAIL carries the echoed OPT extended with an RFC 8914
+     * EDE option; RDLENGTH is patched to cover it. */
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(
+        build_servfail_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            DNS_EDE_NO_REACHABLE_AUTHORITY,
+            &resp,
+            &resp_len),
+        0);
+    assert_non_null(resp);
+
+    /* ARCOUNT == 1 and the OPT record is present. */
+    assert_int_equal((int)((resp[10] << 8) | resp[11]), 1);
+    size_t opt_start = 0;
+    size_t opt_end = 0;
+    assert_int_equal(dns_find_opt_record(resp, resp_len, &opt_start, &opt_end), 0);
+    assert_int_equal(opt_end, resp_len);
+
+    /* Walk to RDATA: root name (1) + type (2) + class (2) + ttl (4) + rdlength (2). */
+    assert_int_equal(resp[opt_start], 0x00);
+    uint16_t rdlength = (uint16_t)((resp[opt_start + 9] << 8) | resp[opt_start + 10]);
+    size_t rdata = opt_start + 11;
+    assert_int_equal(rdata + rdlength, resp_len);
+
+    /* The fixture OPT has empty RDATA, so the EDE option is the whole RDATA:
+     * option-code 15, option-length 2 + text, info-code, EXTRA-TEXT. */
+    const char *text = "no upstream answer within budget";
+    assert_int_equal(rdlength, 4 + 2 + strlen(text));
+    assert_int_equal((int)((resp[rdata] << 8) | resp[rdata + 1]), DNS_EDE_OPTION_CODE);
+    assert_int_equal((int)((resp[rdata + 2] << 8) | resp[rdata + 3]), (int)(2 + strlen(text)));
+    assert_int_equal((int)((resp[rdata + 4] << 8) | resp[rdata + 5]), DNS_EDE_NO_REACHABLE_AUTHORITY);
+    assert_memory_equal(resp + rdata + 6, text, strlen(text));
+    free(resp);
+    resp = NULL;
+
+    /* ede_info_code=-1 leaves the echoed OPT untouched (old behavior). */
+    assert_int_equal(
+        build_servfail_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            -1,
+            &resp,
+            &resp_len),
+        0);
+    assert_int_equal(dns_find_opt_record(resp, resp_len, &opt_start, &opt_end), 0);
+    rdlength = (uint16_t)((resp[opt_start + 9] << 8) | resp[opt_start + 10]);
+    assert_int_equal(rdlength, 0);
+    free(resp);
+    resp = NULL;
+
+    /* A non-EDNS query never gets an OPT, EDE requested or not (RFC 6891). */
+    assert_int_equal(
+        build_servfail_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            DNS_EDE_NETWORK_ERROR,
+            &resp,
+            &resp_len),
+        0);
+    assert_int_equal((int)((resp[10] << 8) | resp[11]), 0);
+    assert_int_equal(dns_find_opt_record(resp, resp_len, &opt_start, &opt_end), -1);
+    free(resp);
+}
+
 static void test_process_query_failure_cache(void **state) {
     (void)state;
     reset_stubs();
@@ -903,7 +993,7 @@ static void test_dns_server_randomized_helper_exploration(void **state) {
 
         uint8_t *out = NULL;
         size_t out_len = 0;
-        (void)build_servfail_response(msg, len, &out, &out_len);
+        (void)build_servfail_response(msg, len, (int)(dns_server_next_rand() % 3) == 0 ? DNS_EDE_NETWORK_ERROR : -1, &out, &out_len);
         free(out);
 
         out = NULL;
@@ -1059,8 +1149,8 @@ static void test_dns_server_additional_edge_paths(void **state) {
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(build_servfail_response(DNS_MALFORMED_SHORT_HEADER, DNS_MALFORMED_SHORT_HEADER_LEN, &resp, &resp_len), -1);
-    assert_int_equal(build_servfail_response(DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, NULL, &resp_len), -1);
+    assert_int_equal(build_servfail_response(DNS_MALFORMED_SHORT_HEADER, DNS_MALFORMED_SHORT_HEADER_LEN, -1, &resp, &resp_len), -1);
+    assert_int_equal(build_servfail_response(DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, -1, NULL, &resp_len), -1);
 
     proxy_server_t server;
     memset(&server, 0, sizeof(server));
@@ -1703,6 +1793,7 @@ int main(void) {
         cmocka_unit_test(test_io_and_socket_helpers),
         cmocka_unit_test(test_process_query_branches),
         cmocka_unit_test(test_process_query_failure_cache),
+        cmocka_unit_test(test_build_servfail_ede),
         cmocka_unit_test(test_tcp_client_loop_large_response_and_zero_length_query),
         cmocka_unit_test(test_dns_server_additional_edge_paths),
         cmocka_unit_test(test_tcp_accept_loop_additional_paths),

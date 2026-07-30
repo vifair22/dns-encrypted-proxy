@@ -329,7 +329,24 @@ static int build_hosts_a_response(
     return 0;
 }
 
-static int build_servfail_response(const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
+/* RFC 8914 Extended DNS Errors attached to proxy-synthesized SERVFAILs so a
+ * plain dig against the proxy explains the failure instead of a bare rcode. */
+#define DNS_EDE_OPTION_CODE 15
+#define DNS_EDE_NO_REACHABLE_AUTHORITY 22
+#define DNS_EDE_NETWORK_ERROR 23
+
+static const char *ede_extra_text(int ede_info_code) {
+    switch (ede_info_code) {
+        case DNS_EDE_NO_REACHABLE_AUTHORITY:
+            return "no upstream answer within budget";
+        case DNS_EDE_NETWORK_ERROR:
+            return "upstream transport failed";
+        default:
+            return "";
+    }
+}
+
+static int build_servfail_response(const uint8_t *query, size_t query_len, int ede_info_code, uint8_t **response_out, size_t *response_len_out) {
     if (query_len < 12 || response_out == NULL || response_len_out == NULL) {
         return -1;
     }
@@ -343,7 +360,16 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     int has_opt = (dns_find_query_opt(query, query_len, &opt_start, &opt_end) == 0);
     size_t opt_len = has_opt ? (opt_end - opt_start) : 0;
 
-    size_t response_len = 12 + question_len + opt_len;
+    /* EDE rides in the echoed OPT; a client that did not signal EDNS gets a
+     * plain SERVFAIL (RFC 6891: never send OPT unsolicited). */
+    size_t ede_text_len = 0;
+    size_t ede_opt_len = 0;
+    if (has_opt && ede_info_code >= 0) {
+        ede_text_len = strlen(ede_extra_text(ede_info_code));
+        ede_opt_len = 4 + 2 + ede_text_len;
+    }
+
+    size_t response_len = 12 + question_len + opt_len + ede_opt_len;
     uint8_t *response = calloc(1, response_len);
     if (response == NULL) {
         return -1;
@@ -373,7 +399,30 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     }
 
     if (has_opt) {
-        memcpy(response + 12 + question_len, query + opt_start, opt_len);
+        size_t resp_opt = 12 + question_len;
+        memcpy(response + resp_opt, query + opt_start, opt_len);
+
+        if (ede_opt_len > 0) {
+            /* The copied OPT's RDATA ends exactly at the copy's end, so the
+             * EDE option appends directly after it; only RDLENGTH needs a
+             * patch. Locate RDLENGTH by walking the copied record. */
+            size_t p = resp_opt;
+            if (dns_skip_name_wire(response, response_len, &p) != 0 || p + 10 > resp_opt + opt_len) {
+                free(response);
+                return -1;
+            }
+            size_t rdlength_pos = p + 8;
+            uint16_t rdlength = read_u16(response + rdlength_pos);
+
+            size_t ede_pos = resp_opt + opt_len;
+            write_u16(response + ede_pos, DNS_EDE_OPTION_CODE);
+            write_u16(response + ede_pos + 2, (uint16_t)(2 + ede_text_len));
+            write_u16(response + ede_pos + 4, (uint16_t)ede_info_code);
+            if (ede_text_len > 0) {
+                memcpy(response + ede_pos + 6, ede_extra_text(ede_info_code), ede_text_len);
+            }
+            write_u16(response + rdlength_pos, (uint16_t)(rdlength + ede_opt_len));
+        }
     }
 
     *response_out = response;
@@ -616,6 +665,26 @@ finalize:
     return 0;
 }
 
+/* Pick the RFC 8914 info-code for a just-failed resolution from the failure
+ * evidence on each upstream. The stage state is shared across in-flight
+ * queries, so this reads the most recent verdicts - for the resolve that
+ * just failed those are almost always its own outcome, and the code is
+ * diagnostic metadata, not protocol state, so a rare race is harmless. */
+static int servfail_ede_code(const upstream_client_t *upstream) {
+    int saw_failure = 0;
+    for (int i = 0; i < upstream->server_count; i++) {
+        const upstream_server_t *s = &upstream->servers[i];
+        if (s->stage.last_failure_slow_response) {
+            /* Upstream transport worked; the resolution beyond it did not. */
+            return DNS_EDE_NO_REACHABLE_AUTHORITY;
+        }
+        if (s->stage.last_failure_class != UPSTREAM_FAILURE_CLASS_UNKNOWN) {
+            saw_failure = 1;
+        }
+    }
+    return saw_failure ? DNS_EDE_NETWORK_ERROR : -1;
+}
+
 static int process_query(proxy_server_t *server, const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
     if (server == NULL || query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL) {
         return -1;
@@ -650,7 +719,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
      */
     if (!key_ok) {
         atomic_fetch_add(&server->metrics.servfail_sent, 1);
-        if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
+        if (build_servfail_response(query, query_len, -1, response_out, response_len_out) != 0) {
             RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "invalid_query_len=%zu", query_len);
             return -1;
         }
@@ -708,7 +777,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     atomic_fetch_add(&server->metrics.upstream_failures, 1);
     atomic_fetch_add(&server->metrics.servfail_sent, 1);
-    if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
+    if (build_servfail_response(query, query_len, servfail_ede_code(&server->upstream), response_out, response_len_out) != 0) {
         RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "query_len=%zu", query_len);
         return -1;
     }
@@ -861,7 +930,7 @@ static void *udp_loop(void *arg) {
                     free(response);
                     response = NULL;
                     response_len = 0;
-                    if (build_servfail_response(buffer, (size_t)n, &response, &response_len) != 0) {
+                    if (build_servfail_response(buffer, (size_t)n, -1, &response, &response_len) != 0) {
                         RECORD_INTERNAL_ERROR(server, "truncation_and_servfail_build_failed", "udp_limit=%zu response_len=%zu", udp_limit, response_len);
                         continue;
                     }

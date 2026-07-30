@@ -193,7 +193,7 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_responses_total` | counter | — | Responses sent back to clients. |
 | `dns_encrypted_proxy_responses_rcode_total` | counter | `rcode` | Response code histogram. |
 | `dns_encrypted_proxy_truncated_sent_total` | counter | — | UDP responses with `TC=1`. |
-| `dns_encrypted_proxy_servfail_sent_total` | counter | — | SERVFAIL responses (proxy-originated). |
+| `dns_encrypted_proxy_servfail_sent_total` | counter | — | SERVFAIL responses (proxy-originated). For EDNS clients these carry an RFC 8914 EDE option: 23 (Network Error) when the upstream transport failed, 22 (No Reachable Authority) when the upstream was reachable but no answer arrived within budget. Upstream-originated SERVFAILs are relayed verbatim, including any upstream EDE. |
 
 ### 5.2 Cache
 
