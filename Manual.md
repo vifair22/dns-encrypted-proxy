@@ -77,7 +77,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 |---|---|---|---|---|
 | `cache_capacity` | `1024` | entries | `CACHE_CAPACITY` | Hash-bucketed LRU cache. |
 | `failure_cache_ttl_seconds` | `30` | seconds | `FAILURE_CACHE_TTL_SECONDS` | RFC 2308 7.1 failure caching: a question that just failed answers SERVFAIL from cache for this long instead of re-burning the upstream budget. `0` disables; capped at `300` (the RFC maximum). Capacity is fixed at 512 entries. |
-| `hosts_a` | (empty) | comma-separated `name=ipv4` or `name:ipv4` | `HOSTS_A` | Local A-record overrides, returned with TTL 60. |
+| `hosts_a` | (empty) | comma-separated `name=ipv4` or `name:ipv4` | `HOSTS_A` | Local A-record overrides, returned with TTL 60. The proxy is authoritative for overridden names: every other query type (AAAA, HTTPS, TXT, ...) answers NODATA locally, standard hosts semantics; nothing for these names goes upstream. |
 
 ### 3.4 Metrics & logging
 

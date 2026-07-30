@@ -205,12 +205,13 @@ static int dns_find_query_opt(const uint8_t *query, size_t query_len, size_t *op
     return -1;
 }
 
-static int dns_extract_single_question_name_a(
+static int dns_extract_single_question_name_addr(
     const uint8_t *query,
     size_t query_len,
     char *name_out,
     size_t name_out_len,
-    size_t *question_end_out) {
+    size_t *question_end_out,
+    uint16_t *qtype_out) {
     if (query == NULL || query_len < 12 || name_out == NULL || name_out_len == 0 || question_end_out == NULL) {
         return -1;
     }
@@ -260,12 +261,15 @@ static int dns_extract_single_question_name_a(
 
     uint16_t qtype = read_u16(query + offset);
     uint16_t qclass = read_u16(query + offset + 2);
-    if (qtype != 1 || qclass != 1) {
+    if (qclass != 1) {
         return -1;
     }
 
     name_out[out_len] = '\0';
     *question_end_out = offset + 4;
+    if (qtype_out != NULL) {
+        *qtype_out = qtype;
+    }
     return 0;
 }
 
@@ -281,7 +285,9 @@ static int build_hosts_a_response(
 
     size_t question_end = 0;
     char unused_name[256];
-    if (dns_extract_single_question_name_a(query, query_len, unused_name, sizeof(unused_name), &question_end) != 0) {
+    uint16_t qtype = 0;
+    if (dns_extract_single_question_name_addr(query, query_len, unused_name, sizeof(unused_name), &question_end, &qtype) != 0 ||
+        qtype != 1) {
         return -1;
     }
 
@@ -322,6 +328,59 @@ static int build_hosts_a_response(
 
     if (has_opt) {
         memcpy(response + ans + answer_len, query + opt_start, opt_len);
+    }
+
+    *response_out = response;
+    *response_len_out = response_len;
+    return 0;
+}
+
+/* NODATA (NOERROR, zero answers) for any non-A query on names we hold local
+ * A data for - standard hosts semantics (dnsmasq host-record does the same).
+ * Forwarding AAAA/HTTPS/TXT/... upstream would split authority for the name
+ * and keep the upstream dependency the override exists to remove. */
+static int build_hosts_nodata_response(
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    if (query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL) {
+        return -1;
+    }
+
+    size_t question_end = 0;
+    char unused_name[256];
+    if (dns_extract_single_question_name_addr(query, query_len, unused_name, sizeof(unused_name), &question_end, NULL) != 0) {
+        return -1;
+    }
+
+    size_t question_len = question_end - 12;
+    size_t opt_start = 0;
+    size_t opt_end = 0;
+    int has_opt = (dns_find_query_opt(query, query_len, &opt_start, &opt_end) == 0);
+    size_t opt_len = has_opt ? (opt_end - opt_start) : 0;
+
+    size_t response_len = 12 + question_len + opt_len;
+    uint8_t *response = calloc(1, response_len);
+    if (response == NULL) {
+        return -1;
+    }
+
+    response[0] = query[0];
+    response[1] = query[1];
+
+    uint16_t query_flags = read_u16(query + 2);
+    uint16_t response_flags = (uint16_t)(0x8000u | (query_flags & 0x7800u) | (query_flags & 0x0100u) | (query_flags & 0x0010u) | 0x0080u);
+    write_u16(response + 2, response_flags);
+    write_u16(response + 4, 1);
+    write_u16(response + 6, 0);
+    write_u16(response + 8, 0);
+    write_u16(response + 10, has_opt ? 1 : 0);
+
+    memcpy(response + 12, query + 12, question_len);
+
+    if (has_opt) {
+        memcpy(response + 12 + question_len, query + opt_start, opt_len);
     }
 
     *response_out = response;
@@ -703,11 +762,18 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     char qname[256];
     size_t question_end = 0;
-    if (dns_extract_single_question_name_a(query, query_len, qname, sizeof(qname), &question_end) == 0) {
+    uint16_t hosts_qtype = 0;
+    if (dns_extract_single_question_name_addr(query, query_len, qname, sizeof(qname), &question_end, &hosts_qtype) == 0) {
         uint32_t addr_v4_be = 0;
         if (config_lookup_hosts_a(&server->config, qname, &addr_v4_be)) {
-            if (build_hosts_a_response(query, query_len, addr_v4_be, response_out, response_len_out) == 0) {
-                return 0;
+            if (hosts_qtype == 1) {
+                if (build_hosts_a_response(query, query_len, addr_v4_be, response_out, response_len_out) == 0) {
+                    return 0;
+                }
+            } else {
+                if (build_hosts_nodata_response(query, query_len, response_out, response_len_out) == 0) {
+                    return 0;
+                }
             }
         }
     }
