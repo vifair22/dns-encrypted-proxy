@@ -728,18 +728,26 @@ static char *bytes_to_hex(const uint8_t *data, size_t len) {
     return out;
 }
 
-static char *create_python_doh_script(const char *response_hex) {
+/* delay_ms > 0 makes every request sleep before answering, emulating an
+ * upstream that is reachable but slow to produce the response (e.g. a cold
+ * recursive resolution). Threading matters for that case: a retry landing
+ * while the first connection is still sleeping must not queue behind it. */
+static char *create_python_doh_script(const char *response_hex, int delay_ms) {
     const char *tmpl =
         "import ssl\n"
         "import sys\n"
-        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "import time\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
         "RESP = bytes.fromhex(\"%s\")\n"
+        "DELAY_S = %d / 1000.0\n"
         "class Handler(BaseHTTPRequestHandler):\n"
         "    protocol_version = \"HTTP/1.1\"\n"
         "    def do_POST(self):\n"
         "        length = int(self.headers.get(\"Content-Length\", \"0\"))\n"
         "        if length > 0:\n"
         "            self.rfile.read(length)\n"
+        "        if DELAY_S > 0:\n"
+        "            time.sleep(DELAY_S)\n"
         "        self.send_response(200)\n"
         "        self.send_header(\"Content-Type\", \"application/dns-message\")\n"
         "        self.send_header(\"Content-Length\", str(len(RESP)))\n"
@@ -752,7 +760,7 @@ static char *create_python_doh_script(const char *response_hex) {
         "    port = int(sys.argv[1])\n"
         "    cert = sys.argv[2]\n"
         "    key = sys.argv[3]\n"
-        "    httpd = HTTPServer((\"127.0.0.1\", port), Handler)\n"
+        "    httpd = ThreadingHTTPServer((\"127.0.0.1\", port), Handler)\n"
         "    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n"
         "    ctx.load_cert_chain(certfile=cert, keyfile=key)\n"
         "    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)\n"
@@ -760,12 +768,12 @@ static char *create_python_doh_script(const char *response_hex) {
         "if __name__ == \"__main__\":\n"
         "    main()\n";
 
-    size_t needed = strlen(tmpl) + strlen(response_hex) + 32;
+    size_t needed = strlen(tmpl) + strlen(response_hex) + 48;
     char *script = malloc(needed);
     if (script == NULL) {
         return NULL;
     }
-    int n = snprintf(script, needed, tmpl, response_hex);
+    int n = snprintf(script, needed, tmpl, response_hex, delay_ms);
     if (n <= 0 || (size_t)n >= needed) {
         free(script);
         return NULL;
@@ -781,7 +789,8 @@ static int start_python_doh_server(
     const char *cert_path,
     const char *key_path,
     const uint8_t *response,
-    size_t response_len) {
+    size_t response_len,
+    int delay_ms) {
 
     if (server == NULL || cert_path == NULL || key_path == NULL || response == NULL || response_len == 0) {
         return -1;
@@ -798,7 +807,7 @@ static int start_python_doh_server(
     if (response_hex == NULL) {
         return -1;
     }
-    server->script_path = create_python_doh_script(response_hex);
+    server->script_path = create_python_doh_script(response_hex, delay_ms);
     free(response_hex);
     if (server->script_path == NULL) {
         return -1;
@@ -1285,7 +1294,8 @@ static void test_upstream_transport_doh_success(void **state) {
             cert_path,
             key_path,
             DNS_RESPONSE_WWW_EXAMPLE_COM_A,
-            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN),
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN,
+            0),
         0);
 
     setenv("CURL_CA_BUNDLE", cert_path, 1);
@@ -1379,6 +1389,105 @@ static void test_upstream_transport_doh_unreachable(void **state) {
     assert_int_equal(client.servers[0].type, UPSTREAM_TYPE_DOH);
     assert_true(client.servers[0].health.total_queries >= 1);
     upstream_client_destroy(&client);
+}
+#endif
+
+/*
+ * Test: DoH upstream that is reachable but answers slower than one budget
+ * slice, while still inside the total per-server budget.
+ *
+ * Regression test for the production resolution stalls: per-attempt budget
+ * splitting handed out slices far below cold-recursion latency, so a slow
+ * (not broken) upstream failed every attempt and the query stalled into
+ * SERVFAIL. The slow-response classifier must notice the request reached
+ * the upstream, skip the tier ladder, and spend the remaining budget on one
+ * same-tier retry that has enough time to succeed.
+ */
+#if UPSTREAM_DOH_ENABLED
+static void test_upstream_transport_doh_slow_response_within_budget(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    /* Answer delay sits above any single budget slice (2500 ms split over
+     * the attempt ladder) but well below the full 2500 ms budget. */
+    python_doh_server_t server;
+    assert_int_equal(
+        start_python_doh_server(
+            &server,
+            cert_path,
+            key_path,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN,
+            1300),
+        0);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://localhost:%d/dns-query", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 2500,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
+
+    struct timespec t_start;
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    int resolve_rc = upstream_resolve(
+        &client,
+        DNS_QUERY_WWW_EXAMPLE_COM_A,
+        DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+        &response,
+        &response_len);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000L +
+                      (t_end.tv_nsec - t_start.tv_nsec) / 1000000L;
+
+    assert_int_equal(resolve_rc, 0);
+    assert_non_null(response);
+    assert_int_equal(response_len, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN);
+    assert_memory_equal(response, DNS_RESPONSE_WWW_EXAMPLE_COM_A, response_len);
+
+    /* The answer must have absorbed the mock's delay yet landed inside the
+     * per-server budget, i.e. the retry ran with the remaining budget
+     * instead of another starved slice. */
+    assert_true(elapsed_ms >= 1300);
+    assert_true(elapsed_ms < 2500);
+
+    upstream_server_t *srv = &client.servers[0];
+    assert_int_equal((int)srv->stage.doh_slow_retry_attempt_total, 1);
+    assert_int_equal((int)srv->stage.doh_slow_retry_success_total, 1);
+    /* Exactly one starved slice timed out (ladder tier 0) before the
+     * classifier stopped the ladder; no downgrade pin engaged. */
+    assert_int_equal((int)srv->stage.doh_attempt_failures_total[0][UPSTREAM_FAILURE_CLASS_TIMEOUT], 1);
+    assert_int_equal((int)srv->stage.doh_forced_http_tier, 0);
+    assert_int_equal((int)srv->stage.doh_h3_consecutive_failures, 0);
+
+    free(response);
+    upstream_client_destroy(&client);
+    stop_python_doh_server(&server);
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
 }
 #endif
 
@@ -2019,7 +2128,8 @@ static void test_upstream_transport_doh_http1_runtime_stats(void **state) {
             cert_path,
             key_path,
             DNS_RESPONSE_WWW_EXAMPLE_COM_A,
-            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN),
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN,
+            0),
         0);
 
     setenv("CURL_CA_BUNDLE", cert_path, 1);
@@ -3089,7 +3199,8 @@ static void test_dns_server_udp_truncation_path(void **state) {
             cert_path,
             key_path,
             large_response,
-            large_len),
+            large_len,
+            0),
         0);
     free(large_response);
 
@@ -3277,7 +3388,8 @@ static void test_dns_server_udp_edns_no_truncation(void **state) {
             cert_path,
             key_path,
             large_response,
-            large_len),
+            large_len,
+            0),
         0);
     free(large_response);
 
@@ -3357,6 +3469,7 @@ int main(void) {
 #if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_upstream_transport_doh_success),
         cmocka_unit_test(test_upstream_transport_doh_unreachable),
+        cmocka_unit_test(test_upstream_transport_doh_slow_response_within_budget),
         cmocka_unit_test(test_upstream_transport_doh_http1_runtime_stats),
 #endif
 #if UPSTREAM_DOT_ENABLED
