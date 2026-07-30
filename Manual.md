@@ -230,6 +230,9 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_doh_protocol_upgrade_probes_total` | counter | `result` | Upgrade probe outcome. |
 | `dns_encrypted_proxy_upstream_doh_forced_http_tier` | gauge | `host` | Currently forced tier (0=h3, 1=h2, 2=h1). |
 | `dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds` | gauge | `host` | Time until next upgrade probe. |
+| `dns_encrypted_proxy_upstream_doh_h3_consecutive_failures` | gauge | `upstream` | Consecutive h3 failures; any downgrade pin out of h3 engages at the threshold (3). |
+| `dns_encrypted_proxy_upstream_doh_attempt_failures_total` | counter | `upstream`, `tier`, `class` | Per-attempt failures by protocol tier and failure class. |
+| `dns_encrypted_proxy_upstream_doh_slow_retries_total` | counter | `upstream`, `result` | Full-remaining-budget retries after a timed-out attempt whose request reached the upstream (slow answer, not broken transport). `result` is attempt / success. |
 
 ### 5.5 Bootstrap stages
 

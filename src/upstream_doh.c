@@ -15,14 +15,27 @@
 #include <string.h>
 #include <time.h>
 
-#define DOH_MIN_ATTEMPT_TIMEOUT_MS 200
+/* Floor for a single attempt's timeout. Splitting the per-server budget
+ * across the full route x tier ladder used to hand out slices as small as
+ * ~277 ms, which is below the time a recursive upstream needs to resolve a
+ * cold domain with a chained delegation - every slice timed out even though
+ * both the network and the upstream were fine. 800 ms covers handshake plus
+ * typical cold-recursion latency; the ladder simply runs fewer attempts
+ * within the same total budget. */
+#define DOH_MIN_ATTEMPT_TIMEOUT_MS 800
+/* Minimum leftover budget worth spending on the slow-response retry. Below
+ * this the retry could only succeed on an upstream cache hit primed by the
+ * failed attempt, which the regular tail attempts already cover. */
+#define DOH_SLOW_RETRY_MIN_TIMEOUT_MS 100
 #define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
 #define DOH_UPGRADE_BACKOFF_BASE_MS (10ULL * 60ULL * 1000ULL)
 #define DOH_UPGRADE_BACKOFF_MAX_MS (6ULL * 60ULL * 60ULL * 1000ULL)
-/* Number of consecutive h3 attempt failures required before pinning to h2.
- * Until the threshold is met, h3 is retried first on every call and h2 is
- * used only as the in-call fallback. Prevents a single transient h3 blip
- * (UDP packet drop, brief firewall flap) from costing the long backoff. */
+/* Number of consecutive h3 attempt failures required before a pin out of h3
+ * (to h2 or h1) engages. Until the threshold is met, h3 is retried first on
+ * every call and the lower tiers are used only as the in-call fallback.
+ * Prevents a single transient h3 blip (UDP packet drop, brief firewall
+ * flap, one slow query sneaking past the slow-response classifier) from
+ * costing the long upgrade backoff. */
 #define DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD 3
 
 typedef enum {
@@ -60,6 +73,10 @@ typedef struct {
     int attempt_tier;
     int used_override_v4;
     uint32_t override_addr_v4_be;
+    /* Nonzero when the HTTP request went out on the wire (connection and
+     * handshake completed). Distinguishes "upstream reachable but slow to
+     * answer" from "transport never came up" on timeout. */
+    int request_sent;
 } doh_attempt_error_t;
 
 static void format_ipv4(uint32_t addr_v4_be, char *out, size_t out_len) {
@@ -194,7 +211,7 @@ static void log_doh_attempt_failure_impl(
     logger_logf(
         caller_func,
         "WARN",
-        "DoH %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=curl=%d(%s),http=%ld,body_len=%zu",
+        "DoH %s failed: host=%s reason=%s timeout_ms=%d override_ip=%s detail=curl=%d(%s),http=%ld,body_len=%zu,sent=%d",
         phase,
         server->host,
         reason,
@@ -203,7 +220,8 @@ static void log_doh_attempt_failure_impl(
         (int)err->curl_rc,
         doh_curl_code_string(err->curl_rc),
         err->http_status,
-        err->response_len);
+        err->response_len,
+        err->request_sent);
 
     if (err->attempt_tier >= 0) {
         logger_logf(
@@ -515,6 +533,13 @@ static int doh_post_with_handle(
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     long http_version = 0;
     (void)curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
+    /* PRETRANSFER_TIME is set once the request is about to be sent, i.e.
+     * after connect + TLS/QUIC handshake on fresh connections and near-zero
+     * but nonzero on reused ones. It stays 0.0 when the transfer never got
+     * past connecting, which is the signature of a genuine transport
+     * failure rather than a slow upstream answer. */
+    double pretransfer_s = 0.0;
+    (void)curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME, &pretransfer_s);
 
     curl_slist_free_all(headers);
     if (resolve != NULL) {
@@ -525,6 +550,7 @@ static int doh_post_with_handle(
         err_out->curl_rc = rc;
         err_out->http_status = status;
         err_out->response_len = response.len;
+        err_out->request_sent = (pretransfer_s > 0.0) || status != 0 || response.len > 0;
     }
 
     /* Empty body is treated as transport failure for resolver semantics. */
@@ -718,8 +744,13 @@ int upstream_doh_resolve(
     upstream_failure_class_t final_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
     doh_http_tier_t successful_tier = DOH_HTTP_TIER_H3;
     int h3_was_attempted = (top_tier == DOH_HTTP_TIER_H3) ? 1 : 0;
+    int slow_response = 0;
+    doh_http_tier_t slow_tier = DOH_HTTP_TIER_H3;
+    int slow_use_override_v4 = 0;
+    uint32_t slow_override_addr_v4_be = 0;
+    const char *slow_phase = "primary request";
 
-    for (int route = 0; route < route_count && result != 0; route++) {
+    for (int route = 0; route < route_count && result != 0 && !slow_response; route++) {
         int use_override_v4 = 0;
         uint32_t override_addr_v4_be = 0;
         const char *phase = "primary request";
@@ -779,9 +810,61 @@ int upstream_doh_resolve(
             }
             final_failure_class = attempt_class;
             server->stage.last_failure_class = (int)final_failure_class;
+
+            if (attempt_err.curl_rc == CURLE_OPERATION_TIMEDOUT && attempt_err.request_sent) {
+                /* The request reached the upstream; the answer was just
+                 * slower than this attempt's slice. Laddering down tiers or
+                 * switching routes re-asks the same slow question with even
+                 * less time, so stop the ladder and give the remaining
+                 * budget to one retry on the same tier below. */
+                slow_response = 1;
+                slow_tier = tier;
+                slow_use_override_v4 = use_override_v4;
+                slow_override_addr_v4_be = override_addr_v4_be;
+                slow_phase = phase;
+                break;
+            }
         }
     }
-    
+
+    if (result != 0 && slow_response) {
+        int retry_timeout_ms = next_attempt_timeout_ms(deadline_ms, 1);
+        if (retry_timeout_ms >= DOH_SLOW_RETRY_MIN_TIMEOUT_MS) {
+            __atomic_add_fetch(&server->stage.doh_slow_retry_attempt_total, 1, __ATOMIC_RELAXED);
+            result = doh_post_with_handle(
+                client,
+                curl,
+                server,
+                slow_tier,
+                slow_use_override_v4,
+                slow_override_addr_v4_be,
+                retry_timeout_ms,
+                query,
+                query_len,
+                &response,
+                &response_len,
+                &attempt_err);
+            if (result == 0) {
+                successful_tier = slow_tier;
+                __atomic_add_fetch(&server->stage.doh_slow_retry_success_total, 1, __ATOMIC_RELAXED);
+                LOGF_INFO(
+                    "DoH slow-response retry succeeded: host=%s protocol=%s timeout_ms=%d",
+                    server->host,
+                    doh_tier_name(slow_tier),
+                    retry_timeout_ms);
+            } else {
+                LOG_DOH_ATTEMPT_FAILURE(slow_phase, server, &attempt_err);
+                upstream_failure_class_t attempt_class = doh_failure_class(attempt_err.curl_rc, attempt_err.http_status, attempt_err.response_len);
+                if ((int)slow_tier >= 0 && (int)slow_tier < DOH_HTTP_TIER_COUNT &&
+                    (int)attempt_class >= 0 && (int)attempt_class < UPSTREAM_FAILURE_CLASS_COUNT) {
+                    __atomic_add_fetch(&server->stage.doh_attempt_failures_total[(int)slow_tier][(int)attempt_class], 1, __ATOMIC_RELAXED);
+                }
+                final_failure_class = attempt_class;
+                server->stage.last_failure_class = (int)final_failure_class;
+            }
+        }
+    }
+
     pool_release(client, slot);
     
     if (result != 0) {
@@ -815,10 +898,14 @@ int upstream_doh_resolve(
             server->stage.doh_h3_consecutive_failures++;
         }
     }
-    int h3_to_h2_pin_gated = (forced_tier == DOH_HTTP_TIER_H3 &&
-                              successful_tier == DOH_HTTP_TIER_H2 &&
-                              server->stage.doh_h3_consecutive_failures < DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD);
-    if (successful_tier > forced_tier && !h3_to_h2_pin_gated) {
+    /* Any pin out of h3 (to h2 or h1) waits for the consecutive-failure
+     * threshold. Production showed single-call h3+h2 timeouts are usually a
+     * slow query, not a broken transport, so "both layers failed in one
+     * call" is not the strong h1-pin signal it was assumed to be. */
+    int h3_pin_gated = (forced_tier == DOH_HTTP_TIER_H3 &&
+                        successful_tier > DOH_HTTP_TIER_H3 &&
+                        server->stage.doh_h3_consecutive_failures < DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD);
+    if (successful_tier > forced_tier && !h3_pin_gated) {
         if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H2) {
             __atomic_add_fetch(&server->stage.doh_downgrade_h3_to_h2_total, 1, __ATOMIC_RELAXED);
         } else if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H1) {
@@ -833,10 +920,10 @@ int upstream_doh_resolve(
         server->stage.doh_upgrade_retry_after_ms =
             now + doh_upgrade_backoff_ms(server->stage.doh_upgrade_failures);
         LOGF_WARN(
-            "DoH protocol downgrade pinned: host=%s forced=%s retry_after_ms=%llu failures=%u",
+            "DoH protocol downgrade pinned: host=%s forced=%s retry_in_ms=%llu failures=%u",
             server->host,
             doh_tier_name(successful_tier),
-            (unsigned long long)server->stage.doh_upgrade_retry_after_ms,
+            (unsigned long long)(server->stage.doh_upgrade_retry_after_ms - now),
             (unsigned)server->stage.doh_upgrade_failures);
     } else if (attempted_upgrade && successful_tier < forced_tier) {
         __atomic_add_fetch(&server->stage.doh_upgrade_probe_attempt_total, 1, __ATOMIC_RELAXED);

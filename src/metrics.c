@@ -224,10 +224,12 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                 "# TYPE dns_encrypted_proxy_upstream_doh_forced_http_tier gauge\n"
                 "# HELP dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds Remaining wait before next DoH protocol upgrade probe for upstream.\n"
                 "# TYPE dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds gauge\n"
-                "# HELP dns_encrypted_proxy_upstream_doh_h3_consecutive_failures Consecutive h3 attempt failures for upstream; pin to h2 engages at threshold.\n"
+                "# HELP dns_encrypted_proxy_upstream_doh_h3_consecutive_failures Consecutive h3 attempt failures for upstream; downgrade pin engages at threshold.\n"
                 "# TYPE dns_encrypted_proxy_upstream_doh_h3_consecutive_failures gauge\n"
                 "# HELP dns_encrypted_proxy_upstream_doh_attempt_failures_total Per-attempt DoH failures broken down by protocol tier and failure class.\n"
-                "# TYPE dns_encrypted_proxy_upstream_doh_attempt_failures_total counter\n") != 0) {
+                "# TYPE dns_encrypted_proxy_upstream_doh_attempt_failures_total counter\n"
+                "# HELP dns_encrypted_proxy_upstream_doh_slow_retries_total Full-remaining-budget DoH retries after a slow-response timeout classification.\n"
+                "# TYPE dns_encrypted_proxy_upstream_doh_slow_retries_total counter\n") != 0) {
         return -1;
     }
 
@@ -285,6 +287,26 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     escaped_url,
                     upstream_protocol_label(server->type),
                     (unsigned)server->stage.doh_h3_consecutive_failures)
+                != 0) {
+                return -1;
+            }
+
+            uint64_t slow_retry_attempts =
+                __atomic_load_n(&server->stage.doh_slow_retry_attempt_total, __ATOMIC_RELAXED);
+            uint64_t slow_retry_successes =
+                __atomic_load_n(&server->stage.doh_slow_retry_success_total, __ATOMIC_RELAXED);
+            if (appendf(
+                    out,
+                    out_size,
+                    offset,
+                    "dns_encrypted_proxy_upstream_doh_slow_retries_total{upstream=\"%s\",protocol=\"%s\",result=\"attempt\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_doh_slow_retries_total{upstream=\"%s\",protocol=\"%s\",result=\"success\"} %llu\n",
+                    escaped_url,
+                    upstream_protocol_label(server->type),
+                    (unsigned long long)slow_retry_attempts,
+                    escaped_url,
+                    upstream_protocol_label(server->type),
+                    (unsigned long long)slow_retry_successes)
                 != 0) {
                 return -1;
             }

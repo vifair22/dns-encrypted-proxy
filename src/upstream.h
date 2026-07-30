@@ -73,6 +73,12 @@ typedef struct {
     uint64_t doh_upgrade_probe_success_total;
     uint64_t doh_upgrade_probe_failure_total;
 
+    /* Full-remaining-budget retries issued after a timed-out attempt whose
+     * request had reached the upstream (slow answer, not broken transport).
+     * Updated atomically. */
+    uint64_t doh_slow_retry_attempt_total;
+    uint64_t doh_slow_retry_success_total;
+
     /* Per-tier per-class attempt failure counts. Indexed [tier][class] using
      * doh_http_tier_t and upstream_failure_class_t. Updated atomically. */
     uint64_t doh_attempt_failures_total[DOH_HTTP_TIER_COUNT][UPSTREAM_FAILURE_CLASS_COUNT];
