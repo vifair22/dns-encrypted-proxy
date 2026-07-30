@@ -37,6 +37,7 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.upstream_timeout_ms, 2500);
     assert_int_equal(config.upstream_pool_size, 6);
     assert_int_equal(config.cache_capacity, 1024);
+    assert_int_equal(config.failure_cache_ttl_seconds, 30);
     assert_int_equal(config.tcp_idle_timeout_ms, 10000);
     assert_int_equal(config.tcp_max_clients, 256);
     assert_int_equal(config.tcp_max_queries_per_conn, 0);
@@ -77,6 +78,7 @@ static void test_config_file_parse(void **state) {
         "upstream_timeout_ms=5000\n"
         "upstream_pool_size=10\n"
         "cache_capacity=2048\n"
+        "failure_cache_ttl_seconds=60\n"
         "upstreams=https://custom.dns/query\n"
         "tcp_idle_timeout_ms=30000\n"
         "tcp_max_clients=512\n"
@@ -97,6 +99,7 @@ static void test_config_file_parse(void **state) {
     assert_int_equal(config.upstream_timeout_ms, 5000);
     assert_int_equal(config.upstream_pool_size, 10);
     assert_int_equal(config.cache_capacity, 2048);
+    assert_int_equal(config.failure_cache_ttl_seconds, 60);
     assert_int_equal(config.tcp_idle_timeout_ms, 30000);
     assert_int_equal(config.tcp_max_clients, 512);
     assert_int_equal(config.tcp_max_queries_per_conn, 100);
@@ -264,6 +267,36 @@ static void test_config_validation_invalid_port(void **state) {
 /*
  * Test: DNS_ENCRYPTED_PROXY_CONFIG environment variable for config path
  */
+static void test_config_failure_cache_ttl_clamp(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    /* File value above the RFC 2308 5-minute cap clamps to 300. */
+    char *temp_file = create_temp_file("failure_cache_ttl_seconds=9999\n");
+    assert_non_null(temp_file);
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, temp_file), PROXY_OK);
+    assert_int_equal(config.failure_cache_ttl_seconds, 300);
+    remove_temp_file(temp_file);
+
+    /* 0 disables failure caching. */
+    temp_file = create_temp_file("failure_cache_ttl_seconds=0\n");
+    assert_non_null(temp_file);
+    assert_int_equal(config_load(&config, temp_file), PROXY_OK);
+    assert_int_equal(config.failure_cache_ttl_seconds, 0);
+    remove_temp_file(temp_file);
+
+    /* Env override wins over the file value and clamps the same way. */
+    temp_file = create_temp_file("failure_cache_ttl_seconds=45\n");
+    assert_non_null(temp_file);
+    setenv("FAILURE_CACHE_TTL_SECONDS", "600", 1);
+    assert_int_equal(config_load(&config, temp_file), PROXY_OK);
+    assert_int_equal(config.failure_cache_ttl_seconds, 300);
+    unsetenv("FAILURE_CACHE_TTL_SECONDS");
+    remove_temp_file(temp_file);
+}
+
 static void test_config_env_config_path(void **state) {
     (void)state;
     
@@ -532,6 +565,7 @@ int main(void) {
         cmocka_unit_test(test_config_defaults),
         cmocka_unit_test(test_config_file_parse),
         cmocka_unit_test(test_config_env_override),
+        cmocka_unit_test(test_config_failure_cache_ttl_clamp),
         cmocka_unit_test(test_config_multiple_upstreams),
         cmocka_unit_test(test_config_whitespace_comments),
         cmocka_unit_test(test_config_invalid_integers),

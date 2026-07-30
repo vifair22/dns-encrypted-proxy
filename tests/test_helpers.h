@@ -56,6 +56,7 @@ static inline void clear_config_env_vars(void) {
     unsetenv("UPSTREAM_TIMEOUT_MS");
     unsetenv("UPSTREAM_POOL_SIZE");
     unsetenv("CACHE_CAPACITY");
+    unsetenv("FAILURE_CACHE_TTL_SECONDS");
     unsetenv("UPSTREAMS");
     unsetenv("TCP_IDLE_TIMEOUT_MS");
     unsetenv("TCP_MAX_CLIENTS");

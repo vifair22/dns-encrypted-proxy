@@ -59,6 +59,12 @@ typedef struct {
     uint64_t iterative_last_attempt_ms;
 
     int last_failure_class;
+    /* Set when the last resolve failed as a "slow response": the request
+     * reached the upstream over a working transport but the answer did not
+     * arrive within budget (or no attempt could run at all). Such failures
+     * are evidence about the query, not the server, and are excluded from
+     * health accounting. */
+    int last_failure_slow_response;
     uint64_t transport_retry_suppress_until_ms;
 
     uint8_t doh_forced_http_tier;

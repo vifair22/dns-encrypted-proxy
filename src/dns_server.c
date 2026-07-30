@@ -24,6 +24,7 @@
 
 #define DNS_MAX_MESSAGE_SIZE 65535
 #define CACHE_KEY_MAX_SIZE 4096
+#define FAILURE_CACHE_CAPACITY 512
 
 typedef struct {
     proxy_server_t *server;
@@ -204,12 +205,13 @@ static int dns_find_query_opt(const uint8_t *query, size_t query_len, size_t *op
     return -1;
 }
 
-static int dns_extract_single_question_name_a(
+static int dns_extract_single_question_name_addr(
     const uint8_t *query,
     size_t query_len,
     char *name_out,
     size_t name_out_len,
-    size_t *question_end_out) {
+    size_t *question_end_out,
+    uint16_t *qtype_out) {
     if (query == NULL || query_len < 12 || name_out == NULL || name_out_len == 0 || question_end_out == NULL) {
         return -1;
     }
@@ -259,12 +261,15 @@ static int dns_extract_single_question_name_a(
 
     uint16_t qtype = read_u16(query + offset);
     uint16_t qclass = read_u16(query + offset + 2);
-    if (qtype != 1 || qclass != 1) {
+    if (qclass != 1) {
         return -1;
     }
 
     name_out[out_len] = '\0';
     *question_end_out = offset + 4;
+    if (qtype_out != NULL) {
+        *qtype_out = qtype;
+    }
     return 0;
 }
 
@@ -280,7 +285,9 @@ static int build_hosts_a_response(
 
     size_t question_end = 0;
     char unused_name[256];
-    if (dns_extract_single_question_name_a(query, query_len, unused_name, sizeof(unused_name), &question_end) != 0) {
+    uint16_t qtype = 0;
+    if (dns_extract_single_question_name_addr(query, query_len, unused_name, sizeof(unused_name), &question_end, &qtype) != 0 ||
+        qtype != 1) {
         return -1;
     }
 
@@ -328,7 +335,77 @@ static int build_hosts_a_response(
     return 0;
 }
 
-static int build_servfail_response(const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
+/* NODATA (NOERROR, zero answers) for any non-A query on names we hold local
+ * A data for - standard hosts semantics (dnsmasq host-record does the same).
+ * Forwarding AAAA/HTTPS/TXT/... upstream would split authority for the name
+ * and keep the upstream dependency the override exists to remove. */
+static int build_hosts_nodata_response(
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    if (query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL) {
+        return -1;
+    }
+
+    size_t question_end = 0;
+    char unused_name[256];
+    if (dns_extract_single_question_name_addr(query, query_len, unused_name, sizeof(unused_name), &question_end, NULL) != 0) {
+        return -1;
+    }
+
+    size_t question_len = question_end - 12;
+    size_t opt_start = 0;
+    size_t opt_end = 0;
+    int has_opt = (dns_find_query_opt(query, query_len, &opt_start, &opt_end) == 0);
+    size_t opt_len = has_opt ? (opt_end - opt_start) : 0;
+
+    size_t response_len = 12 + question_len + opt_len;
+    uint8_t *response = calloc(1, response_len);
+    if (response == NULL) {
+        return -1;
+    }
+
+    response[0] = query[0];
+    response[1] = query[1];
+
+    uint16_t query_flags = read_u16(query + 2);
+    uint16_t response_flags = (uint16_t)(0x8000u | (query_flags & 0x7800u) | (query_flags & 0x0100u) | (query_flags & 0x0010u) | 0x0080u);
+    write_u16(response + 2, response_flags);
+    write_u16(response + 4, 1);
+    write_u16(response + 6, 0);
+    write_u16(response + 8, 0);
+    write_u16(response + 10, has_opt ? 1 : 0);
+
+    memcpy(response + 12, query + 12, question_len);
+
+    if (has_opt) {
+        memcpy(response + 12 + question_len, query + opt_start, opt_len);
+    }
+
+    *response_out = response;
+    *response_len_out = response_len;
+    return 0;
+}
+
+/* RFC 8914 Extended DNS Errors attached to proxy-synthesized SERVFAILs so a
+ * plain dig against the proxy explains the failure instead of a bare rcode. */
+#define DNS_EDE_OPTION_CODE 15
+#define DNS_EDE_NO_REACHABLE_AUTHORITY 22
+#define DNS_EDE_NETWORK_ERROR 23
+
+static const char *ede_extra_text(int ede_info_code) {
+    switch (ede_info_code) {
+        case DNS_EDE_NO_REACHABLE_AUTHORITY:
+            return "no upstream answer within budget";
+        case DNS_EDE_NETWORK_ERROR:
+            return "upstream transport failed";
+        default:
+            return "";
+    }
+}
+
+static int build_servfail_response(const uint8_t *query, size_t query_len, int ede_info_code, uint8_t **response_out, size_t *response_len_out) {
     if (query_len < 12 || response_out == NULL || response_len_out == NULL) {
         return -1;
     }
@@ -342,7 +419,16 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     int has_opt = (dns_find_query_opt(query, query_len, &opt_start, &opt_end) == 0);
     size_t opt_len = has_opt ? (opt_end - opt_start) : 0;
 
-    size_t response_len = 12 + question_len + opt_len;
+    /* EDE rides in the echoed OPT; a client that did not signal EDNS gets a
+     * plain SERVFAIL (RFC 6891: never send OPT unsolicited). */
+    size_t ede_text_len = 0;
+    size_t ede_opt_len = 0;
+    if (has_opt && ede_info_code >= 0) {
+        ede_text_len = strlen(ede_extra_text(ede_info_code));
+        ede_opt_len = 4 + 2 + ede_text_len;
+    }
+
+    size_t response_len = 12 + question_len + opt_len + ede_opt_len;
     uint8_t *response = calloc(1, response_len);
     if (response == NULL) {
         return -1;
@@ -372,7 +458,30 @@ static int build_servfail_response(const uint8_t *query, size_t query_len, uint8
     }
 
     if (has_opt) {
-        memcpy(response + 12 + question_len, query + opt_start, opt_len);
+        size_t resp_opt = 12 + question_len;
+        memcpy(response + resp_opt, query + opt_start, opt_len);
+
+        if (ede_opt_len > 0) {
+            /* The copied OPT's RDATA ends exactly at the copy's end, so the
+             * EDE option appends directly after it; only RDLENGTH needs a
+             * patch. Locate RDLENGTH by walking the copied record. */
+            size_t p = resp_opt;
+            if (dns_skip_name_wire(response, response_len, &p) != 0 || p + 10 > resp_opt + opt_len) {
+                free(response);
+                return -1;
+            }
+            size_t rdlength_pos = p + 8;
+            uint16_t rdlength = read_u16(response + rdlength_pos);
+
+            size_t ede_pos = resp_opt + opt_len;
+            write_u16(response + ede_pos, DNS_EDE_OPTION_CODE);
+            write_u16(response + ede_pos + 2, (uint16_t)(2 + ede_text_len));
+            write_u16(response + ede_pos + 4, (uint16_t)ede_info_code);
+            if (ede_text_len > 0) {
+                memcpy(response + ede_pos + 6, ede_extra_text(ede_info_code), ede_text_len);
+            }
+            write_u16(response + rdlength_pos, (uint16_t)(rdlength + ede_opt_len));
+        }
     }
 
     *response_out = response;
@@ -615,6 +724,26 @@ finalize:
     return 0;
 }
 
+/* Pick the RFC 8914 info-code for a just-failed resolution from the failure
+ * evidence on each upstream. The stage state is shared across in-flight
+ * queries, so this reads the most recent verdicts - for the resolve that
+ * just failed those are almost always its own outcome, and the code is
+ * diagnostic metadata, not protocol state, so a rare race is harmless. */
+static int servfail_ede_code(const upstream_client_t *upstream) {
+    int saw_failure = 0;
+    for (int i = 0; i < upstream->server_count; i++) {
+        const upstream_server_t *s = &upstream->servers[i];
+        if (s->stage.last_failure_slow_response) {
+            /* Upstream transport worked; the resolution beyond it did not. */
+            return DNS_EDE_NO_REACHABLE_AUTHORITY;
+        }
+        if (s->stage.last_failure_class != UPSTREAM_FAILURE_CLASS_UNKNOWN) {
+            saw_failure = 1;
+        }
+    }
+    return saw_failure ? DNS_EDE_NETWORK_ERROR : -1;
+}
+
 static int process_query(proxy_server_t *server, const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
     if (server == NULL || query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL) {
         return -1;
@@ -633,11 +762,18 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     char qname[256];
     size_t question_end = 0;
-    if (dns_extract_single_question_name_a(query, query_len, qname, sizeof(qname), &question_end) == 0) {
+    uint16_t hosts_qtype = 0;
+    if (dns_extract_single_question_name_addr(query, query_len, qname, sizeof(qname), &question_end, &hosts_qtype) == 0) {
         uint32_t addr_v4_be = 0;
         if (config_lookup_hosts_a(&server->config, qname, &addr_v4_be)) {
-            if (build_hosts_a_response(query, query_len, addr_v4_be, response_out, response_len_out) == 0) {
-                return 0;
+            if (hosts_qtype == 1) {
+                if (build_hosts_a_response(query, query_len, addr_v4_be, response_out, response_len_out) == 0) {
+                    return 0;
+                }
+            } else {
+                if (build_hosts_nodata_response(query, query_len, response_out, response_len_out) == 0) {
+                    return 0;
+                }
             }
         }
     }
@@ -649,7 +785,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
      */
     if (!key_ok) {
         atomic_fetch_add(&server->metrics.servfail_sent, 1);
-        if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
+        if (build_servfail_response(query, query_len, -1, response_out, response_len_out) != 0) {
             RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "invalid_query_len=%zu", query_len);
             return -1;
         }
@@ -658,6 +794,16 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     if (dns_cache_lookup(&server->cache, key, key_len, request_id, response_out, response_len_out)) {
         atomic_fetch_add(&server->metrics.cache_hits, 1);
+        return 0;
+    }
+
+    /* RFC 2308 7.1: a recently failed question answers SERVFAIL from cache
+     * instead of re-burning the full upstream budget on a name that is
+     * known to be unresolvable right now. */
+    if (server->config.failure_cache_ttl_seconds > 0 &&
+        dns_cache_lookup(&server->failure_cache, key, key_len, request_id, response_out, response_len_out)) {
+        atomic_fetch_add(&server->metrics.failure_cache_hits, 1);
+        atomic_fetch_add(&server->metrics.servfail_sent, 1);
         return 0;
     }
     atomic_fetch_add(&server->metrics.cache_misses, 1);
@@ -697,9 +843,19 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     atomic_fetch_add(&server->metrics.upstream_failures, 1);
     atomic_fetch_add(&server->metrics.servfail_sent, 1);
-    if (build_servfail_response(query, query_len, response_out, response_len_out) != 0) {
+    if (build_servfail_response(query, query_len, servfail_ede_code(&server->upstream), response_out, response_len_out) != 0) {
         RECORD_INTERNAL_ERROR(server, "servfail_build_failed", "query_len=%zu", query_len);
         return -1;
+    }
+
+    if (server->config.failure_cache_ttl_seconds > 0) {
+        dns_cache_store(
+            &server->failure_cache,
+            key,
+            key_len,
+            *response_out,
+            *response_len_out,
+            (uint32_t)server->config.failure_cache_ttl_seconds);
     }
     return 0;
 }
@@ -840,7 +996,7 @@ static void *udp_loop(void *arg) {
                     free(response);
                     response = NULL;
                     response_len = 0;
-                    if (build_servfail_response(buffer, (size_t)n, &response, &response_len) != 0) {
+                    if (build_servfail_response(buffer, (size_t)n, -1, &response, &response_len) != 0) {
                         RECORD_INTERNAL_ERROR(server, "truncation_and_servfail_build_failed", "udp_limit=%zu response_len=%zu", udp_limit, response_len);
                         continue;
                     }
@@ -1114,7 +1270,15 @@ proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *c
     if (cache_rc != PROXY_OK) {
         return cache_rc;
     }
-    
+
+    /* Failure-cache entries are tiny (header-only SERVFAILs) and short-lived,
+     * so a small fixed capacity bounds memory without a config knob. */
+    proxy_status_t failure_cache_rc = dns_cache_init(&server->failure_cache, FAILURE_CACHE_CAPACITY);
+    if (failure_cache_rc != PROXY_OK) {
+        dns_cache_destroy(&server->cache);
+        return failure_cache_rc;
+    }
+
     /* Initialize upstream client */
     const char *urls[MAX_UPSTREAMS];
     for (int i = 0; i < config->upstream_count; i++) {
@@ -1134,6 +1298,7 @@ proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *c
     
     proxy_status_t upstream_rc = upstream_client_init(&server->upstream, urls, config->upstream_count, &upstream_cfg);
     if (upstream_rc != PROXY_OK) {
+        dns_cache_destroy(&server->failure_cache);
         dns_cache_destroy(&server->cache);
         return upstream_rc;
     }
@@ -1143,6 +1308,7 @@ proxy_status_t proxy_server_init(proxy_server_t *server, const proxy_config_t *c
     proxy_status_t facilitator_rc = upstream_facilitator_init(&server->upstream_facilitator, &server->upstream);
     if (facilitator_rc != PROXY_OK) {
         upstream_client_destroy(&server->upstream);
+        dns_cache_destroy(&server->failure_cache);
         dns_cache_destroy(&server->cache);
         return facilitator_rc;
     }
@@ -1166,6 +1332,7 @@ void proxy_server_destroy(proxy_server_t *server) {
     
     upstream_facilitator_destroy(&server->upstream_facilitator);
     upstream_client_destroy(&server->upstream);
+    dns_cache_destroy(&server->failure_cache);
     dns_cache_destroy(&server->cache);
     memset(server, 0, sizeof(*server));
 }

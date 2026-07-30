@@ -27,6 +27,9 @@ typedef struct {
     int max_inflight_dot;
     int max_inflight_doq;
     int cache_capacity;
+    /* RFC 2308 7.1 failure caching: seconds a resolution failure (SERVFAIL)
+     * is cached per question. 0 disables; capped at 300 (the RFC maximum). */
+    int failure_cache_ttl_seconds;
     char upstream_urls[MAX_UPSTREAMS][MAX_URL_LEN];
     int upstream_count;
     char config_path[256];

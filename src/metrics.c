@@ -631,6 +631,9 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "# HELP dns_encrypted_proxy_cache_misses_total Total number of cache misses.\n"
             "# TYPE dns_encrypted_proxy_cache_misses_total counter\n"
             "dns_encrypted_proxy_cache_misses_total %llu\n"
+            "# HELP dns_encrypted_proxy_failure_cache_hits_total SERVFAILs answered from the RFC 2308 failure cache without an upstream attempt.\n"
+            "# TYPE dns_encrypted_proxy_failure_cache_hits_total counter\n"
+            "dns_encrypted_proxy_failure_cache_hits_total %llu\n"
             "# HELP dns_encrypted_proxy_upstream_success_total Total number of successful upstream resolutions.\n"
             "# TYPE dns_encrypted_proxy_upstream_success_total counter\n"
             "dns_encrypted_proxy_upstream_success_total %llu\n"
@@ -672,6 +675,7 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)atomic_load(&m->queries_tcp),
             (unsigned long long)atomic_load(&m->cache_hits),
             (unsigned long long)atomic_load(&m->cache_misses),
+            (unsigned long long)atomic_load(&m->failure_cache_hits),
             (unsigned long long)atomic_load(&m->upstream_success),
             (unsigned long long)atomic_load(&m->upstream_failures),
             (unsigned long long)atomic_load(&m->servfail_sent),

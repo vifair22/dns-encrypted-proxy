@@ -33,6 +33,14 @@ static size_t g_stub_cache_lookup_resp_len = 0;
 static int g_stub_upstream_rc = -1;
 static const uint8_t *g_stub_upstream_resp = NULL;
 static size_t g_stub_upstream_resp_len = 0;
+static int g_stub_upstream_resolve_calls = 0;
+/* When set, the dns_cache stubs treat this pointer as the failure cache and
+ * route lookups/stores through the g_stub_failure_cache_* controls. */
+static const void *g_stub_failure_cache_ptr = NULL;
+static int g_stub_failure_cache_lookup_hit = 0;
+static const uint8_t *g_stub_failure_cache_lookup_resp = NULL;
+static size_t g_stub_failure_cache_lookup_resp_len = 0;
+static int g_stub_failure_cache_store_calls = 0;
 static int g_stub_cacheable = 0;
 static int g_stub_ttl_ok = 0;
 static uint32_t g_stub_min_ttl = 0;
@@ -115,6 +123,12 @@ static void reset_stubs(void) {
     g_stub_upstream_rc = -1;
     g_stub_upstream_resp = NULL;
     g_stub_upstream_resp_len = 0;
+    g_stub_upstream_resolve_calls = 0;
+    g_stub_failure_cache_ptr = NULL;
+    g_stub_failure_cache_lookup_hit = 0;
+    g_stub_failure_cache_lookup_resp = NULL;
+    g_stub_failure_cache_lookup_resp_len = 0;
+    g_stub_failure_cache_store_calls = 0;
     g_stub_cacheable = 0;
     g_stub_ttl_ok = 0;
     g_stub_min_ttl = 0;
@@ -351,23 +365,26 @@ int dns_cache_lookup(
     const uint8_t request_id[2],
     uint8_t **response_out,
     size_t *response_len_out) {
-    (void)cache;
     (void)key;
     (void)key_len;
-    if (!g_stub_cache_lookup_hit) {
+    int is_failure_cache = (g_stub_failure_cache_ptr != NULL && (const void *)cache == g_stub_failure_cache_ptr);
+    int hit = is_failure_cache ? g_stub_failure_cache_lookup_hit : g_stub_cache_lookup_hit;
+    const uint8_t *resp = is_failure_cache ? g_stub_failure_cache_lookup_resp : g_stub_cache_lookup_resp;
+    size_t resp_len = is_failure_cache ? g_stub_failure_cache_lookup_resp_len : g_stub_cache_lookup_resp_len;
+    if (!hit) {
         return 0;
     }
-    if (response_out == NULL || response_len_out == NULL || g_stub_cache_lookup_resp == NULL || g_stub_cache_lookup_resp_len == 0) {
+    if (response_out == NULL || response_len_out == NULL || resp == NULL || resp_len == 0) {
         return 0;
     }
-    *response_out = malloc(g_stub_cache_lookup_resp_len);
+    *response_out = malloc(resp_len);
     if (*response_out == NULL) {
         return 0;
     }
-    memcpy(*response_out, g_stub_cache_lookup_resp, g_stub_cache_lookup_resp_len);
+    memcpy(*response_out, resp, resp_len);
     (*response_out)[0] = request_id[0];
     (*response_out)[1] = request_id[1];
-    *response_len_out = g_stub_cache_lookup_resp_len;
+    *response_len_out = resp_len;
     return 1;
 }
 
@@ -378,12 +395,15 @@ void dns_cache_store(
     const uint8_t *response,
     size_t response_len,
     uint32_t ttl_seconds) {
-    (void)cache;
     (void)key;
     (void)key_len;
     (void)response;
     (void)response_len;
     (void)ttl_seconds;
+    if (g_stub_failure_cache_ptr != NULL && (const void *)cache == g_stub_failure_cache_ptr) {
+        g_stub_failure_cache_store_calls++;
+        return;
+    }
     g_stub_cache_store_calls++;
 }
 
@@ -433,6 +453,7 @@ int upstream_facilitator_resolve(
     (void)facilitator;
     (void)query;
     (void)query_len;
+    g_stub_upstream_resolve_calls++;
     if (g_stub_upstream_rc != 0) {
         return -1;
     }
@@ -497,11 +518,29 @@ int dns_extract_question_key(const uint8_t *query, size_t query_len, uint8_t *ke
     return 0;
 }
 
+/* Mirrors the real parser's shape (walk QDCOUNT names + fixed fields) so
+ * EDNS queries do not leak the OPT record into the question length the way
+ * the old message_len-12 shortcut did. Compression is not needed for test
+ * fixtures. */
 int dns_question_section_length(const uint8_t *message, size_t message_len, size_t *section_len_out) {
     if (message == NULL || message_len < 12 || section_len_out == NULL) {
         return -1;
     }
-    *section_len_out = message_len - 12;
+    uint16_t qdcount = (uint16_t)((message[4] << 8) | message[5]);
+    size_t off = 12;
+    for (uint16_t i = 0; i < qdcount; i++) {
+        while (off < message_len && message[off] != 0 && (message[off] & 0xC0u) == 0) {
+            off += (size_t)message[off] + 1;
+        }
+        if (off >= message_len || message[off] != 0) {
+            return -1;
+        }
+        off += 1 + 4;
+        if (off > message_len) {
+            return -1;
+        }
+    }
+    *section_len_out = off - 12;
     return 0;
 }
 
@@ -602,6 +641,7 @@ static void test_servfail_and_truncated_builders(void **state) {
         build_servfail_response(
             DNS_QUERY_WWW_EXAMPLE_COM_A,
             DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            -1,
             &servfail,
             &servfail_len),
         0);
@@ -756,6 +796,134 @@ static void test_process_query_branches(void **state) {
     assert_true((uint64_t)atomic_load(&server.metrics.servfail_sent) >= 1);
 }
 
+static void test_build_servfail_ede(void **state) {
+    (void)state;
+    reset_stubs();
+
+    /* EDNS query: SERVFAIL carries the echoed OPT extended with an RFC 8914
+     * EDE option; RDLENGTH is patched to cover it. */
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(
+        build_servfail_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            DNS_EDE_NO_REACHABLE_AUTHORITY,
+            &resp,
+            &resp_len),
+        0);
+    assert_non_null(resp);
+
+    /* ARCOUNT == 1 and the OPT record is present. */
+    assert_int_equal((int)((resp[10] << 8) | resp[11]), 1);
+    size_t opt_start = 0;
+    size_t opt_end = 0;
+    assert_int_equal(dns_find_opt_record(resp, resp_len, &opt_start, &opt_end), 0);
+    assert_int_equal(opt_end, resp_len);
+
+    /* Walk to RDATA: root name (1) + type (2) + class (2) + ttl (4) + rdlength (2). */
+    assert_int_equal(resp[opt_start], 0x00);
+    uint16_t rdlength = (uint16_t)((resp[opt_start + 9] << 8) | resp[opt_start + 10]);
+    size_t rdata = opt_start + 11;
+    assert_int_equal(rdata + rdlength, resp_len);
+
+    /* The fixture OPT has empty RDATA, so the EDE option is the whole RDATA:
+     * option-code 15, option-length 2 + text, info-code, EXTRA-TEXT. */
+    const char *text = "no upstream answer within budget";
+    assert_int_equal(rdlength, 4 + 2 + strlen(text));
+    assert_int_equal((int)((resp[rdata] << 8) | resp[rdata + 1]), DNS_EDE_OPTION_CODE);
+    assert_int_equal((int)((resp[rdata + 2] << 8) | resp[rdata + 3]), (int)(2 + strlen(text)));
+    assert_int_equal((int)((resp[rdata + 4] << 8) | resp[rdata + 5]), DNS_EDE_NO_REACHABLE_AUTHORITY);
+    assert_memory_equal(resp + rdata + 6, text, strlen(text));
+    free(resp);
+    resp = NULL;
+
+    /* ede_info_code=-1 leaves the echoed OPT untouched (old behavior). */
+    assert_int_equal(
+        build_servfail_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
+            -1,
+            &resp,
+            &resp_len),
+        0);
+    assert_int_equal(dns_find_opt_record(resp, resp_len, &opt_start, &opt_end), 0);
+    rdlength = (uint16_t)((resp[opt_start + 9] << 8) | resp[opt_start + 10]);
+    assert_int_equal(rdlength, 0);
+    free(resp);
+    resp = NULL;
+
+    /* A non-EDNS query never gets an OPT, EDE requested or not (RFC 6891). */
+    assert_int_equal(
+        build_servfail_response(
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            DNS_EDE_NETWORK_ERROR,
+            &resp,
+            &resp_len),
+        0);
+    assert_int_equal((int)((resp[10] << 8) | resp[11]), 0);
+    assert_int_equal(dns_find_opt_record(resp, resp_len, &opt_start, &opt_end), -1);
+    free(resp);
+}
+
+static void test_process_query_failure_cache(void **state) {
+    (void)state;
+    reset_stubs();
+
+    proxy_server_t server;
+    memset(&server, 0, sizeof(server));
+    server.config.failure_cache_ttl_seconds = 30;
+    g_stub_failure_cache_ptr = &server.failure_cache;
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+
+    /* Upstream fails (stub default rc=-1): the synthesized SERVFAIL must be
+     * stored in the failure cache. */
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    out = NULL;
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal(g_stub_failure_cache_store_calls, 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.servfail_sent), 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.cache_misses), 1);
+
+    /* A repeat of the failing question answers from the failure cache: no
+     * upstream attempt, no cache-miss accounting, instant SERVFAIL. */
+    g_stub_failure_cache_lookup_hit = 1;
+    g_stub_failure_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_failure_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    out = NULL;
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.failure_cache_hits), 1);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.servfail_sent), 2);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.cache_misses), 1);
+
+    /* failure_cache_ttl_seconds=0 disables both lookup and store. */
+    reset_stubs();
+    proxy_server_t disabled;
+    memset(&disabled, 0, sizeof(disabled));
+    disabled.config.failure_cache_ttl_seconds = 0;
+    g_stub_failure_cache_ptr = &disabled.failure_cache;
+    g_stub_failure_cache_lookup_hit = 1;
+    g_stub_failure_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_failure_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+    assert_int_equal(process_query(&disabled, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal(g_stub_failure_cache_store_calls, 0);
+    assert_int_equal((uint64_t)atomic_load(&disabled.metrics.failure_cache_hits), 0);
+}
+
 static void test_proxy_server_init_and_socket_success_paths(void **state) {
     (void)state;
     reset_stubs();
@@ -825,7 +993,7 @@ static void test_dns_server_randomized_helper_exploration(void **state) {
 
         uint8_t *out = NULL;
         size_t out_len = 0;
-        (void)build_servfail_response(msg, len, &out, &out_len);
+        (void)build_servfail_response(msg, len, (int)(dns_server_next_rand() % 3) == 0 ? DNS_EDE_NETWORK_ERROR : -1, &out, &out_len);
         free(out);
 
         out = NULL;
@@ -981,8 +1149,8 @@ static void test_dns_server_additional_edge_paths(void **state) {
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(build_servfail_response(DNS_MALFORMED_SHORT_HEADER, DNS_MALFORMED_SHORT_HEADER_LEN, &resp, &resp_len), -1);
-    assert_int_equal(build_servfail_response(DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, NULL, &resp_len), -1);
+    assert_int_equal(build_servfail_response(DNS_MALFORMED_SHORT_HEADER, DNS_MALFORMED_SHORT_HEADER_LEN, -1, &resp, &resp_len), -1);
+    assert_int_equal(build_servfail_response(DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, -1, NULL, &resp_len), -1);
 
     proxy_server_t server;
     memset(&server, 0, sizeof(server));
@@ -1525,38 +1693,121 @@ static void test_dns_server_udp_loop_poll_and_process_fail_paths(void **state) {
     assert_int_equal((uint64_t)atomic_load(&server.metrics.queries_udp), 0);
 }
 
+static void test_hosts_override_aaaa_nodata(void **state) {
+    (void)state;
+    reset_stubs();
+
+    proxy_server_t server;
+    memset(&server, 0, sizeof(server));
+    metrics_init(&server.metrics);
+
+    g_stub_hosts_lookup_hit = 1;
+    g_stub_hosts_lookup_addr_be = htonl(0x01020304u);
+
+    /* Any non-A query for a name with a local A override answers NODATA
+     * locally: NOERROR, question echoed, zero answers, no upstream attempt.
+     * AAAA and HTTPS (type 65, constant Apple-device traffic) both covered. */
+    uint8_t aaaa_query[sizeof(DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS)];
+    memcpy(aaaa_query, DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS, sizeof(aaaa_query));
+    /* qtype sits 4 bytes before the OPT record (11 bytes) from the end. */
+    aaaa_query[sizeof(aaaa_query) - 11 - 4] = 0x00;
+    aaaa_query[sizeof(aaaa_query) - 11 - 3] = 0x1C;
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(process_query(&server, aaaa_query, sizeof(aaaa_query), &out, &out_len), 0);
+    assert_non_null(out);
+    assert_int_equal(g_stub_upstream_resolve_calls, 0);
+
+    uint16_t flags = (uint16_t)(((uint16_t)out[2] << 8) | out[3]);
+    assert_int_equal((flags & 0x000Fu), 0);
+    assert_int_equal((int)(((uint16_t)out[6] << 8) | out[7]), 0);
+    assert_int_equal((int)(((uint16_t)out[10] << 8) | out[11]), 1);
+
+    size_t r_opt_s = 0;
+    size_t r_opt_e = 0;
+    assert_int_equal(dns_find_opt_record(out, out_len, &r_opt_s, &r_opt_e), 0);
+    free(out);
+    out = NULL;
+
+    /* HTTPS (SVCB) query: same local NODATA. */
+    uint8_t https_query[sizeof(DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS)];
+    memcpy(https_query, DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS, sizeof(https_query));
+    https_query[sizeof(https_query) - 11 - 4] = 0x00;
+    https_query[sizeof(https_query) - 11 - 3] = 0x41;
+    assert_int_equal(process_query(&server, https_query, sizeof(https_query), &out, &out_len), 0);
+    assert_non_null(out);
+    assert_int_equal(g_stub_upstream_resolve_calls, 0);
+    assert_int_equal((int)(((uint16_t)out[6] << 8) | out[7]), 0);
+    free(out);
+    out = NULL;
+
+    /* Without an override the AAAA forwards upstream as before. */
+    g_stub_hosts_lookup_hit = 0;
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+    g_stub_upstream_rc = 0;
+    g_stub_upstream_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_upstream_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    assert_int_equal(process_query(&server, aaaa_query, sizeof(aaaa_query), &out, &out_len), 0);
+    assert_non_null(out);
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    free(out);
+}
+
 static void test_hosts_override_edns_and_parser_edges(void **state) {
     (void)state;
     reset_stubs();
 
     char name[256];
     size_t q_end = 0;
+    uint16_t parsed_qtype = 0;
     assert_int_equal(
-        dns_extract_single_question_name_a(
+        dns_extract_single_question_name_addr(
             DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS,
             DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS_LEN,
             name,
             sizeof(name),
-            &q_end),
+            &q_end,
+            &parsed_qtype),
         0);
     assert_string_equal(name, "www.example.com");
+    assert_int_equal(parsed_qtype, 1);
 
     uint8_t bad_qd[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
     memcpy(bad_qd, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_qd));
     bad_qd[4] = 0x00;
     bad_qd[5] = 0x02;
-    assert_int_equal(dns_extract_single_question_name_a(bad_qd, sizeof(bad_qd), name, sizeof(name), &q_end), -1);
+    assert_int_equal(dns_extract_single_question_name_addr(bad_qd, sizeof(bad_qd), name, sizeof(name), &q_end, NULL), -1);
 
-    uint8_t bad_qtype[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
-    memcpy(bad_qtype, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_qtype));
-    bad_qtype[sizeof(bad_qtype) - 4] = 0x00;
-    bad_qtype[sizeof(bad_qtype) - 3] = 0x1C;
-    assert_int_equal(dns_extract_single_question_name_a(bad_qtype, sizeof(bad_qtype), name, sizeof(name), &q_end), -1);
+    /* AAAA now parses (hosts overrides answer it with NODATA)... */
+    uint8_t aaaa_qtype[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
+    memcpy(aaaa_qtype, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(aaaa_qtype));
+    aaaa_qtype[sizeof(aaaa_qtype) - 4] = 0x00;
+    aaaa_qtype[sizeof(aaaa_qtype) - 3] = 0x1C;
+    assert_int_equal(dns_extract_single_question_name_addr(aaaa_qtype, sizeof(aaaa_qtype), name, sizeof(name), &q_end, &parsed_qtype), 0);
+    assert_int_equal(parsed_qtype, 28);
+
+    /* ...and so does any other qtype: override-owned names are answered
+     * locally for every type (NODATA when no local data exists). */
+    uint8_t mx_qtype[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
+    memcpy(mx_qtype, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(mx_qtype));
+    mx_qtype[sizeof(mx_qtype) - 4] = 0x00;
+    mx_qtype[sizeof(mx_qtype) - 3] = 0x0F;
+    assert_int_equal(dns_extract_single_question_name_addr(mx_qtype, sizeof(mx_qtype), name, sizeof(name), &q_end, &parsed_qtype), 0);
+    assert_int_equal(parsed_qtype, 15);
+
+    /* Non-IN classes are never treated as hosts material. */
+    uint8_t bad_qclass[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
+    memcpy(bad_qclass, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_qclass));
+    bad_qclass[sizeof(bad_qclass) - 2] = 0x00;
+    bad_qclass[sizeof(bad_qclass) - 1] = 0x03;
+    assert_int_equal(dns_extract_single_question_name_addr(bad_qclass, sizeof(bad_qclass), name, sizeof(name), &q_end, NULL), -1);
 
     uint8_t bad_label[DNS_QUERY_WWW_EXAMPLE_COM_A_LEN];
     memcpy(bad_label, DNS_QUERY_WWW_EXAMPLE_COM_A, sizeof(bad_label));
     bad_label[12] = 0xC0;
-    assert_int_equal(dns_extract_single_question_name_a(bad_label, sizeof(bad_label), name, sizeof(name), &q_end), -1);
+    assert_int_equal(dns_extract_single_question_name_addr(bad_label, sizeof(bad_label), name, sizeof(name), &q_end, NULL), -1);
 
     assert_int_equal(build_hosts_a_response(NULL, 0, htonl(0x01020304u), NULL, NULL), -1);
 
@@ -1608,7 +1859,7 @@ static void test_hosts_override_edns_and_parser_edges(void **state) {
     assert_memory_equal(out + r_opt_s, DNS_QUERY_WWW_EXAMPLE_COM_A_EDNS + q_opt_s, q_opt_e - q_opt_s);
 
     size_t out_q_end = 0;
-    assert_int_equal(dns_extract_single_question_name_a(out, out_len, name, sizeof(name), &out_q_end), 0);
+    assert_int_equal(dns_extract_single_question_name_addr(out, out_len, name, sizeof(name), &out_q_end, NULL), 0);
     size_t ans = out_q_end;
     assert_int_equal(out[ans + 12], 1);
     assert_int_equal(out[ans + 13], 2);
@@ -1624,6 +1875,9 @@ int main(void) {
         cmocka_unit_test(test_servfail_and_truncated_builders),
         cmocka_unit_test(test_io_and_socket_helpers),
         cmocka_unit_test(test_process_query_branches),
+        cmocka_unit_test(test_process_query_failure_cache),
+        cmocka_unit_test(test_build_servfail_ede),
+        cmocka_unit_test(test_hosts_override_aaaa_nodata),
         cmocka_unit_test(test_tcp_client_loop_large_response_and_zero_length_query),
         cmocka_unit_test(test_dns_server_additional_edge_paths),
         cmocka_unit_test(test_tcp_accept_loop_additional_paths),

@@ -322,6 +322,15 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
+    if (strcmp(key, "failure_cache_ttl_seconds") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            /* RFC 2308 7.1 caps server-failure caching at 5 minutes. */
+            config->failure_cache_ttl_seconds = parsed > 300 ? 300 : parsed;
+        }
+        return;
+    }
+
     if (strcmp(key, "upstreams") == 0) {
         split_upstreams(config, value);
         return;
@@ -450,6 +459,14 @@ static void apply_env_overrides(proxy_config_t *config) {
         }
     }
 
+    value = getenv("FAILURE_CACHE_TTL_SECONDS");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed >= 0) {
+            config->failure_cache_ttl_seconds = parsed > 300 ? 300 : parsed;
+        }
+    }
+
     value = getenv("UPSTREAMS");
     if (value != NULL && *value != '\0') {
         split_upstreams(config, value);
@@ -522,6 +539,7 @@ static void set_defaults(proxy_config_t *config) {
     config->max_inflight_dot = 1;
     config->max_inflight_doq = 1;
     config->cache_capacity = 1024;
+    config->failure_cache_ttl_seconds = 30;
 
 #if UPSTREAM_DOH_ENABLED
     strncpy(config->upstream_urls[0], "https://dns.google/dns-query", MAX_URL_LEN - 1);
@@ -681,6 +699,7 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  max_inflight_dot=%d\n", config->max_inflight_dot);
     fprintf(out, "  max_inflight_doq=%d\n", config->max_inflight_doq);
     fprintf(out, "  cache_capacity=%d\n", config->cache_capacity);
+    fprintf(out, "  failure_cache_ttl_seconds=%d\n", config->failure_cache_ttl_seconds);
     fprintf(out, "  tcp_idle_timeout_ms=%d\n", config->tcp_idle_timeout_ms);
     fprintf(out, "  tcp_max_clients=%d\n", config->tcp_max_clients);
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);

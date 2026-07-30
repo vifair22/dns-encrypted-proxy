@@ -573,11 +573,16 @@ static void test_doh_resolve_success_and_validation_failure(void **state) {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
 
-    g_dns_validate_rc = -1;
+    /* Budgets below DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS are refused outright. */
+    g_dns_validate_rc = 0;
     assert_int_equal(upstream_doh_resolve(client, &server, 50, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(server.stage.last_failure_slow_response, 1);
+
+    g_dns_validate_rc = -1;
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), -1);
 
     g_dns_validate_rc = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 50, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
     assert_non_null(resp);
     free(resp);
 
@@ -811,6 +816,10 @@ static void test_next_attempt_timeout_floor(void **state) {
 
     /* Expired deadline refuses further attempts. */
     assert_int_equal(next_attempt_timeout_ms(now_ms(), 3), -1);
+
+    /* Leftover budget below one useful DNS round trip refuses the attempt
+     * instead of firing a can't-succeed micro-timeout request. */
+    assert_int_equal(next_attempt_timeout_ms(now_ms() + DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS / 2, 1), -1);
 }
 
 static void test_doh_slow_response_retry_succeeds(void **state) {
@@ -892,6 +901,37 @@ static void test_doh_slow_response_retry_failure_stops_ladder(void **state) {
     assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TIMEOUT], 2);
     assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H3);
     assert_int_equal(server.stage.last_failure_class, (int)UPSTREAM_FAILURE_CLASS_TIMEOUT);
+    /* Slow-response failures are flagged so health accounting skips them. */
+    assert_int_equal(server.stage.last_failure_slow_response, 1);
+
+    upstream_doh_client_destroy(client);
+}
+
+static void test_doh_transport_failure_is_health_attributable(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+
+    /* Every tier fails at the transport layer: this IS evidence about the
+     * server, so the slow-response flag must stay clear. */
+    g_curl_perform_rc = CURLE_COULDNT_CONNECT;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(server.stage.last_failure_slow_response, 0);
+    assert_int_equal(server.stage.last_failure_class, (int)UPSTREAM_FAILURE_CLASS_TRANSPORT);
 
     upstream_doh_client_destroy(client);
 }
@@ -964,6 +1004,7 @@ int main(void) {
         cmocka_unit_test(test_next_attempt_timeout_floor),
         cmocka_unit_test(test_doh_slow_response_retry_succeeds),
         cmocka_unit_test(test_doh_slow_response_retry_failure_stops_ladder),
+        cmocka_unit_test(test_doh_transport_failure_is_health_attributable),
         cmocka_unit_test(test_doh_h3_to_h1_pin_gated_below_threshold),
     };
 
