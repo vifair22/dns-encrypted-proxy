@@ -120,7 +120,7 @@ generate_deploy_child_pipeline:
       : "${UNRAID_DEPLOY_TARGETS:?UNRAID_DEPLOY_TARGETS is not set}"
 
       python3 - <<'PY'
-      import os, sys
+      import os, sys, time
 
       targets_raw = os.environ.get("UNRAID_DEPLOY_TARGETS", "")
       if not targets_raw.strip():
@@ -176,9 +176,56 @@ generate_deploy_child_pipeline:
         out.append("        --restart unless-stopped \\")
         out.append('        --network "$DOCKER_NET" \\')
         out.append('        --ip "$CONTAINER_IP" \\')
+        # The proxy resolves its own upstream hostnames through the container's
+        # resolver, which by default is the host's - and the host resolves
+        # through Pi-hole, which forwards here. Left alone that is a loop the
+        # bootstrap ladder has to unwind on every cold start. Point this one
+        # container at the same resolvers the ladder falls back to instead.
+        out.append("        --dns 8.8.8.8 \\")
+        out.append("        --dns 1.1.1.1 \\")
         out.append("        -v /mnt/cache/appdata/dns-encrypted-proxy:/app/config \\")
         out.append("        -e CACHE_CAPACITY=8192 \\")
         out.append('        "$IMAGE:$TAG"')
+        out.append("")
+        # Unraid's Docker tab is built from the user templates, not from the
+        # running containers, so a container created only by docker run
+        # disappears from the UI the moment it is stopped and the only way
+        # back is another deploy. Writing the template on every deploy keeps
+        # the container startable, stoppable and editable from the UI, and
+        # keeps what the UI would recreate identical to what CI just ran.
+        out.append("      mkdir -p /boot/config/plugins/dockerMan/templates-user")
+        out.append("      cat > /boot/config/plugins/dockerMan/templates-user/my-dns-encrypted-proxy.xml <<'TPL'")
+        out.append('      <?xml version="1.0"?>')
+        out.append('      <Container version="2">')
+        out.append("        <Name>dns-encrypted-proxy</Name>")
+        out.append('        <Repository>$IMAGE:$TAG</Repository>')
+        out.append("        <Registry>https://git.airies.net/vifair22/dns-encrypted-proxy/container_registry</Registry>")
+        out.append(f"        <Network>{net}</Network>")
+        out.append(f"        <MyIP>{ip}</MyIP>")
+        out.append("        <Shell>sh</Shell>")
+        out.append("        <Privileged>false</Privileged>")
+        out.append("        <Support>https://git.airies.net/vifair22/dns-encrypted-proxy/-/issues</Support>")
+        out.append("        <Project>https://git.airies.net/vifair22/dns-encrypted-proxy</Project>")
+        out.append("        <ReadMe>https://git.airies.net/vifair22/dns-encrypted-proxy/-/blob/master/Manual.md</ReadMe>")
+        out.append("        <Overview>Encrypted DNS forwarding proxy (DoH/DoT) with local cache, bootstrap ladder and Prometheus metrics. Deployed by GitLab CI; this template exists so the container stays manageable from the Docker tab between deploys.</Overview>")
+        out.append("        <Category>Network:DNS Network:Privacy</Category>")
+        out.append("        <WebUI/>")
+        out.append("        <TemplateURL/>")
+        out.append("        <Icon/>")
+        out.append("        <ExtraParams>--dns 8.8.8.8 --dns 1.1.1.1</ExtraParams>")
+        out.append("        <PostArgs/>")
+        out.append("        <CPUset/>")
+        out.append(f"        <DateInstalled>{int(time.time())}</DateInstalled>")
+        out.append("        <DonateText/>")
+        out.append("        <DonateLink/>")
+        out.append("        <Requires/>")
+        out.append('        <Config Name="Config directory" Target="/app/config" Default="/mnt/cache/appdata/dns-encrypted-proxy" Mode="rw" Description="Holds dns-encrypted-proxy.conf; empty means built-in defaults." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/dns-encrypted-proxy</Config>')
+        out.append('        <Config Name="Cache capacity" Target="CACHE_CAPACITY" Default="8192" Mode="" Description="Answer cache entries." Type="Variable" Display="always" Required="false" Mask="false">8192</Config>')
+        out.append('        <Config Name="DNS (UDP)" Target="53" Default="53" Mode="udp" Description="DNS listener." Type="Port" Display="always" Required="true" Mask="false">53</Config>')
+        out.append('        <Config Name="DNS (TCP)" Target="53" Default="53" Mode="tcp" Description="DNS listener." Type="Port" Display="always" Required="true" Mask="false">53</Config>')
+        out.append('        <Config Name="Metrics" Target="9090" Default="9090" Mode="tcp" Description="Prometheus metrics, /healthz and /readyz." Type="Port" Display="always" Required="false" Mask="false">9090</Config>')
+        out.append("      </Container>")
+        out.append("      TPL")
         out.append("      EOF")
         out.append("  rules:")
         out.append('    - if: \'$CI_COMMIT_BRANCH == "master"\'')

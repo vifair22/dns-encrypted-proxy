@@ -48,8 +48,12 @@ static CURLcode g_last_perform_rc = CURLE_OK;
 static long g_curl_response_code = 200;
 static long g_curl_http_version = 0;
 static double g_curl_pretransfer_time = 0.0;
-/* Empty means the transfer never got a usable connection. */
+/* Empty means the transfer never got a usable connection. The _seq variant
+ * drives it per attempt, for tests where some attempts connect and some do
+ * not. */
 static const char *g_curl_primary_ip = "";
+static const char *g_curl_primary_ip_seq[8];
+static int g_curl_primary_ip_seq_len = 0;
 static int g_emit_body = 0;
 static const uint8_t *g_body_ptr = NULL;
 static size_t g_body_len = 0;
@@ -90,6 +94,8 @@ static void reset_stubs(void) {
     g_curl_http_version = 0;
     g_curl_pretransfer_time = 0.0;
     g_curl_primary_ip = "";
+    memset(g_curl_primary_ip_seq, 0, sizeof(g_curl_primary_ip_seq));
+    g_curl_primary_ip_seq_len = 0;
     g_emit_body = 0;
     g_body_ptr = NULL;
     g_body_len = 0;
@@ -241,7 +247,14 @@ CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...) {
     } else if (info == CURLINFO_PRIMARY_IP) {
         const char **ip = va_arg(ap, const char **);
         if (ip != NULL) {
-            *ip = g_curl_primary_ip;
+            /* perform() has already consumed this attempt's slot, so index
+             * back one to describe the transfer that just ran. */
+            int idx = g_curl_perform_seq_idx - 1;
+            if (g_curl_primary_ip_seq_len > 0 && idx >= 0 && idx < g_curl_primary_ip_seq_len) {
+                *ip = g_curl_primary_ip_seq[idx];
+            } else {
+                *ip = g_curl_primary_ip;
+            }
         }
     } else if (info == CURLINFO_PRETRANSFER_TIME) {
         double *pretransfer = va_arg(ap, double *);
@@ -1042,6 +1055,93 @@ static void test_doh_unconnected_timeout_is_not_a_slow_response(void **state) {
     upstream_doh_client_destroy(client);
 }
 
+/* Production pinned dns.google to HTTP/1.1 for hours: the h2 attempt failed on
+ * the libc route while h1 answered on the bootstrap route, and the ladder read
+ * a routing difference as a protocol verdict. A tier that never reached the
+ * peer says nothing about the version, so no pin may follow. */
+static void test_doh_route_failure_does_not_pin_the_protocol(void **state) {
+    (void)state;
+    reset_stubs();
+    g_curl_http3_supported = 0;
+
+    upstream_config_t config = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 5,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    strncpy(server.host, "example.test", sizeof(server.host) - 1);
+    server.port = 443;
+    server.stage.has_bootstrap_v4 = 1;
+    assert_int_equal(inet_pton(AF_INET, "10.2.2.2", &server.stage.bootstrap_addr_v4_be), 1);
+
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    /* libc route: h2 then h1, neither reaching a peer. Bootstrap route: h2
+     * likewise, then h1 answers. */
+    g_curl_perform_rc_seq[0] = CURLE_COULDNT_RESOLVE_HOST;
+    g_curl_perform_rc_seq[1] = CURLE_COULDNT_RESOLVE_HOST;
+    g_curl_perform_rc_seq[2] = CURLE_COULDNT_CONNECT;
+    g_curl_perform_rc_seq[3] = CURLE_OK;
+    g_curl_perform_seq_len = 4;
+    g_curl_primary_ip_seq[0] = "";
+    g_curl_primary_ip_seq[1] = "";
+    g_curl_primary_ip_seq[2] = "";
+    g_curl_primary_ip_seq[3] = "10.2.2.2";
+    g_curl_primary_ip_seq_len = 4;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    assert_int_equal(g_curl_perform_seq_idx, 4);
+    assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H2);
+    assert_int_equal((int)server.stage.doh_downgrade_h2_to_h1_total, 0);
+    assert_int_equal((int)server.stage.doh_upgrade_failures, 0);
+
+    /* Same shape, except the h2 attempt on the answering route reached the
+     * peer and failed there. That does implicate the version, so the pin
+     * engages. */
+    reset_stubs();
+    g_curl_http3_supported = 0;
+    upstream_server_t connected = make_resolve_server();
+    strncpy(connected.host, "example.test", sizeof(connected.host) - 1);
+    connected.port = 443;
+    connected.stage.has_bootstrap_v4 = 1;
+    assert_int_equal(inet_pton(AF_INET, "10.2.2.2", &connected.stage.bootstrap_addr_v4_be), 1);
+
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+    g_curl_perform_rc_seq[0] = CURLE_COULDNT_RESOLVE_HOST;
+    g_curl_perform_rc_seq[1] = CURLE_COULDNT_RESOLVE_HOST;
+    g_curl_perform_rc_seq[2] = CURLE_RECV_ERROR;
+    g_curl_perform_rc_seq[3] = CURLE_OK;
+    g_curl_perform_seq_len = 4;
+    g_curl_primary_ip_seq[0] = "";
+    g_curl_primary_ip_seq[1] = "";
+    g_curl_primary_ip_seq[2] = "10.2.2.2";
+    g_curl_primary_ip_seq[3] = "10.2.2.2";
+    g_curl_primary_ip_seq_len = 4;
+
+    resp = NULL;
+    assert_int_equal(upstream_doh_resolve(client, &connected, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_int_equal((int)connected.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H1);
+    assert_int_equal((int)connected.stage.doh_downgrade_h2_to_h1_total, 1);
+
+    upstream_doh_client_destroy(client);
+}
+
 static void test_next_attempt_timeout_floor(void **state) {
     (void)state;
     reset_stubs();
@@ -1259,6 +1359,7 @@ int main(void) {
         cmocka_unit_test(test_doh_pool_wait_timeout_is_not_server_evidence),
         cmocka_unit_test(test_doh_skip_local_route_starts_at_bootstrap),
         cmocka_unit_test(test_doh_unconnected_timeout_is_not_a_slow_response),
+        cmocka_unit_test(test_doh_route_failure_does_not_pin_the_protocol),
         cmocka_unit_test(test_next_attempt_timeout_floor),
         cmocka_unit_test(test_doh_slow_response_retry_succeeds),
         cmocka_unit_test(test_doh_slow_response_retry_failure_stops_ladder),
