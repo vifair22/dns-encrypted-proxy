@@ -34,6 +34,7 @@ static upstream_server_t make_test_server(void) {
     return server;
 }
 
+static int g_curl_http3_supported = 0;
 static CURLcode g_curl_global_init_rc = CURLE_OK;
 static int g_curl_easy_init_fail_at = 0;
 static int g_curl_easy_init_calls = 0;
@@ -47,6 +48,8 @@ static CURLcode g_last_perform_rc = CURLE_OK;
 static long g_curl_response_code = 200;
 static long g_curl_http_version = 0;
 static double g_curl_pretransfer_time = 0.0;
+/* Empty means the transfer never got a usable connection. */
+static const char *g_curl_primary_ip = "";
 static int g_emit_body = 0;
 static const uint8_t *g_body_ptr = NULL;
 static size_t g_body_len = 0;
@@ -59,6 +62,8 @@ static int g_realloc_fail_on_call = 0;
 static int g_realloc_calls = 0;
 static int g_curl_http_version_setopt_calls = 0;
 static long g_curl_http_version_setopt_value = 0;
+static long g_curl_timeout_ms_setopt_value = 0;
+static char g_curl_resolve_entry[256];
 
 typedef struct {
     size_t (*write_fn)(char *, size_t, size_t, void *);
@@ -68,6 +73,9 @@ typedef struct {
 static curl_slot_t g_slots[16];
 
 static void reset_stubs(void) {
+    /* Default to a fully featured libcurl; the tests that cover the
+     * collapsed ladder clear this explicitly. */
+    g_curl_http3_supported = 1;
     g_curl_global_init_rc = CURLE_OK;
     g_curl_easy_init_fail_at = 0;
     g_curl_easy_init_calls = 0;
@@ -81,6 +89,7 @@ static void reset_stubs(void) {
     g_curl_response_code = 200;
     g_curl_http_version = 0;
     g_curl_pretransfer_time = 0.0;
+    g_curl_primary_ip = "";
     g_emit_body = 0;
     g_body_ptr = NULL;
     g_body_len = 0;
@@ -93,6 +102,8 @@ static void reset_stubs(void) {
     g_realloc_calls = 0;
     g_curl_http_version_setopt_calls = 0;
     g_curl_http_version_setopt_value = 0;
+    g_curl_timeout_ms_setopt_value = 0;
+    g_curl_resolve_entry[0] = '\0';
     memset(g_slots, 0, sizeof(g_slots));
 }
 
@@ -140,6 +151,16 @@ CURLcode curl_global_init(long flags) {
 void curl_global_cleanup(void) {
 }
 
+/* The ladder consults libcurl's feature bits to decide whether the h3 tier
+ * can run at all; g_curl_http3_supported drives that from the test. */
+curl_version_info_data *curl_version_info(CURLversion age) {
+    (void)age;
+    static curl_version_info_data info;
+    memset(&info, 0, sizeof(info));
+    info.features = g_curl_http3_supported ? CURL_VERSION_HTTP3 : 0;
+    return &info;
+}
+
 CURL *curl_easy_init(void) {
     g_curl_easy_init_calls++;
     if (g_curl_easy_init_fail_at > 0 && g_curl_easy_init_calls == g_curl_easy_init_fail_at) {
@@ -154,6 +175,8 @@ void curl_easy_cleanup(CURL *curl) {
 
 void curl_easy_reset(CURL *curl) {
     (void)curl;
+    g_curl_resolve_entry[0] = '\0';
+    g_curl_timeout_ms_setopt_value = 0;
 }
 
 CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
@@ -168,6 +191,13 @@ CURLcode curl_easy_setopt(CURL *curl, CURLoption option, ...) {
     } else if (option == CURLOPT_HTTP_VERSION) {
         g_curl_http_version_setopt_value = va_arg(ap, long);
         g_curl_http_version_setopt_calls++;
+    } else if (option == CURLOPT_TIMEOUT_MS) {
+        g_curl_timeout_ms_setopt_value = va_arg(ap, long);
+    } else if (option == CURLOPT_RESOLVE) {
+        struct curl_slist *entries = va_arg(ap, struct curl_slist *);
+        if (entries != NULL && entries->data != NULL) {
+            snprintf(g_curl_resolve_entry, sizeof(g_curl_resolve_entry), "%s", entries->data);
+        }
     } else {
         (void)va_arg(ap, void *);
     }
@@ -207,6 +237,11 @@ CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...) {
              * status arrived; mirroring that keeps the request_sent
              * classification honest in tests. */
             *status = (g_last_perform_rc == CURLE_OK) ? g_curl_response_code : 0;
+        }
+    } else if (info == CURLINFO_PRIMARY_IP) {
+        const char **ip = va_arg(ap, const char **);
+        if (ip != NULL) {
+            *ip = g_curl_primary_ip;
         }
     } else if (info == CURLINFO_PRETRANSFER_TIME) {
         double *pretransfer = va_arg(ap, double *);
@@ -320,7 +355,7 @@ typedef struct {
 
 static void *pool_acquire_thread_main(void *arg) {
     acquire_ctx_t *ctx = (acquire_ctx_t *)arg;
-    ctx->rc = pool_acquire(ctx->client, &ctx->handle, &ctx->slot);
+    ctx->rc = pool_acquire(ctx->client, now_ms() + 1000, &ctx->handle, &ctx->slot);
     return NULL;
 }
 
@@ -575,14 +610,14 @@ static void test_doh_resolve_success_and_validation_failure(void **state) {
 
     /* Budgets below DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS are refused outright. */
     g_dns_validate_rc = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 50, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 50, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
     assert_int_equal(server.stage.last_failure_slow_response, 1);
 
     g_dns_validate_rc = -1;
-    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     g_dns_validate_rc = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     assert_non_null(resp);
     free(resp);
 
@@ -608,10 +643,11 @@ static void test_doh_pool_stats_in_use_branch(void **state) {
     int cap = 0;
     int in_use = 0;
     uint64_t h3 = 0;
+    uint64_t pool_waits = 0;
     uint64_t h2 = 0;
     uint64_t h1 = 0;
     uint64_t other = 0;
-    assert_int_equal(upstream_doh_client_get_pool_stats(client, &cap, &in_use, &h3, &h2, &h1, &other), 0);
+    assert_int_equal(upstream_doh_client_get_pool_stats(client, &cap, &in_use, &h3, &h2, &h1, &other, &pool_waits), 0);
     assert_int_equal(cap, 2);
     assert_int_equal(in_use, 1);
 
@@ -653,7 +689,7 @@ static void test_doh_h3_failure_no_pin_below_threshold(void **state) {
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     free(resp);
 
     assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H3);
@@ -692,7 +728,7 @@ static void test_doh_h3_pin_engages_at_threshold(void **state) {
 
         uint8_t *resp = NULL;
         size_t resp_len = 0;
-        assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+        assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
         free(resp);
     }
 
@@ -734,7 +770,7 @@ static void test_doh_h3_success_resets_consecutive_counter(void **state) {
 
         uint8_t *resp = NULL;
         size_t resp_len = 0;
-        assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+        assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
         free(resp);
     }
     assert_int_equal((int)server.stage.doh_h3_consecutive_failures, 2);
@@ -746,7 +782,7 @@ static void test_doh_h3_success_resets_consecutive_counter(void **state) {
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     free(resp);
 
     assert_int_equal((int)server.stage.doh_h3_consecutive_failures, 0);
@@ -782,7 +818,7 @@ static void test_doh_attempt_failure_counter_per_class(void **state) {
     g_curl_perform_seq_len = 2;
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     free(resp);
 
     /* Call 2: h3 = TLS error, h2 = OK */
@@ -791,7 +827,7 @@ static void test_doh_attempt_failure_counter_per_class(void **state) {
     g_curl_perform_rc_seq[1] = CURLE_OK;
     g_curl_perform_seq_len = 2;
     resp = NULL;
-    assert_int_equal(upstream_doh_resolve(client, &server, 200, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 200, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     free(resp);
 
     assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TIMEOUT], 1);
@@ -801,18 +837,235 @@ static void test_doh_attempt_failure_counter_per_class(void **state) {
     upstream_doh_client_destroy(client);
 }
 
+/* Without a QUIC backend the h3 tier cannot run, so counting it in the ladder
+ * only divides the budget by a step that never executes. The ladder must
+ * start at h2 and hand the first attempt everything but the reserve held for
+ * the h1 step behind it. */
+static void test_doh_ladder_collapses_without_http3(void **state) {
+    (void)state;
+    reset_stubs();
+    g_curl_http3_supported = 0;
+
+    upstream_config_t config = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+    assert_int_equal(client->http3_supported, 0);
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+    g_curl_perform_rc = CURLE_OK;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    assert_int_equal(g_curl_http_version_setopt_value, doh_http_version_for_tier(DOH_HTTP_TIER_H2));
+    assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H2);
+    /* Two ladder steps (h2, h1) means one reserve withheld, not two. */
+    assert_in_range(g_curl_timeout_ms_setopt_value, 2500 - DOH_FALLBACK_RESERVE_MS - 20, 2500 - DOH_FALLBACK_RESERVE_MS);
+
+    /* A libcurl that does speak h3 keeps the full ladder. */
+    upstream_doh_client_destroy(client);
+    reset_stubs();
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+    g_curl_perform_rc = CURLE_OK;
+    client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+    assert_int_equal(client->http3_supported, 1);
+
+    upstream_server_t h3_server = make_resolve_server();
+    resp = NULL;
+    assert_int_equal(upstream_doh_resolve(client, &h3_server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_int_equal(g_curl_http_version_setopt_value, doh_http_version_for_tier(DOH_HTTP_TIER_H3));
+    assert_in_range(g_curl_timeout_ms_setopt_value, 2500 - 2 * DOH_FALLBACK_RESERVE_MS - 20, 2500 - 2 * DOH_FALLBACK_RESERVE_MS);
+
+    upstream_doh_client_destroy(client);
+}
+
+/* A query that never gets a pool handle inside its own deadline must give up
+ * rather than reach the transport with a slice too small to succeed, and the
+ * failure is local congestion: no evidence about the upstream. */
+static void test_doh_pool_wait_timeout_is_not_server_evidence(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 200,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    /* Hold the only handle for longer than the caller's budget. */
+    client->pool_in_use[0] = 1;
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+
+    uint64_t started = now_ms();
+    assert_int_equal(upstream_doh_resolve(client, &server, 150, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    uint64_t elapsed = now_ms() - started;
+
+    assert_null(resp);
+    assert_true(elapsed >= 100);
+    assert_true(elapsed < 1000);
+    assert_int_equal(server.stage.last_failure_class, UPSTREAM_FAILURE_CLASS_TIMEOUT);
+    assert_int_equal(server.stage.last_failure_slow_response, 1);
+    /* No request went out, so nothing may land in the per-tier counters. */
+    assert_int_equal((int)server.stage.doh_attempt_failures_total[DOH_HTTP_TIER_H3][UPSTREAM_FAILURE_CLASS_TIMEOUT], 0);
+
+    uint64_t pool_waits = 0;
+    assert_int_equal(upstream_doh_client_get_pool_stats(client, NULL, NULL, NULL, NULL, NULL, NULL, &pool_waits), 0);
+    assert_int_equal((int)pool_waits, 1);
+
+    client->pool_in_use[0] = 0;
+    upstream_doh_client_destroy(client);
+}
+
+/* After a bootstrap lookup the retry must dial the address that lookup
+ * produced. Both the live libc route and the stage1 cache come from the
+ * resolver that just failed, so neither may be tried first. */
+static void test_doh_skip_local_route_starts_at_bootstrap(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 1000,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    strncpy(server.host, "example.test", sizeof(server.host) - 1);
+    server.port = 443;
+    server.stage.has_stage1_cached_v4 = 1;
+    assert_int_equal(inet_pton(AF_INET, "10.1.1.1", &server.stage.stage1_cached_addr_v4_be), 1);
+    server.stage.has_bootstrap_v4 = 1;
+    assert_int_equal(inet_pton(AF_INET, "10.2.2.2", &server.stage.bootstrap_addr_v4_be), 1);
+
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+    g_curl_perform_rc = CURLE_OK;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(
+        upstream_doh_resolve(client, &server, 1000, UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE, query, sizeof(query), &resp, &resp_len),
+        0);
+    free(resp);
+    assert_string_equal(g_curl_resolve_entry, "example.test:443:10.2.2.2");
+
+    /* Without the hint the ladder still starts on the libc route, which sets
+     * no address override at all. */
+    resp = NULL;
+    assert_int_equal(
+        upstream_doh_resolve(client, &server, 1000, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len),
+        0);
+    free(resp);
+    assert_string_equal(g_curl_resolve_entry, "");
+
+    upstream_doh_client_destroy(client);
+}
+
+/* A timeout on a transfer that never reached a peer is a broken path to the
+ * upstream, not a slow answer from it. Production read those as slow answers
+ * (libcurl stamps PRETRANSFER_TIME at teardown even when nothing resolved),
+ * which stopped the ladder before the bootstrap route and kept a genuinely
+ * broken resolver path out of health accounting. */
+static void test_doh_unconnected_timeout_is_not_a_slow_response(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    upstream_server_t server = make_resolve_server();
+    strncpy(server.host, "example.test", sizeof(server.host) - 1);
+    server.port = 443;
+    server.stage.has_bootstrap_v4 = 1;
+    assert_int_equal(inet_pton(AF_INET, "10.2.2.2", &server.stage.bootstrap_addr_v4_be), 1);
+
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+
+    /* No peer address on any attempt until the bootstrap route connects. */
+    g_curl_primary_ip = "";
+    g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[1] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[2] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[3] = CURLE_OK;
+    g_curl_perform_seq_len = 4;
+
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+
+    /* The ladder walked all three tiers of the libc route and then moved to
+     * the bootstrap address, rather than stopping after one attempt. */
+    assert_int_equal(g_curl_perform_seq_idx, 4);
+    assert_string_equal(g_curl_resolve_entry, "example.test:443:10.2.2.2");
+    assert_int_equal((int)server.stage.doh_slow_retry_attempt_total, 0);
+
+    upstream_doh_client_destroy(client);
+}
+
 static void test_next_attempt_timeout_floor(void **state) {
     (void)state;
     reset_stubs();
 
-    /* 2500 ms budget over 9 planned attempts used to yield ~277 ms slices;
-     * the floor must lift them to DOH_MIN_ATTEMPT_TIMEOUT_MS. */
+    /* A long ladder reserves a connect-sized allowance per step still ahead,
+     * capped at half the budget: 2500 ms over 9 planned attempts leaves the
+     * attempt running now with half, not with a 277 ms slice that no cold
+     * recursive resolution can answer inside. */
     int t = next_attempt_timeout_ms(now_ms() + 2500, 9);
-    assert_in_range(t, DOH_MIN_ATTEMPT_TIMEOUT_MS - 20, DOH_MIN_ATTEMPT_TIMEOUT_MS);
+    assert_in_range(t, 1230, 1250);
+
+    /* A short ladder gives the current attempt everything but the reserve
+     * held for the one step behind it. */
+    t = next_attempt_timeout_ms(now_ms() + 2500, 2);
+    assert_in_range(t, 2180, 2200);
 
     /* A single remaining attempt gets the whole remaining budget. */
     t = next_attempt_timeout_ms(now_ms() + 2500, 1);
     assert_in_range(t, 2400, 2500);
+
+    /* The floor still lifts a slice that the reserve would push below one
+     * cold-recursion round trip. */
+    t = next_attempt_timeout_ms(now_ms() + 900, 3);
+    assert_in_range(t, DOH_MIN_ATTEMPT_TIMEOUT_MS - 20, DOH_MIN_ATTEMPT_TIMEOUT_MS);
 
     /* Expired deadline refuses further attempts. */
     assert_int_equal(next_attempt_timeout_ms(now_ms(), 3), -1);
@@ -842,16 +1095,17 @@ static void test_doh_slow_response_retry_succeeds(void **state) {
     g_body_ptr = body;
     g_body_len = sizeof(body);
 
-    /* h3 attempt times out with the request already sent (slow upstream
-     * answer): no tier ladder, one full-remaining-budget retry on h3. */
-    g_curl_pretransfer_time = 0.05;
+    /* h3 attempt times out on a connection that was established (the peer
+     * address is known), i.e. a slow upstream answer: no tier ladder, one
+     * full-remaining-budget retry on h3. */
+    g_curl_primary_ip = "203.0.113.10";
     g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
     g_curl_perform_rc_seq[1] = CURLE_OK;
     g_curl_perform_seq_len = 2;
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 2500, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     free(resp);
 
     assert_int_equal(g_curl_perform_seq_idx, 2);
@@ -886,14 +1140,14 @@ static void test_doh_slow_response_retry_failure_stops_ladder(void **state) {
     /* Both the slice attempt and the full-budget retry time out with the
      * request sent. The resolve must fail after exactly those two attempts
      * instead of burning more attempts on lower tiers. */
-    g_curl_pretransfer_time = 0.05;
+    g_curl_primary_ip = "203.0.113.10";
     g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
     g_curl_perform_rc_seq[1] = CURLE_OPERATION_TIMEDOUT;
     g_curl_perform_seq_len = 2;
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 2500, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     assert_int_equal(g_curl_perform_seq_idx, 2);
     assert_int_equal((int)server.stage.doh_slow_retry_attempt_total, 1);
@@ -929,7 +1183,7 @@ static void test_doh_transport_failure_is_health_attributable(void **state) {
 
     uint8_t *resp = NULL;
     size_t resp_len = 0;
-    assert_int_equal(upstream_doh_resolve(client, &server, 2500, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
     assert_int_equal(server.stage.last_failure_slow_response, 0);
     assert_int_equal(server.stage.last_failure_class, (int)UPSTREAM_FAILURE_CLASS_TRANSPORT);
 
@@ -967,7 +1221,7 @@ static void test_doh_h3_to_h1_pin_gated_below_threshold(void **state) {
 
         uint8_t *resp = NULL;
         size_t resp_len = 0;
-        assert_int_equal(upstream_doh_resolve(client, &server, 2500, query, sizeof(query), &resp, &resp_len), 0);
+        assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
         free(resp);
 
         if (call < DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD - 1) {
@@ -1001,6 +1255,10 @@ int main(void) {
         cmocka_unit_test(test_doh_h3_pin_engages_at_threshold),
         cmocka_unit_test(test_doh_h3_success_resets_consecutive_counter),
         cmocka_unit_test(test_doh_attempt_failure_counter_per_class),
+        cmocka_unit_test(test_doh_ladder_collapses_without_http3),
+        cmocka_unit_test(test_doh_pool_wait_timeout_is_not_server_evidence),
+        cmocka_unit_test(test_doh_skip_local_route_starts_at_bootstrap),
+        cmocka_unit_test(test_doh_unconnected_timeout_is_not_a_slow_response),
         cmocka_unit_test(test_next_attempt_timeout_floor),
         cmocka_unit_test(test_doh_slow_response_retry_succeeds),
         cmocka_unit_test(test_doh_slow_response_retry_failure_stops_ladder),

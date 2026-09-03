@@ -8,6 +8,7 @@
 #include <curl/curl.h>
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,13 @@
  * 1-28 ms attempts when dispatch handed over nearly-expired deadlines).
  * next_attempt_timeout_ms reports budget exhaustion instead. */
 #define DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS 100
+/* Wall clock held back for each ladder step still ahead of the current
+ * attempt. Splitting the budget evenly across the ladder assumed every step
+ * would consume its share, but the failures that make laddering worthwhile
+ * (connection refused, TLS reject, unresolvable host) all fail in tens of
+ * milliseconds. Reserving a connect-sized allowance instead of an equal
+ * share gives the attempt most likely to answer the bulk of the budget. */
+#define DOH_FALLBACK_RESERVE_MS 300
 #define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
 #define DOH_UPGRADE_BACKOFF_BASE_MS (10ULL * 60ULL * 1000ULL)
 #define DOH_UPGRADE_BACKOFF_MAX_MS (6ULL * 60ULL * 60ULL * 1000ULL)
@@ -184,17 +192,29 @@ static int next_attempt_timeout_ms(uint64_t deadline_ms, int attempts_left) {
     if (remaining < DOH_MIN_USEFUL_ATTEMPT_TIMEOUT_MS) {
         return -1;
     }
-    int t = (int)(remaining / (uint64_t)attempts_left);
+
+    /* Hold back a connect-sized allowance per remaining ladder step rather
+     * than an equal share, and never hold back more than half the budget:
+     * a long ladder must not starve the attempt running right now. */
+    uint64_t reserve = (uint64_t)(attempts_left - 1) * DOH_FALLBACK_RESERVE_MS;
+    if (reserve > remaining / 2) {
+        reserve = remaining / 2;
+    }
+
+    uint64_t t = remaining - reserve;
     if (t < DOH_MIN_ATTEMPT_TIMEOUT_MS && remaining >= DOH_MIN_ATTEMPT_TIMEOUT_MS) {
         t = DOH_MIN_ATTEMPT_TIMEOUT_MS;
     }
-    if ((uint64_t)t > remaining) {
-        t = (int)remaining;
+    if (t > remaining) {
+        t = remaining;
     }
-    if (t <= 0) {
+    if (t > (uint64_t)INT32_MAX) {
+        t = (uint64_t)INT32_MAX;
+    }
+    if (t == 0) {
         t = 1;
     }
-    return t;
+    return (int)t;
 }
 
 static void log_doh_attempt_failure_impl(
@@ -248,6 +268,11 @@ struct upstream_doh_client {
     pthread_mutex_t pool_mutex;
     pthread_cond_t pool_cond;
     int initialized;
+    /* Whether the linked libcurl was built with a QUIC backend. Without one
+     * the h3 tier cannot run at all, so counting it in the ladder only
+     * shrinks every other attempt's slice. */
+    int http3_supported;
+    atomic_uint_fast64_t pool_wait_timeouts_total;
     atomic_uint_fast64_t http3_responses_total;
     atomic_uint_fast64_t http2_responses_total;
     atomic_uint_fast64_t http1_responses_total;
@@ -313,6 +338,36 @@ static int curl_http_version_is_h1(long http_version) {
     }
 #endif
     return 0;
+}
+
+static int curl_runtime_supports_http3(void) {
+#ifdef CURL_VERSION_HTTP3
+    const curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+    if (info != NULL && (info->features & CURL_VERSION_HTTP3) != 0) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+/* Test hook: pin the transport to HTTP/1.1. It also collapses the ladder to
+ * that single tier, so a test's budget arithmetic does not depend on whether
+ * the machine's libcurl happens to ship a QUIC backend. */
+static int doh_force_http1(void) {
+    const char *v = getenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+    return v != NULL && *v != '\0';
+}
+
+/* Highest tier the ladder may start from: h3 only when libcurl can speak it,
+ * and h1 alone when the force-http1 test hook is set. */
+static doh_http_tier_t doh_ladder_top_tier_limit(const upstream_doh_client_t *client) {
+    if (doh_force_http1()) {
+        return DOH_HTTP_TIER_H1;
+    }
+    if (client != NULL && client->http3_supported) {
+        return DOH_HTTP_TIER_H3;
+    }
+    return DOH_HTTP_TIER_H2;
 }
 
 static long doh_preferred_http_version(void) {
@@ -423,11 +478,16 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     return chunk;
 }
 
-static int pool_acquire(upstream_doh_client_t *client, CURL **handle_out, int *slot_out) {
+static int pool_acquire(upstream_doh_client_t *client, uint64_t deadline_ms, CURL **handle_out, int *slot_out) {
     /*
      * Blocking acquire gives simple backpressure: callers wait instead of
      * creating unbounded transient handles, preserving connection reuse and
-     * predictable memory/socket usage under load.
+     * predictable memory/socket usage under load. The wait is bounded by the
+     * caller's own deadline: an unbounded wait let a burst hand queries to
+     * the transport with tens of milliseconds left of a 2500 ms budget, so
+     * every attempt timed out and the bootstrap stages behind it were then
+     * skipped for lack of budget. Failing the acquire leaves that budget to
+     * the fallback ladder instead.
      */
     pthread_mutex_lock(&client->pool_mutex);
 
@@ -442,7 +502,42 @@ static int pool_acquire(upstream_doh_client_t *client, CURL **handle_out, int *s
             }
         }
 
-        pthread_cond_wait(&client->pool_cond, &client->pool_mutex);
+        uint64_t now = now_ms();
+        if (now >= deadline_ms) {
+            pthread_mutex_unlock(&client->pool_mutex);
+            atomic_fetch_add(&client->pool_wait_timeouts_total, 1);
+            return -1;
+        }
+
+        uint64_t wait_ms = deadline_ms - now;
+        struct timespec abs_wait;
+        if (clock_gettime(CLOCK_REALTIME, &abs_wait) != 0) {
+            pthread_mutex_unlock(&client->pool_mutex);
+            return -1;
+        }
+        abs_wait.tv_sec += (time_t)(wait_ms / 1000ULL);
+        abs_wait.tv_nsec += (long)((wait_ms % 1000ULL) * 1000000ULL);
+        if (abs_wait.tv_nsec >= 1000000000L) {
+            abs_wait.tv_sec += 1;
+            abs_wait.tv_nsec -= 1000000000L;
+        }
+
+        int wait_rc = pthread_cond_timedwait(&client->pool_cond, &client->pool_mutex, &abs_wait);
+        if (wait_rc == ETIMEDOUT) {
+            /* Re-check the slots once: a release may have raced the timeout. */
+            for (int i = 0; i < client->pool_size; i++) {
+                if (!client->pool_in_use[i]) {
+                    client->pool_in_use[i] = 1;
+                    *handle_out = client->pool_handles[i];
+                    *slot_out = i;
+                    pthread_mutex_unlock(&client->pool_mutex);
+                    return 0;
+                }
+            }
+            pthread_mutex_unlock(&client->pool_mutex);
+            atomic_fetch_add(&client->pool_wait_timeouts_total, 1);
+            return -1;
+        }
     }
 }
 
@@ -494,11 +589,20 @@ static int doh_post_with_handle(
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
     /* Test hooks are opt-in and only alter transport selection/verification. */
-    const char *force_http1 = getenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
-    if (force_http1 != NULL && *force_http1 != '\0') {
+    if (doh_force_http1()) {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
     } else {
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, doh_http_version_for_tier(http_tier));
+        /* A libcurl without a QUIC backend rejects the h3 version and keeps
+         * whatever the handle already had, so an unchecked setopt would send
+         * an "h3" attempt over h2 and mislabel every counter it feeds. */
+        CURLcode version_rc = curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, doh_http_version_for_tier(http_tier));
+        if (version_rc != CURLE_OK) {
+            curl_slist_free_all(headers);
+            if (err_out != NULL) {
+                err_out->curl_rc = CURLE_UNSUPPORTED_PROTOCOL;
+            }
+            return -1;
+        }
     }
 
     const char *insecure_tls = getenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
@@ -538,13 +642,23 @@ static int doh_post_with_handle(
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
     long http_version = 0;
     (void)curl_easy_getinfo(curl, CURLINFO_HTTP_VERSION, &http_version);
-    /* PRETRANSFER_TIME is set once the request is about to be sent, i.e.
-     * after connect + TLS/QUIC handshake on fresh connections and near-zero
-     * but nonzero on reused ones. It stays 0.0 when the transfer never got
-     * past connecting, which is the signature of a genuine transport
-     * failure rather than a slow upstream answer. */
-    double pretransfer_s = 0.0;
-    (void)curl_easy_getinfo(curl, CURLINFO_PRETRANSFER_TIME, &pretransfer_s);
+    /* PRIMARY_IP is the peer of the connection this transfer actually used.
+     * libcurl publishes it once the connection is established - after TLS on
+     * an https transfer - and on a reused connection it is already there, so
+     * a non-empty value means the request went out and only the answer is
+     * missing. It is empty whenever the transfer never got a usable
+     * connection: name resolution failed, the connect was refused, or the
+     * handshake stalled. curl_easy_reset clears it, so a stale value cannot
+     * leak in from an earlier attempt on the same pooled handle.
+     *
+     * PRETRANSFER_TIME cannot answer this question, despite reading like it
+     * should: on a timed-out transfer libcurl stamps it at teardown, so it
+     * comes back equal to the timeout even when nothing resolved. Trusting it
+     * classified every DNS-path failure as a slow upstream answer, which
+     * stopped the attempt ladder before the bootstrap route and kept the
+     * failure out of health accounting. */
+    const char *primary_ip = NULL;
+    (void)curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &primary_ip);
 
     curl_slist_free_all(headers);
     if (resolve != NULL) {
@@ -555,7 +669,8 @@ static int doh_post_with_handle(
         err_out->curl_rc = rc;
         err_out->http_status = status;
         err_out->response_len = response.len;
-        err_out->request_sent = (pretransfer_s > 0.0) || status != 0 || response.len > 0;
+        err_out->request_sent =
+            (primary_ip != NULL && primary_ip[0] != '\0') || status != 0 || response.len > 0;
     }
 
     /* Empty body is treated as transport failure for resolver semantics. */
@@ -656,6 +771,11 @@ proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, cons
         }
     }
 
+    client->http3_supported = curl_runtime_supports_http3();
+    if (!client->http3_supported) {
+        LOGF_INFO("libcurl has no HTTP/3 backend; DoH attempt ladder starts at HTTP/2");
+    }
+
     client->initialized = 1;
     *client_out = client;
     return PROXY_OK;
@@ -690,6 +810,7 @@ int upstream_doh_resolve(
     upstream_doh_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -710,26 +831,43 @@ int upstream_doh_resolve(
     server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
     server->stage.last_failure_slow_response = 0;
 
+    /* The deadline covers the wait for a pool handle, not just the transfer:
+     * time spent queued is time the caller no longer has for the fallback
+     * stages, and pretending otherwise is what let a cold-start burst blow
+     * the whole query budget before a single request went out. */
+    int total_budget_ms = timeout_ms > 0 ? timeout_ms : 1000;
+    uint64_t now = now_ms();
+    uint64_t deadline_ms = now + (uint64_t)total_budget_ms;
+
     CURL *curl = NULL;
     int slot = -1;
-    if (pool_acquire(client, &curl, &slot) != 0) {
+    if (pool_acquire(client, deadline_ms, &curl, &slot) != 0) {
+        server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+        /* Local congestion says nothing about this server's health. */
+        server->stage.last_failure_slow_response = 1;
+        LOGF_WARN(
+            "DoH pool acquire timed out: host=%s budget_ms=%d pool_size=%d",
+            server->host,
+            total_budget_ms,
+            client->pool_size);
         return -1;
     }
-    
+
     uint8_t *response = NULL;
     size_t response_len = 0;
     doh_attempt_error_t attempt_err;
 
-    uint64_t now = now_ms();
+    now = now_ms();
+    doh_http_tier_t top_tier_limit = doh_ladder_top_tier_limit(client);
     doh_http_tier_t forced_tier = (doh_http_tier_t)server->stage.doh_forced_http_tier;
-    if (forced_tier < DOH_HTTP_TIER_H3 || forced_tier > DOH_HTTP_TIER_H1) {
-        forced_tier = DOH_HTTP_TIER_H3;
+    if (forced_tier < top_tier_limit || forced_tier > DOH_HTTP_TIER_H1) {
+        forced_tier = top_tier_limit;
         server->stage.doh_forced_http_tier = (uint8_t)forced_tier;
     }
 
     doh_http_tier_t top_tier = forced_tier;
     int attempted_upgrade = 0;
-    if (forced_tier > DOH_HTTP_TIER_H3 &&
+    if (forced_tier > top_tier_limit &&
         now >= server->stage.doh_upgrade_retry_after_ms) {
         top_tier = (doh_http_tier_t)(forced_tier - 1);
         attempted_upgrade = 1;
@@ -742,10 +880,21 @@ int upstream_doh_resolve(
     if (server->stage.has_bootstrap_v4) {
         route_count++;
     }
+
+    /* The caller sets SKIP_LOCAL_ROUTE when it already watched the libc route
+     * fail for this query, which is exactly the retry that follows a
+     * successful stage2/stage3 bootstrap. Start at the bootstrapped address:
+     * both the live libc lookup and the stage1 cache derive from the resolver
+     * that just failed, so re-running either spends the retry's budget
+     * proving what the caller already knows. */
+    int first_route = 0;
+    if ((attempt_flags & UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE) != 0 &&
+        server->stage.has_bootstrap_v4) {
+        first_route = server->stage.has_stage1_cached_v4 ? 2 : 1;
+    }
+
     int protocol_attempts_per_route = (int)(DOH_HTTP_TIER_H1 - top_tier + 1);
-    int attempts_left = route_count * protocol_attempts_per_route;
-    int total_budget_ms = timeout_ms > 0 ? timeout_ms : 1000;
-    uint64_t deadline_ms = now + (uint64_t)total_budget_ms;
+    int attempts_left = (route_count - first_route) * protocol_attempts_per_route;
     int result = -1;
     upstream_failure_class_t final_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
     doh_http_tier_t successful_tier = DOH_HTTP_TIER_H3;
@@ -757,7 +906,7 @@ int upstream_doh_resolve(
     uint32_t slow_override_addr_v4_be = 0;
     const char *slow_phase = "primary request";
 
-    for (int route = 0; route < route_count && result != 0 && !slow_response; route++) {
+    for (int route = first_route; route < route_count && result != 0 && !slow_response; route++) {
         int use_override_v4 = 0;
         uint32_t override_addr_v4_be = 0;
         const char *phase = "primary request";
@@ -976,7 +1125,8 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
-    uint64_t *http_other_total_out) {
+    uint64_t *http_other_total_out,
+    uint64_t *pool_wait_timeouts_out) {
     if (capacity_out != NULL) {
         *capacity_out = 0;
     }
@@ -994,6 +1144,9 @@ int upstream_doh_client_get_pool_stats(
     }
     if (http_other_total_out != NULL) {
         *http_other_total_out = 0;
+    }
+    if (pool_wait_timeouts_out != NULL) {
+        *pool_wait_timeouts_out = 0;
     }
 
     if (client == NULL) {
@@ -1026,6 +1179,9 @@ int upstream_doh_client_get_pool_stats(
     }
     if (http_other_total_out != NULL) {
         *http_other_total_out = (uint64_t)atomic_load(&client->http_other_responses_total);
+    }
+    if (pool_wait_timeouts_out != NULL) {
+        *pool_wait_timeouts_out = (uint64_t)atomic_load(&client->pool_wait_timeouts_total);
     }
 
     return 0;

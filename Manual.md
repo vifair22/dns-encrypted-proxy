@@ -55,6 +55,8 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 |---|---|---|---|---|
 | `listen_addr` | `0.0.0.0` | IPv4 | `LISTEN_ADDR` | Bind address. |
 | `listen_port` | `53` | port | `LISTEN_PORT` | Privileged ports need `cap_net_bind_service` or root. |
+| `udp_workers` | `8` | count | `UDP_WORKERS` | Threads that resolve queries read off the UDP socket. The reader hands each datagram to one of them, so a slow query no longer blocks the ones behind it. `0` resolves inline on the reader thread (the pre-0.1.3 behavior); capped at 64. |
+| `udp_queue_capacity` | `256` | count | `UDP_QUEUE_CAPACITY` | Datagrams that may wait for a free worker. Beyond it queries are shed and counted in `dns_encrypted_proxy_udp_queue_drops_total`; capped at 4096. |
 | `tcp_idle_timeout_ms` | `10000` | ms | `TCP_IDLE_TIMEOUT_MS` | Idle TCP connections close after this. |
 | `tcp_max_clients` | `256` | count | `TCP_MAX_CLIENTS` | Concurrent TCP connection cap. |
 | `tcp_max_queries_per_conn` | `0` | count | `TCP_MAX_QUERIES_PER_CONN` | `0` = unlimited. |
@@ -76,7 +78,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 | Key | Default | Unit | Env override | Notes |
 |---|---|---|---|---|
 | `cache_capacity` | `1024` | entries | `CACHE_CAPACITY` | Hash-bucketed LRU cache. |
-| `failure_cache_ttl_seconds` | `30` | seconds | `FAILURE_CACHE_TTL_SECONDS` | RFC 2308 7.1 failure caching: a question that just failed answers SERVFAIL from cache for this long instead of re-burning the upstream budget. `0` disables; capped at `300` (the RFC maximum). Capacity is fixed at 512 entries. |
+| `failure_cache_ttl_seconds` | `30` | seconds | `FAILURE_CACHE_TTL_SECONDS` | RFC 2308 7.1 failure caching: a question that just failed answers SERVFAIL from cache for this long instead of re-burning the upstream budget. `0` disables; capped at `300` (the RFC maximum). Capacity is fixed at 512 entries. A failure that consumed the whole `upstream_timeout_ms` budget is *not* cached: running out of clock is evidence about the proxy, not about the name. |
 | `hosts_a` | (empty) | comma-separated `name=ipv4` or `name:ipv4` | `HOSTS_A` | Local A-record overrides, returned with TTL 60. The proxy is authoritative for overridden names: every other query type (AAAA, HTTPS, TXT, ...) answers NODATA locally, standard hosts semantics; nothing for these names goes upstream. |
 
 ### 3.4 Metrics & logging
@@ -93,7 +95,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 
 ### 4.1 Query lifecycle
 
-1. Client sends a DNS query over UDP or TCP.
+1. Client sends a DNS query over UDP or TCP. TCP connections get a thread each; UDP datagrams are read by a single reader thread and handed to the `udp_workers` pool, so one query that spends its whole budget cannot stall the ones behind it.
 2. The proxy parses the question section and computes a canonical key (lowercased name + qtype + qclass + EDNS-relevant flags).
 3. **`hosts_a` shortcut.** If the question is a single `A IN` record matching a local hosts override, return a synthesized response with TTL 60. No upstream traffic.
 4. **Cache lookup.** On hit, the cached response is returned with TTLs aged down by elapsed time.
@@ -128,6 +130,12 @@ stateDiagram-v2
 - **Stage 3** (`upstream_bootstrap_try_stage3`): the proxy's own iterative resolver walks from the root servers down. Used only when stage 2 also fails. Same cooldown applies.
 
 Each stage transitions are visible via the `dns_encrypted_proxy_upstream_stage_fallback_total` and `dns_encrypted_proxy_upstream_stage_reason_total` counters (see §5.5).
+
+**Budget reservation.** Stage 1 runs against a deadline shortened by `UPSTREAM_STAGE_FALLBACK_RESERVE_MS` (600 ms, never more than half of what is left), so a local resolver that hangs cannot spend the budget the later stages need. Without that reserve the stages were unreachable in exactly the situation they exist for: if `getaddrinfo` leads back through the proxy's own downstream, stage 1 stalls until the deadline and stages 2 and 3 log `budget_exhausted` and are skipped. Stage 2's UDP lookup is further capped at `UPSTREAM_STAGE2_QUERY_TIMEOUT_MS` (400 ms) so stage 3 and the retry still have room.
+
+**Retry routing.** The attempt that follows a successful stage 2 or stage 3 skips the libc route *and* the stage-1 address cache (`UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE`): both derive from the resolver that just failed, so dialing them again would spend the retry proving what the bootstrap already established.
+
+**Member refresh.** A ready member re-checks the address it dials every `MEMBER_REFRESH_INTERVAL_MS`, staggered per slot so a provider's members never come due in the same pass. The check runs *in place*: the member keeps serving its current address and only a failed check unseats it. Dropping to `connecting` first meant that whenever the system resolver was slow, every member went unavailable together and queries died at their own deadline without a single upstream attempt. For the same reason the stage1 lookup runs outside the address-cache lock, and a caller that finds a lookup already in flight uses the last known address instead of queueing behind a blocking `getaddrinfo`.
 
 ### 4.3 Member state machine
 
@@ -170,13 +178,17 @@ Per-state counts are exported as `dns_encrypted_proxy_upstream_dispatch_members{
 
 ### 4.5 Protocol selection (DoH HTTP version)
 
-When `libcurl` is built with HTTP/3, DoH requests prefer h3, then h2, then h1.1. The proxy actively probes upgrades and tracks per-upstream "forced tier" state with backoff so a flaky h3 path doesn't keep failing first on every query:
+When `libcurl` is built with HTTP/3, DoH requests prefer h3, then h2, then h1.1. The proxy checks that at startup via `curl_version_info()` and logs `libcurl has no HTTP/3 backend; DoH attempt ladder starts at HTTP/2` when the backend is missing (Alpine's `libcurl` package is one such build). This matters for more than labelling: the ladder divides the per-server budget among the steps it plans to run, so counting a tier that cannot execute shrinks every attempt that can. A tier the runtime cannot speak is dropped from the ladder entirely.
+
+Each attempt is handed the remaining budget minus `DOH_FALLBACK_RESERVE_MS` (300 ms) for each ladder step still behind it, capped at half the budget, and floored at `DOH_MIN_ATTEMPT_TIMEOUT_MS`. The failures that make laddering worthwhile (connection refused, TLS reject, unresolvable host) return in tens of milliseconds, so reserving a connect-sized allowance rather than an equal share gives the attempt most likely to answer nearly the whole budget.
+
+The proxy actively probes upgrades and tracks per-upstream "forced tier" state with backoff so a flaky h3 path doesn't keep failing first on every query:
 
 - On transport failure at a higher tier, the upstream is forced down (h3→h2 or h2→h1) for `DOH_UPGRADE_BACKOFF_BASE_MS` × `2^attempts` (capped at `DOH_UPGRADE_BACKOFF_MAX_MS`).
 - After backoff, an upgrade probe goes back to the higher tier. Probe outcomes are tracked separately in counters.
 - The active forced tier is exported per-upstream as `dns_encrypted_proxy_upstream_doh_forced_http_tier{...} 0|1|2` (h3/h2/h1).
 
-Test override: setting `DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1=1` forces h1.1 — used by integration tests; not for production.
+Test overrides, used by the test suite and not for production: `DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1=1` forces h1.1 and collapses the ladder to that single tier, and `DNS_ENCRYPTED_PROXY_TEST_BOOTSTRAP_DNS_PORT` points stage 2 at a mock resolver on an unprivileged port.
 
 ---
 
@@ -202,6 +214,7 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_cache_hits_total` | counter | |
 | `dns_encrypted_proxy_cache_misses_total` | counter | |
 | `dns_encrypted_proxy_failure_cache_hits_total` | counter | SERVFAILs answered from the RFC 2308 failure cache without an upstream attempt. |
+| `dns_encrypted_proxy_udp_queue_drops_total` | counter | UDP queries shed because every worker was busy and the handoff queue was full. Clients retry, but a nonzero rate means the proxy is shedding load: raise `udp_workers`, or find what is holding queries open for their full budget. |
 | `dns_encrypted_proxy_cache_evictions_total` | counter | LRU pressure events. |
 | `dns_encrypted_proxy_cache_expirations_total` | counter | TTL-aged-out reads/sweeps. |
 | `dns_encrypted_proxy_cache_entries` | gauge | Current entry count. |
@@ -235,6 +248,7 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_upstream_doh_h3_consecutive_failures` | gauge | `upstream` | Consecutive h3 failures; any downgrade pin out of h3 engages at the threshold (3). |
 | `dns_encrypted_proxy_upstream_doh_attempt_failures_total` | counter | `upstream`, `tier`, `class` | Per-attempt failures by protocol tier and failure class. |
 | `dns_encrypted_proxy_upstream_doh_slow_retries_total` | counter | `upstream`, `result` | Full-remaining-budget retries after a timed-out attempt whose request reached the upstream (slow answer, not broken transport). `result` is attempt / success. |
+| `dns_encrypted_proxy_doh_pool_wait_timeouts_total` | counter | none | Attempts abandoned because no handle in the DoH pool came free inside the query's own deadline. Local congestion, not an upstream fault: nothing is sent and the server's health is untouched. A nonzero rate means `upstream_pool_size` is too small for the offered load, or upstream latency is holding handles too long. |
 
 ### 5.5 Bootstrap stages
 
@@ -322,27 +336,34 @@ Restart=on-failure
 2. Check `dns_encrypted_proxy_upstream_stage{host="..."}` per upstream. Stuck on stage 2 or 3 means stage 1 (system DNS) is broken — check `/etc/resolv.conf` and that `bootstrap_resolvers` is reachable.
 3. Check `dns_encrypted_proxy_upstream_server_consecutive_failures`. Non-zero means the upstream is rejecting / TLS failing.
 4. Bump `log_level` to `DEBUG` and look for `Upstream stage event:` lines — they're verbose but explicit about which transport stage failed and why.
+5. `Upstream stage event: ... action=skipped reason=budget_exhausted` on every failure means queries are arriving at the transport with no time left, not that the upstream is broken. Check `dns_encrypted_proxy_doh_pool_wait_timeouts_total` and `dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max` for the congestion, and raise `upstream_pool_size` or `upstream_timeout_ms`.
+6. A containerised proxy whose own `resolv.conf` points at a downstream resolver that forwards back to the proxy has no working stage 1 by construction. Give the container a resolver outside that loop (`--dns`) rather than relying on the bootstrap ladder to unwind it on every cold start.
 
 ### 7.2 "DoH is slow / timing out"
 
 1. `dns_encrypted_proxy_upstream_doh_forced_http_tier{host="..."}` — if it's `2` (h1) the proxy gave up on h2/h3 due to repeated failures. `dns_encrypted_proxy_upstream_doh_upgrade_retry_remaining_milliseconds` shows when the next upgrade probe will fire.
-2. Check the libcurl version's HTTP/3 support: `curl -V` looking for `HTTP3` in features. Without it the proxy will run h2/h1 only — performance is fine but not the best case.
+2. Check the libcurl version's HTTP/3 support: `curl -V` looking for `HTTP3` in features. Without it the proxy runs h2/h1 only and says so once at startup. `dns_encrypted_proxy_doh_http_responses_total{version="h3"}` staying at 0 while h2 climbs is the same signal from the metrics side.
 3. `dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max` — high values mean dispatch is queuing rather than executing; raise `upstream_pool_size` or `max_inflight_doh`.
 
-### 7.3 "Cache isn't helping"
+### 7.3 "UDP is slow but TCP is fine"
+
+1. `dns_encrypted_proxy_udp_queue_drops_total` rising means the worker pool is saturated: raise `udp_workers`, or find what is holding queries open for their whole budget.
+2. Clients falling back to TCP en masse (`queries_tcp_total` outrunning `queries_udp_total`) is the classic signature of UDP answers arriving late. Check `upstream_dispatch_queue_wait_milliseconds_max` and `doh_pool_wait_timeouts_total` before suspecting the network.
+
+### 7.4 "Cache isn't helping"
 
 1. `dns_encrypted_proxy_cache_hits_total` / `(hits + misses)` is your hit ratio. Production ratios above 40% are typical for residential traffic, lower for forwarder-of-forwarders deployments.
 2. `dns_encrypted_proxy_cache_evictions_total` rising fast → bump `cache_capacity`.
 3. `dns_encrypted_proxy_cache_expirations_total` rising fast with low hits → upstream TTLs are too short for the working set; not much you can do beyond capacity.
 
-### 7.4 "Process keeps growing in memory"
+### 7.5 "Process keeps growing in memory"
 
 `dns_encrypted_proxy_process_memory_rss_bytes` should stabilize. If it grows monotonically:
 
 1. Compare with `dns_encrypted_proxy_cache_bytes_in_use` — usually accounts for most of it.
 2. Run an ASAN build (`-DENABLE_ASAN=ON`) and reproduce. ASAN catches leaks at exit.
 
-### 7.5 "Tests pass but I don't trust them"
+### 7.6 "Tests pass but I don't trust them"
 
 The reverse-engineering moves: build with ASAN (`build/asan`), run `ctest --test-dir build/asan`. If green, run full Alpine matrix locally:
 

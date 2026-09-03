@@ -41,6 +41,9 @@ static int g_stub_failure_cache_lookup_hit = 0;
 static const uint8_t *g_stub_failure_cache_lookup_resp = NULL;
 static size_t g_stub_failure_cache_lookup_resp_len = 0;
 static int g_stub_failure_cache_store_calls = 0;
+/* Milliseconds the stubbed upstream spends before failing, used to drive a
+ * query past its own deadline. */
+static int g_stub_upstream_burns_budget_ms = 0;
 static int g_stub_cacheable = 0;
 static int g_stub_ttl_ok = 0;
 static uint32_t g_stub_min_ttl = 0;
@@ -129,6 +132,7 @@ static void reset_stubs(void) {
     g_stub_failure_cache_lookup_resp = NULL;
     g_stub_failure_cache_lookup_resp_len = 0;
     g_stub_failure_cache_store_calls = 0;
+    g_stub_upstream_burns_budget_ms = 0;
     g_stub_cacheable = 0;
     g_stub_ttl_ok = 0;
     g_stub_min_ttl = 0;
@@ -477,6 +481,12 @@ int upstream_facilitator_resolve_with_deadline(
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)deadline_ms;
+    if (g_stub_upstream_burns_budget_ms > 0) {
+        struct timespec ts;
+        ts.tv_sec = g_stub_upstream_burns_budget_ms / 1000;
+        ts.tv_nsec = (long)((g_stub_upstream_burns_budget_ms % 1000) * 1000000L);
+        (void)nanosleep(&ts, NULL);
+    }
     return upstream_facilitator_resolve(facilitator, query, query_len, response_out, response_len_out);
 }
 
@@ -867,14 +877,71 @@ static void test_build_servfail_ede(void **state) {
     free(resp);
 }
 
-static void test_process_query_failure_cache(void **state) {
+/* The worker pool is the backpressure boundary for UDP: it is optional, and
+ * when it is full it sheds rather than growing without bound. */
+static void test_udp_worker_pool_lifecycle_and_backpressure(void **state) {
     (void)state;
     reset_stubs();
 
     proxy_server_t server;
     memset(&server, 0, sizeof(server));
-    server.config.failure_cache_ttl_seconds = 30;
-    g_stub_failure_cache_ptr = &server.failure_cache;
+
+    struct sockaddr_in client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    uint8_t query[12];
+    memset(query, 0, sizeof(query));
+
+    /* udp_workers=0 keeps the reader resolving inline; submit must say so. */
+    udp_worker_pool_t pool;
+    server.config.udp_workers = 0;
+    assert_int_equal(udp_worker_pool_start(&pool, &server, -1), 0);
+    assert_int_equal(pool.started, 0);
+    assert_int_equal(udp_worker_pool_submit(&pool, query, sizeof(query), &client_addr, sizeof(client_addr)), -1);
+    udp_worker_pool_stop(&pool);
+
+    /* A configured pool starts its threads and reports its bounded queue. */
+    server.config.udp_workers = 2;
+    server.config.udp_queue_capacity = 4;
+    assert_int_equal(udp_worker_pool_start(&pool, &server, -1), 0);
+    assert_int_equal(pool.started, 1);
+    assert_true(pool.thread_count >= 1);
+    assert_int_equal(pool.capacity, 4);
+
+    /* A full queue sheds the datagram instead of queueing it. */
+    pthread_mutex_lock(&pool.mutex);
+    pool.depth = pool.capacity;
+    pthread_mutex_unlock(&pool.mutex);
+    assert_int_equal(udp_worker_pool_submit(&pool, query, sizeof(query), &client_addr, sizeof(client_addr)), -1);
+
+    pthread_mutex_lock(&pool.mutex);
+    pool.depth = 0;
+    pthread_mutex_unlock(&pool.mutex);
+
+    udp_worker_pool_stop(&pool);
+    assert_int_equal(pool.started, 0);
+    assert_null(pool.threads);
+
+    /* Capacity is clamped, never taken at face value. */
+    server.config.udp_workers = UDP_WORKERS_MAX + 10;
+    server.config.udp_queue_capacity = UDP_QUEUE_CAPACITY_MAX + 10;
+    assert_int_equal(udp_worker_pool_start(&pool, &server, -1), 0);
+    assert_int_equal(pool.capacity, UDP_QUEUE_CAPACITY_MAX);
+    assert_true(pool.thread_count <= UDP_WORKERS_MAX);
+    udp_worker_pool_stop(&pool);
+}
+
+/* proxy_server_t carries the whole config plus both caches, so two of them in
+ * one frame sits right at the 64 KB stack budget the analyze stage enforces.
+ * They live on the heap to keep the check honest as the structs grow. */
+static void test_process_query_failure_cache(void **state) {
+    (void)state;
+    reset_stubs();
+
+    proxy_server_t *server = calloc(1, sizeof(*server));
+    assert_non_null(server);
+    server->config.failure_cache_ttl_seconds = 30;
+    g_stub_failure_cache_ptr = &server->failure_cache;
     g_stub_key_ok = 1;
     g_stub_key_len = 8;
 
@@ -882,46 +949,82 @@ static void test_process_query_failure_cache(void **state) {
      * stored in the failure cache. */
     uint8_t *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_int_equal(process_query(server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
     assert_non_null(out);
     free(out);
     out = NULL;
     assert_int_equal(g_stub_upstream_resolve_calls, 1);
     assert_int_equal(g_stub_failure_cache_store_calls, 1);
-    assert_int_equal((uint64_t)atomic_load(&server.metrics.servfail_sent), 1);
-    assert_int_equal((uint64_t)atomic_load(&server.metrics.cache_misses), 1);
+    assert_int_equal((uint64_t)atomic_load(&server->metrics.servfail_sent), 1);
+    assert_int_equal((uint64_t)atomic_load(&server->metrics.cache_misses), 1);
 
     /* A repeat of the failing question answers from the failure cache: no
      * upstream attempt, no cache-miss accounting, instant SERVFAIL. */
     g_stub_failure_cache_lookup_hit = 1;
     g_stub_failure_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
     g_stub_failure_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
-    assert_int_equal(process_query(&server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_int_equal(process_query(server, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
     assert_non_null(out);
     free(out);
     out = NULL;
     assert_int_equal(g_stub_upstream_resolve_calls, 1);
-    assert_int_equal((uint64_t)atomic_load(&server.metrics.failure_cache_hits), 1);
-    assert_int_equal((uint64_t)atomic_load(&server.metrics.servfail_sent), 2);
-    assert_int_equal((uint64_t)atomic_load(&server.metrics.cache_misses), 1);
+    assert_int_equal((uint64_t)atomic_load(&server->metrics.failure_cache_hits), 1);
+    assert_int_equal((uint64_t)atomic_load(&server->metrics.servfail_sent), 2);
+    assert_int_equal((uint64_t)atomic_load(&server->metrics.cache_misses), 1);
 
     /* failure_cache_ttl_seconds=0 disables both lookup and store. */
     reset_stubs();
-    proxy_server_t disabled;
-    memset(&disabled, 0, sizeof(disabled));
-    disabled.config.failure_cache_ttl_seconds = 0;
-    g_stub_failure_cache_ptr = &disabled.failure_cache;
+    proxy_server_t *disabled = calloc(1, sizeof(*disabled));
+    assert_non_null(disabled);
+    disabled->config.failure_cache_ttl_seconds = 0;
+    g_stub_failure_cache_ptr = &disabled->failure_cache;
     g_stub_failure_cache_lookup_hit = 1;
     g_stub_failure_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
     g_stub_failure_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
     g_stub_key_ok = 1;
     g_stub_key_len = 8;
-    assert_int_equal(process_query(&disabled, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_int_equal(process_query(disabled, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
     assert_non_null(out);
     free(out);
     assert_int_equal(g_stub_upstream_resolve_calls, 1);
     assert_int_equal(g_stub_failure_cache_store_calls, 0);
-    assert_int_equal((uint64_t)atomic_load(&disabled.metrics.failure_cache_hits), 0);
+    assert_int_equal((uint64_t)atomic_load(&disabled->metrics.failure_cache_hits), 0);
+
+    free(server);
+    free(disabled);
+}
+
+/* A failure that consumed the query's whole budget says the proxy ran out of
+ * clock, not that the name is unresolvable. Caching those turned a cold-start
+ * burst into minutes of instant SERVFAIL for healthy names, so the SERVFAIL
+ * still goes back to the client but nothing is pinned.
+ *
+ * proxy_server_t carries the whole config and both caches, so it lives on the
+ * heap here: three of them in one frame is over the 64 KB stack budget the
+ * analyze stage enforces. */
+static void test_process_query_does_not_cache_budget_exhaustion(void **state) {
+    (void)state;
+    reset_stubs();
+
+    proxy_server_t *congested = calloc(1, sizeof(*congested));
+    assert_non_null(congested);
+    congested->config.failure_cache_ttl_seconds = 30;
+    congested->config.upstream_timeout_ms = 20;
+    g_stub_failure_cache_ptr = &congested->failure_cache;
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+    g_stub_upstream_burns_budget_ms = 40;
+
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(process_query(congested, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN, &out, &out_len), 0);
+    assert_non_null(out);
+    free(out);
+    assert_int_equal(g_stub_upstream_resolve_calls, 1);
+    assert_int_equal(g_stub_failure_cache_store_calls, 0);
+    assert_int_equal((uint64_t)atomic_load(&congested->metrics.servfail_sent), 1);
+
+    free(congested);
 }
 
 static void test_proxy_server_init_and_socket_success_paths(void **state) {
@@ -1875,7 +1978,9 @@ int main(void) {
         cmocka_unit_test(test_servfail_and_truncated_builders),
         cmocka_unit_test(test_io_and_socket_helpers),
         cmocka_unit_test(test_process_query_branches),
+        cmocka_unit_test(test_udp_worker_pool_lifecycle_and_backpressure),
         cmocka_unit_test(test_process_query_failure_cache),
+        cmocka_unit_test(test_process_query_does_not_cache_budget_exhaustion),
         cmocka_unit_test(test_build_servfail_ede),
         cmocka_unit_test(test_hosts_override_aaaa_nodata),
         cmocka_unit_test(test_tcp_client_loop_large_response_and_zero_length_query),

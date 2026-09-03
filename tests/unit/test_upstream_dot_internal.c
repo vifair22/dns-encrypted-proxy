@@ -615,7 +615,7 @@ static void test_dot_resolve_success_and_failures(void **state) {
     g_ssl_write_script_len = 2;
 
     g_dns_validate_rc = -1;
-    assert_int_equal(upstream_dot_resolve(client, &server, 20, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 20, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     /* Existing live connection to different host/port forces reconnect branch */
     client->pool[0].fd = 7;
@@ -630,7 +630,7 @@ static void test_dot_resolve_success_and_failures(void **state) {
     g_ssl_read_script_len = 2;
     g_ssl_write_script[0] = -1; /* triggers write failure branch */
     g_ssl_write_script_len = 1;
-    assert_int_equal(upstream_dot_resolve(client, &server, 20, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 20, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     reset_stubs();
     g_ssl_read_data = framed;
@@ -642,7 +642,7 @@ static void test_dot_resolve_success_and_failures(void **state) {
     g_ssl_write_script[1] = 2;
     g_ssl_write_script_len = 2;
     g_malloc_fail_on_call = 1; /* response buffer alloc failure */
-    assert_int_equal(upstream_dot_resolve(client, &server, 20, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 20, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     reset_stubs();
     g_ssl_read_data = framed;
@@ -653,7 +653,7 @@ static void test_dot_resolve_success_and_failures(void **state) {
     g_ssl_write_script[0] = 2;
     g_ssl_write_script[1] = 2;
     g_ssl_write_script_len = 2;
-    assert_int_equal(upstream_dot_resolve(client, &server, 20, query, sizeof(query), &resp, &resp_len), 0);
+    assert_int_equal(upstream_dot_resolve(client, &server, 20, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     assert_non_null(resp);
     assert_int_equal((int)resp_len, 4);
     free(resp);

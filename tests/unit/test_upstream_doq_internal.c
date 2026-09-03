@@ -28,12 +28,14 @@ static void reset_stubs(void) {
 int upstream_doq_ngtcp2_resolve(
     const upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)server;
     (void)timeout_ms;
+    (void)attempt_flags;
     (void)query;
     (void)query_len;
 
@@ -91,7 +93,7 @@ static void test_upstream_doq_resolve_backend_failure(void **state) {
     size_t response_len = 999;
 
     assert_int_equal(
-        upstream_doq_resolve(&client, &server, 100, query, sizeof(query), &response, &response_len),
+        upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len),
         -1);
     assert_null(response);
     assert_int_equal(response_len, 0);
@@ -117,7 +119,7 @@ static void test_upstream_doq_resolve_validation_failure_frees_response(void **s
     size_t response_len = 0;
 
     assert_int_equal(
-        upstream_doq_resolve(&client, &server, 100, query, sizeof(query), &response, &response_len),
+        upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len),
         -1);
     assert_null(response);
     assert_int_equal(response_len, 0);
@@ -143,7 +145,7 @@ static void test_upstream_doq_resolve_success_path(void **state) {
     size_t response_len = 0;
 
     assert_int_equal(
-        upstream_doq_resolve(&client, &server, 100, query, sizeof(query), &response, &response_len),
+        upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len),
         0);
     assert_non_null(response);
     assert_int_equal((int)response_len, (int)sizeof(backend_resp));
@@ -164,21 +166,21 @@ static void test_upstream_doq_resolve_guards(void **state) {
     uint8_t *response = NULL;
     size_t response_len = 0;
 
-    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, query, sizeof(query), &response, &response_len), -1);
-    assert_int_equal(upstream_doq_resolve(&client, NULL, 100, query, sizeof(query), &response, &response_len), -1);
-    assert_int_equal(upstream_doq_resolve(&client, &server, 100, NULL, sizeof(query), &response, &response_len), -1);
-    assert_int_equal(upstream_doq_resolve(&client, &server, 100, query, 0, &response, &response_len), -1);
-    assert_int_equal(upstream_doq_resolve(&client, &server, 100, query, sizeof(query), NULL, &response_len), -1);
-    assert_int_equal(upstream_doq_resolve(&client, &server, 100, query, sizeof(query), &response, NULL), -1);
+    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, NULL, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, NULL, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, 0, &response, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), NULL, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, NULL), -1);
 
     server.type = UPSTREAM_TYPE_DOH;
-    assert_int_equal(upstream_doq_resolve(&client, &server, 100, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
 
     uint8_t *oversized = malloc(65536);
     assert_non_null(oversized);
     memset(oversized, 0xAB, 65536);
     server.type = UPSTREAM_TYPE_DOQ;
-    assert_int_equal(upstream_doq_resolve(&client, &server, 100, oversized, 65536, &response, &response_len), -1);
+    assert_int_equal(upstream_doq_resolve(&client, &server, 100, UPSTREAM_ATTEMPT_NONE, oversized, 65536, &response, &response_len), -1);
     free(oversized);
 }
 

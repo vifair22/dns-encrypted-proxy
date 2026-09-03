@@ -512,6 +512,7 @@ int upstream_dot_resolve(
     upstream_dot_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -575,10 +576,20 @@ int upstream_dot_resolve(
                 timeout_ms);
         }
 
-        if (!connected && establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0, &attempt_reason) == 0) {
-            connected = 1;
-        } else if (!connected) {
-            LOG_DOT_ATTEMPT_FAILURE(server, "primary request", attempt_reason, 0, 0, timeout_ms);
+        /* The caller sets SKIP_LOCAL_ROUTE once it has watched the libc
+         * route fail for this query, so the retry that follows a stage2 or
+         * stage3 bootstrap dials the address that bootstrap just produced
+         * instead of re-proving the broken one. */
+        int skip_local_route =
+            (attempt_flags & UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE) != 0 &&
+            server->stage.has_bootstrap_v4;
+
+        if (!connected && !skip_local_route) {
+            if (establish_tls_connection(client, conn, server->host, server->port, timeout_ms, 0, 0, &attempt_reason) == 0) {
+                connected = 1;
+            } else {
+                LOG_DOT_ATTEMPT_FAILURE(server, "primary request", attempt_reason, 0, 0, timeout_ms);
+            }
         }
 
         if (!connected) {

@@ -48,6 +48,7 @@ int upstream_doq_resolve(
     upstream_doq_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -71,6 +72,7 @@ int upstream_doq_resolve(
     int result = upstream_doq_ngtcp2_resolve(
         server,
         timeout_ms,
+        attempt_flags,
         query,
         query_len,
         response_out,

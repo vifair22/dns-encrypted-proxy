@@ -22,6 +22,10 @@ typedef struct {
     atomic_uint_fast64_t truncated_sent;
     atomic_uint_fast64_t tcp_connections_total;
     atomic_uint_fast64_t tcp_connections_rejected;
+    /* UDP datagrams dropped because every worker was busy and the handoff
+     * queue was full. Clients retry, but a nonzero rate means the proxy is
+     * shedding load. */
+    atomic_uint_fast64_t udp_queue_drops;
     atomic_int_fast32_t tcp_connections_active;
 
     atomic_uint_fast64_t responses_total;

@@ -13,6 +13,7 @@ int upstream_doh_resolve(
     upstream_doh_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -24,6 +25,7 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
-    uint64_t *http_other_total_out);
+    uint64_t *http_other_total_out,
+    uint64_t *pool_wait_timeouts_out);
 
 #endif /* UPSTREAM_DOH_H */
