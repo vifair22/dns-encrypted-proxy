@@ -292,7 +292,7 @@ static void test_resolve_timeout_path_no_server(void **state) {
     uint8_t *response = (uint8_t *)(uintptr_t)0x1;
     size_t response_len = 123;
 
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 20, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 20, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
     assert_null(response);
     assert_int_equal(response_len, 0);
 }
@@ -339,21 +339,21 @@ static void test_resolve_argument_guards(void **state) {
     uint8_t *response = NULL;
     size_t response_len = 0;
 
-    assert_int_equal(upstream_doq_ngtcp2_resolve(NULL, 100, query, sizeof(query), &response, &response_len), -1);
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, NULL, sizeof(query), &response, &response_len), -1);
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, query, 0, &response, &response_len), -1);
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, query, sizeof(query), NULL, &response_len), -1);
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, query, sizeof(query), &response, NULL), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(NULL, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, NULL, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, query, 0, &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), NULL, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, NULL), -1);
 
     server.host[0] = '\0';
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
 
     strcpy(server.host, "127.0.0.1");
     server.port = 0;
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
 
     server.port = 70000;
-    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, query, sizeof(query), &response, &response_len), -1);
+    assert_int_equal(upstream_doq_ngtcp2_resolve(&server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &response, &response_len), -1);
 
     uint8_t *oversized = malloc(DOQ_MAX_DNS_MESSAGE_SIZE + 1);
     assert_non_null(oversized);
@@ -363,6 +363,7 @@ static void test_resolve_argument_guards(void **state) {
         upstream_doq_ngtcp2_resolve(
             &server,
             100,
+            UPSTREAM_ATTEMPT_NONE,
             oversized,
             DOQ_MAX_DNS_MESSAGE_SIZE + 1,
             &response,

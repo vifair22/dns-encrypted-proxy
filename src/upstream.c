@@ -568,6 +568,7 @@ static int resolve_with_server(
                 client->doq_client,
                 server,
                 timeout_ms,
+                attempt_flags,
                 query,
                 query_len,
                 response_out,

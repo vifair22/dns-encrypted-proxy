@@ -25,10 +25,12 @@ static uint64_t g_now_ms = 0;
 static int g_doh_init_rc = 0;
 static int g_dot_init_rc = 0;
 static int g_doq_init_rc = 0;
-static int g_doh_last_attempt_flags = 0;
+static int g_last_attempt_flags = 0;
 /* Makes the stubbed stage1 attempt advance the fake clock by the timeout it
- * was handed, i.e. an upstream that answers nothing until the slice ends. */
-static int g_doh_consume_budget = 0;
+ * was handed, i.e. an upstream that answers nothing until the slice ends.
+ * Honoured by every transport stub so the test reads the same in each build
+ * of the DoH/DoT/DoQ matrix. */
+static int g_consume_budget = 0;
 static int g_doh_resolve_rc = -1;
 static int g_dot_resolve_rc = -1;
 static int g_doq_resolve_rc = -1;
@@ -81,8 +83,8 @@ static void reset_stubs(void) {
     g_dot_init_rc = 0;
     g_doq_init_rc = 0;
     g_doh_resolve_rc = -1;
-    g_doh_consume_budget = 0;
-    g_doh_last_attempt_flags = 0;
+    g_consume_budget = 0;
+    g_last_attempt_flags = 0;
     g_dot_resolve_rc = -1;
     g_doq_resolve_rc = -1;
     g_stage2_rc = -1;
@@ -156,8 +158,8 @@ int upstream_doh_resolve(
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)client;
-    g_doh_last_attempt_flags = attempt_flags;
-    if (g_doh_consume_budget && timeout_ms > 0) {
+    g_last_attempt_flags = attempt_flags;
+    if (g_consume_budget && timeout_ms > 0) {
         g_now_ms += (uint64_t)timeout_ms;
     }
     (void)query;
@@ -221,8 +223,10 @@ int upstream_dot_resolve(
     size_t *response_len_out) {
     (void)client;
     (void)server;
-    (void)attempt_flags;
-    (void)timeout_ms;
+    g_last_attempt_flags = attempt_flags;
+    if (g_consume_budget && timeout_ms > 0) {
+        g_now_ms += (uint64_t)timeout_ms;
+    }
     (void)query;
     (void)query_len;
     if (g_dot_resolve_rc != 0 || g_resp_len == 0) {
@@ -265,13 +269,17 @@ int upstream_doq_resolve(
     upstream_doq_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)client;
     (void)server;
-    (void)timeout_ms;
+    g_last_attempt_flags = attempt_flags;
+    if (g_consume_budget && timeout_ms > 0) {
+        g_now_ms += (uint64_t)timeout_ms;
+    }
     (void)query;
     (void)query_len;
     if (g_doq_resolve_rc != 0 || g_resp_len == 0) {
@@ -738,7 +746,7 @@ static void test_stage2_survives_a_stage1_that_spends_its_budget(void **state) {
     /* Stage1 fails after consuming every millisecond it was given. */
     g_doh_resolve_rc = -1;
     g_doh_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
-    g_doh_consume_budget = 1;
+    g_consume_budget = 1;
     g_stage2_rc = 0;
     g_stage2_reason = "ok";
     g_now_ms = 1000;
@@ -765,7 +773,7 @@ static void test_stage2_survives_a_stage1_that_spends_its_budget(void **state) {
     assert_int_equal(stats.stage2_attempts, 1);
     assert_int_equal(stats.stage2_successes, 1);
     /* The retry that follows the bootstrap must skip the local route. */
-    assert_int_equal(g_doh_last_attempt_flags, UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE);
+    assert_int_equal(g_last_attempt_flags, UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE);
 
     upstream_client_destroy(&client);
 }

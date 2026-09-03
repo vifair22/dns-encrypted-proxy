@@ -63,6 +63,7 @@ int upstream_doq_resolve(
     upstream_doq_client_t *client,
     const upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -630,15 +631,15 @@ static void test_doq_protocol_guard_paths(void **state) {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
 
-    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
+    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, NULL, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, NULL), -1);
 
     server.type = UPSTREAM_TYPE_DOQ;
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     int cap = 1;
     int in_use = 1;
