@@ -80,8 +80,24 @@ int upstream_bootstrap_try_stage2(
     return -1;
 }
 
-upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server_t *server) {
+/* Emulates the system resolver taking its time. g_stage1_prepare_running lets
+ * a test catch the allocator mid-refresh. */
+static int g_stage1_prepare_delay_ms = 0;
+static volatile int g_stage1_prepare_running = 0;
+
+upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_client_t *client, upstream_server_t *server) {
+    (void)client;
     (void)server;
+    int delay_ms = g_stage1_prepare_delay_ms;
+    if (delay_ms > 0) {
+        g_stage1_prepare_running = 1;
+        struct timespec ts = {
+            .tv_sec = delay_ms / 1000,
+            .tv_nsec = (long)(delay_ms % 1000) * 1000000L,
+        };
+        (void)nanosleep(&ts, NULL);
+        g_stage1_prepare_running = 0;
+    }
     return UPSTREAM_STAGE1_CACHE_HIT;
 }
 
@@ -101,6 +117,8 @@ void upstream_bootstrap_stage1_invalidate(upstream_server_t *server) {
 static void reset_stubs(void) {
     memset(g_resolve_calls, 0, sizeof(g_resolve_calls));
     g_resolve_sleep_ms = 0;
+    g_stage1_prepare_delay_ms = 0;
+    g_stage1_prepare_running = 0;
     for (int i = 0; i < UPSTREAM_MAX_SERVERS; i++) {
         g_resolve_result[i] = -1;
     }
@@ -227,6 +245,61 @@ static void test_dispatch_stats_exposed(void **state) {
     destroy_test_client(&client);
 }
 
+static uint64_t test_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+/* A member re-checking its address must keep serving while it does. Taking it
+ * out of READY first meant that whenever the system resolver was slow, every
+ * member of a provider went unavailable together and queries died at their
+ * own deadline without a single upstream attempt. */
+static void test_member_serves_queries_during_a_slow_refresh(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_client_t client;
+    init_test_client(&client);
+    client.server_count = 1;
+    client.config.pool_size = 1;
+    client.config.timeout_ms = 200;
+    client.servers[0].type = UPSTREAM_TYPE_DOH;
+    g_resolve_result[0] = 0;
+
+    upstream_facilitator_t fac;
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
+
+    /* Wait for the first connect to settle the member into service. */
+    uint64_t deadline = test_now_ms() + 2000ULL;
+    while (atomic_load(&fac.members[0].state) != UPSTREAM_MEMBER_READY && test_now_ms() < deadline) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+        (void)nanosleep(&ts, NULL);
+    }
+    assert_int_equal(atomic_load(&fac.members[0].state), UPSTREAM_MEMBER_READY);
+
+    /* Make the next refresh take far longer than a query's whole budget. */
+    g_stage1_prepare_delay_ms = 400;
+    deadline = test_now_ms() + 3000ULL;
+    while (!g_stage1_prepare_running && test_now_ms() < deadline) {
+        struct timespec ts = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        (void)nanosleep(&ts, NULL);
+    }
+    assert_true(g_stage1_prepare_running);
+
+    /* Mid-refresh: the member is still the one answering. */
+    assert_int_equal(atomic_load(&fac.members[0].state), UPSTREAM_MEMBER_READY);
+    uint8_t q[] = {0x51, 0x52};
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_facilitator_resolve(&fac, q, sizeof(q), &resp, &resp_len), 0);
+    free(resp);
+
+    g_stage1_prepare_delay_ms = 0;
+    upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
+}
+
 static void test_cooldown_skips_failed_provider_member(void **state) {
     (void)state;
     reset_stubs();
@@ -311,6 +384,7 @@ int main(void) {
         cmocka_unit_test(test_priority_fallback_to_second_provider),
         cmocka_unit_test(test_deadline_expired_fails_fast),
         cmocka_unit_test(test_dispatch_stats_exposed),
+        cmocka_unit_test(test_member_serves_queries_during_a_slow_refresh),
         cmocka_unit_test(test_cooldown_skips_failed_provider_member),
         cmocka_unit_test(test_inflight_failure_drain_no_job_loss),
     };

@@ -37,6 +37,7 @@
 #include "dns_message.h"
 #include "metrics.h"
 #include "upstream.h"
+#include "upstream_bootstrap.h"
 #include "test_helpers.h"
 #include "test_fixtures.h"
 
@@ -732,7 +733,7 @@ static char *bytes_to_hex(const uint8_t *data, size_t len) {
  * upstream that is reachable but slow to produce the response (e.g. a cold
  * recursive resolution). Threading matters for that case: a retry landing
  * while the first connection is still sleeping must not queue behind it. */
-static char *create_python_doh_script(const char *response_hex, int delay_ms) {
+static char *create_python_doh_script(const char *response_hex, int delay_ms, const char *bind_addr) {
     const char *tmpl =
         "import ssl\n"
         "import sys\n"
@@ -740,6 +741,7 @@ static char *create_python_doh_script(const char *response_hex, int delay_ms) {
         "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
         "RESP = bytes.fromhex(\"%s\")\n"
         "DELAY_S = %d / 1000.0\n"
+        "BIND_ADDR = \"%s\"\n"
         "class Handler(BaseHTTPRequestHandler):\n"
         "    protocol_version = \"HTTP/1.1\"\n"
         "    def do_POST(self):\n"
@@ -760,7 +762,7 @@ static char *create_python_doh_script(const char *response_hex, int delay_ms) {
         "    port = int(sys.argv[1])\n"
         "    cert = sys.argv[2]\n"
         "    key = sys.argv[3]\n"
-        "    httpd = ThreadingHTTPServer((\"127.0.0.1\", port), Handler)\n"
+        "    httpd = ThreadingHTTPServer((BIND_ADDR, port), Handler)\n"
         "    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n"
         "    ctx.load_cert_chain(certfile=cert, keyfile=key)\n"
         "    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)\n"
@@ -768,12 +770,13 @@ static char *create_python_doh_script(const char *response_hex, int delay_ms) {
         "if __name__ == \"__main__\":\n"
         "    main()\n";
 
-    size_t needed = strlen(tmpl) + strlen(response_hex) + 48;
+    const char *addr = (bind_addr != NULL && *bind_addr != '\0') ? bind_addr : "127.0.0.1";
+    size_t needed = strlen(tmpl) + strlen(response_hex) + strlen(addr) + 48;
     char *script = malloc(needed);
     if (script == NULL) {
         return NULL;
     }
-    int n = snprintf(script, needed, tmpl, response_hex, delay_ms);
+    int n = snprintf(script, needed, tmpl, response_hex, delay_ms, addr);
     if (n <= 0 || (size_t)n >= needed) {
         free(script);
         return NULL;
@@ -784,13 +787,15 @@ static char *create_python_doh_script(const char *response_hex, int delay_ms) {
     return path;
 }
 
-static int start_python_doh_server(
+static int start_python_doh_server_on(
     python_doh_server_t *server,
     const char *cert_path,
     const char *key_path,
     const uint8_t *response,
     size_t response_len,
-    int delay_ms) {
+    int delay_ms,
+    const char *bind_addr,
+    int port) {
 
     if (server == NULL || cert_path == NULL || key_path == NULL || response == NULL || response_len == 0) {
         return -1;
@@ -798,7 +803,7 @@ static int start_python_doh_server(
 
     memset(server, 0, sizeof(*server));
     server->pid = -1;
-    server->port = reserve_unused_port();
+    server->port = port > 0 ? port : reserve_unused_port();
     if (server->port <= 0) {
         return -1;
     }
@@ -807,7 +812,7 @@ static int start_python_doh_server(
     if (response_hex == NULL) {
         return -1;
     }
-    server->script_path = create_python_doh_script(response_hex, delay_ms);
+    server->script_path = create_python_doh_script(response_hex, delay_ms, bind_addr);
     free(response_hex);
     if (server->script_path == NULL) {
         return -1;
@@ -852,6 +857,16 @@ static int start_python_doh_server(
     }
 
     return 0;
+}
+
+static int start_python_doh_server(
+    python_doh_server_t *server,
+    const char *cert_path,
+    const char *key_path,
+    const uint8_t *response,
+    size_t response_len,
+    int delay_ms) {
+    return start_python_doh_server_on(server, cert_path, key_path, response, response_len, delay_ms, "127.0.0.1", 0);
 }
 
 static void stop_python_doh_server(python_doh_server_t *server) {
@@ -1468,18 +1483,24 @@ static void test_upstream_transport_doh_slow_response_within_budget(void **state
     assert_memory_equal(response, DNS_RESPONSE_WWW_EXAMPLE_COM_A, response_len);
 
     /* The answer must have absorbed the mock's delay yet landed inside the
-     * per-server budget, i.e. the retry ran with the remaining budget
-     * instead of another starved slice. */
+     * per-server budget. The ladder now reserves only a connect-sized
+     * allowance for the steps behind the current attempt instead of an equal
+     * share, so a 1300 ms answer fits in the first attempt: no slice times
+     * out, nothing is retried, and no protocol pin engages. */
     assert_true(elapsed_ms >= 1300);
     assert_true(elapsed_ms < 2500);
 
     upstream_server_t *srv = &client.servers[0];
-    assert_int_equal((int)srv->stage.doh_slow_retry_attempt_total, 1);
-    assert_int_equal((int)srv->stage.doh_slow_retry_success_total, 1);
-    /* Exactly one starved slice timed out (ladder tier 0) before the
-     * classifier stopped the ladder; no downgrade pin engaged. */
-    assert_int_equal((int)srv->stage.doh_attempt_failures_total[0][UPSTREAM_FAILURE_CLASS_TIMEOUT], 1);
-    assert_int_equal((int)srv->stage.doh_forced_http_tier, 0);
+    assert_int_equal((int)srv->stage.doh_attempt_failures_total[0][UPSTREAM_FAILURE_CLASS_TIMEOUT], 0);
+    assert_int_equal((int)srv->stage.doh_attempt_failures_total[1][UPSTREAM_FAILURE_CLASS_TIMEOUT], 0);
+    assert_int_equal((int)srv->stage.doh_attempt_failures_total[2][UPSTREAM_FAILURE_CLASS_TIMEOUT], 0);
+    assert_int_equal((int)srv->stage.doh_slow_retry_attempt_total, 0);
+    /* The force-http1 hook collapses the ladder onto h1, so that is where
+     * the tier settles - by clamping, not by a downgrade pin. */
+    assert_int_equal((int)srv->stage.doh_forced_http_tier, 2);
+    assert_int_equal((int)srv->stage.doh_downgrade_h3_to_h2_total, 0);
+    assert_int_equal((int)srv->stage.doh_downgrade_h3_to_h1_total, 0);
+    assert_int_equal((int)srv->stage.doh_downgrade_h2_to_h1_total, 0);
     assert_int_equal((int)srv->stage.doh_h3_consecutive_failures, 0);
 
     free(response);
@@ -1489,6 +1510,424 @@ static void test_upstream_transport_doh_slow_response_within_budget(void **state
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
     unsetenv("CURL_CA_BUNDLE");
 }
+/*
+ * Mock stage2 bootstrap resolver: answers every A question with a fixed
+ * address so the bootstrap ladder can be exercised without a real recursive
+ * resolver and without binding port 53.
+ */
+typedef struct {
+    int fd;
+    int port;
+    uint32_t answer_ip_be;
+    uint32_t answer_ttl;
+    pthread_t thread;
+    int running;
+    volatile int stop;
+    volatile unsigned int queries_answered;
+} mock_bootstrap_resolver_t;
+
+static void bootstrap_write_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)((v >> 8) & 0xffu);
+    p[1] = (uint8_t)(v & 0xffu);
+}
+
+static void bootstrap_write_u32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)((v >> 24) & 0xffu);
+    p[1] = (uint8_t)((v >> 16) & 0xffu);
+    p[2] = (uint8_t)((v >> 8) & 0xffu);
+    p[3] = (uint8_t)(v & 0xffu);
+}
+
+static void *mock_bootstrap_resolver_loop(void *arg) {
+    mock_bootstrap_resolver_t *ctx = (mock_bootstrap_resolver_t *)arg;
+
+    while (!ctx->stop) {
+        uint8_t query[512];
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof(peer);
+        ssize_t qn = recvfrom(ctx->fd, query, sizeof(query), 0, (struct sockaddr *)&peer, &peer_len);
+        if (qn < 12) {
+            continue;
+        }
+
+        /* Walk the single question so the answer can echo it back. */
+        size_t qoff = 12;
+        while (qoff < (size_t)qn && query[qoff] != 0) {
+            uint8_t label_len = query[qoff];
+            if (label_len > 63 || qoff + 1 + label_len >= (size_t)qn) {
+                qoff = 0;
+                break;
+            }
+            qoff += 1 + (size_t)label_len;
+        }
+        if (qoff == 0 || qoff + 5 > (size_t)qn) {
+            continue;
+        }
+        qoff += 1 + 4;
+
+        uint8_t resp[512];
+        memset(resp, 0, sizeof(resp));
+        memcpy(resp, query, 2);
+        bootstrap_write_u16(resp + 2, 0x8180);
+        bootstrap_write_u16(resp + 4, 1);
+        bootstrap_write_u16(resp + 6, 1);
+
+        size_t roff = 12;
+        memcpy(resp + roff, query + 12, qoff - 12);
+        roff += qoff - 12;
+
+        resp[roff++] = 0xC0;
+        resp[roff++] = 0x0C;
+        bootstrap_write_u16(resp + roff, 1);
+        bootstrap_write_u16(resp + roff + 2, 1);
+        bootstrap_write_u32(resp + roff + 4, ctx->answer_ttl);
+        bootstrap_write_u16(resp + roff + 8, 4);
+        roff += 10;
+        memcpy(resp + roff, &ctx->answer_ip_be, 4);
+        roff += 4;
+
+        (void)sendto(ctx->fd, resp, roff, 0, (struct sockaddr *)&peer, peer_len);
+        ctx->queries_answered++;
+    }
+
+    return NULL;
+}
+
+static int start_mock_bootstrap_resolver(mock_bootstrap_resolver_t *ctx, const char *answer_ip, uint32_t ttl) {
+    if (ctx == NULL || answer_ip == NULL) {
+        return -1;
+    }
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->fd = -1;
+    ctx->answer_ttl = ttl;
+    if (inet_pton(AF_INET, answer_ip, &ctx->answer_ip_be) != 1) {
+        return -1;
+    }
+
+    ctx->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ctx->fd < 0) {
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(ctx->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(ctx->fd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+    ctx->port = ntohs(addr.sin_port);
+
+    /* Bounded receive so the loop notices the stop flag on teardown. */
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100 * 1000;
+    (void)setsockopt(ctx->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    if (pthread_create(&ctx->thread, NULL, mock_bootstrap_resolver_loop, ctx) != 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+        return -1;
+    }
+    ctx->running = 1;
+    return 0;
+}
+
+static void stop_mock_bootstrap_resolver(mock_bootstrap_resolver_t *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->running) {
+        ctx->stop = 1;
+        pthread_join(ctx->thread, NULL);
+        ctx->running = 0;
+    }
+    if (ctx->fd >= 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+}
+
+static void configure_test_bootstrap_resolver(upstream_client_t *client, const char *resolver_ip, int resolver_port) {
+    proxy_config_t bootstrap_config;
+    memset(&bootstrap_config, 0, sizeof(bootstrap_config));
+    snprintf(
+        bootstrap_config.bootstrap_resolvers[0],
+        sizeof(bootstrap_config.bootstrap_resolvers[0]),
+        "%s",
+        resolver_ip);
+    bootstrap_config.bootstrap_resolver_count = 1;
+    assert_int_equal(upstream_bootstrap_configure(client, &bootstrap_config), PROXY_OK);
+
+    char port_text[16];
+    snprintf(port_text, sizeof(port_text), "%d", resolver_port);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_BOOTSTRAP_DNS_PORT", port_text, 1);
+}
+
+/*
+ * Test: a stage1 route that swallows the request must not consume the budget
+ * the bootstrap ladder needs. Production ran exactly this shape - the local
+ * resolver path pointed back through the proxy's own downstream, so route 0
+ * hung - and every query logged "stage2 skipped budget_exhausted" and
+ * SERVFAILed with the rescue path untouched.
+ *
+ * Both mock upstreams answer for the same hostname on the same port: the one
+ * libc resolves (127.0.0.1) never answers in time, the one stage2 hands back
+ * (127.0.0.2) answers at once.
+ */
+static void test_upstream_stage2_bootstrap_rescues_stalled_stage1(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    int shared_port = reserve_unused_port();
+    assert_true(shared_port > 0);
+
+    /* Answers only after the whole per-server budget has elapsed. */
+    python_doh_server_t stalled_server;
+    assert_int_equal(
+        start_python_doh_server_on(
+            &stalled_server,
+            cert_path,
+            key_path,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN,
+            5000,
+            "127.0.0.1",
+            shared_port),
+        0);
+
+    python_doh_server_t bootstrap_server;
+    assert_int_equal(
+        start_python_doh_server_on(
+            &bootstrap_server,
+            cert_path,
+            key_path,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A,
+            DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN,
+            0,
+            "127.0.0.2",
+            shared_port),
+        0);
+
+    mock_bootstrap_resolver_t resolver;
+    assert_int_equal(start_mock_bootstrap_resolver(&resolver, "127.0.0.2", 60), 0);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://localhost:%d/dns-query", shared_port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 2500,
+        .pool_size = 2,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
+    configure_test_bootstrap_resolver(&client, "127.0.0.1", resolver.port);
+
+    struct timespec t_start;
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    int resolve_rc = upstream_resolve(
+        &client,
+        DNS_QUERY_WWW_EXAMPLE_COM_A,
+        DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+        &response,
+        &response_len);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000L +
+                      (t_end.tv_nsec - t_start.tv_nsec) / 1000000L;
+
+    assert_int_equal(resolve_rc, 0);
+    assert_non_null(response);
+    assert_int_equal(response_len, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN);
+    assert_memory_equal(response, DNS_RESPONSE_WWW_EXAMPLE_COM_A, response_len);
+
+    /* The rescue has to happen inside the query's own budget, otherwise the
+     * dispatcher has already given up on this server. */
+    assert_true(elapsed_ms < 2500);
+
+    assert_int_equal((int)client.stage_metrics.stage2_attempts, 1);
+    assert_int_equal((int)client.stage_metrics.stage2_successes, 1);
+    assert_true(resolver.queries_answered >= 1);
+
+    upstream_server_t *srv = &client.servers[0];
+    assert_int_equal(srv->stage.has_bootstrap_v4, 1);
+    assert_int_equal((int)srv->stage.bootstrap_addr_v4_be, (int)resolver.answer_ip_be);
+    /* Stage1's stall is a slow answer over a working transport, so it must
+     * not count against the server's health. */
+    assert_int_equal(srv->health.healthy, 1);
+
+    free(response);
+    upstream_client_destroy(&client);
+    stop_mock_bootstrap_resolver(&resolver);
+    stop_python_doh_server(&bootstrap_server);
+    stop_python_doh_server(&stalled_server);
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_BOOTSTRAP_DNS_PORT");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+
+typedef struct {
+    int port;
+    int rc;
+    uint16_t rcode;
+} udp_client_ctx_t;
+
+static void *udp_client_thread_main(void *arg) {
+    udp_client_ctx_t *ctx = (udp_client_ctx_t *)arg;
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    ctx->rc = send_udp_query_and_recv(
+        ctx->port,
+        DNS_QUERY_WWW_EXAMPLE_COM_A,
+        DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+        resp,
+        &resp_len);
+    if (ctx->rc == 0 && resp_len >= 12) {
+        uint16_t flags = (uint16_t)(((uint16_t)resp[2] << 8) | (uint16_t)resp[3]);
+        ctx->rcode = (uint16_t)(flags & 0x000Fu);
+    }
+    return NULL;
+}
+
+/*
+ * Test: concurrent UDP queries must not queue behind each other. The socket
+ * reader used to resolve inline, so four queries against an upstream that
+ * takes half a second each cost two seconds and the listener was deaf for
+ * the whole of it - the shape that made one slow upstream look like a total
+ * outage and pushed clients onto TCP.
+ */
+static void test_dns_server_udp_queries_run_concurrently(void **state) {
+    (void)state;
+
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    /* TTL 0 keeps every query on the upstream path: a cached answer would
+     * let the later queries skip it and hide the serialization entirely. The
+     * TTL field sits after the answer's name pointer, type and class. */
+    uint8_t uncached_response[sizeof(DNS_RESPONSE_WWW_EXAMPLE_COM_A)];
+    memcpy(uncached_response, DNS_RESPONSE_WWW_EXAMPLE_COM_A, sizeof(uncached_response));
+    const size_t answer_ttl_offset = 12 + 21 + 2 + 2 + 2;
+    memset(uncached_response + answer_ttl_offset, 0, 4);
+
+    python_doh_server_t upstream;
+    assert_int_equal(
+        start_python_doh_server(
+            &upstream,
+            cert_path,
+            key_path,
+            uncached_response,
+            sizeof(uncached_response),
+            500),
+        0);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent"), 0);
+    strncpy(config.listen_addr, "127.0.0.1", sizeof(config.listen_addr) - 1);
+    config.listen_addr[sizeof(config.listen_addr) - 1] = '\0';
+    config.listen_port = reserve_unused_port();
+    assert_true(config.listen_port > 0);
+    config.upstream_timeout_ms = 2500;
+    config.upstream_pool_size = 4;
+    config.upstream_count = 1;
+    config.udp_workers = 4;
+    config.metrics_enabled = 0;
+    snprintf(config.upstream_urls[0], sizeof(config.upstream_urls[0]), "https://localhost:%d/dns-query", upstream.port);
+
+    volatile sig_atomic_t stop = 0;
+    proxy_server_t server;
+    assert_int_equal(proxy_server_init(&server, &config, &stop), PROXY_OK);
+
+    proxy_thread_ctx_t ctx = {.server = &server, .rc = -1};
+    pthread_t thread;
+    assert_int_equal(pthread_create(&thread, NULL, proxy_server_thread_main, &ctx), 0);
+
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 300 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    enum { UDP_CLIENTS = 4 };
+    udp_client_ctx_t clients[UDP_CLIENTS];
+    pthread_t client_threads[UDP_CLIENTS];
+
+    struct timespec t_start;
+    struct timespec t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int i = 0; i < UDP_CLIENTS; i++) {
+        clients[i].port = config.listen_port;
+        clients[i].rc = -1;
+        clients[i].rcode = 0xFFFFu;
+        assert_int_equal(pthread_create(&client_threads[i], NULL, udp_client_thread_main, &clients[i]), 0);
+    }
+    for (int i = 0; i < UDP_CLIENTS; i++) {
+        pthread_join(client_threads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000L +
+                      (t_end.tv_nsec - t_start.tv_nsec) / 1000000L;
+
+    stop = 1;
+    pthread_join(thread, NULL);
+    assert_int_equal(ctx.rc, 0);
+
+    for (int i = 0; i < UDP_CLIENTS; i++) {
+        assert_int_equal(clients[i].rc, 0);
+        assert_int_equal(clients[i].rcode, 0);
+    }
+
+    /* Four 500 ms queries resolved in parallel land near 500 ms; resolved one
+     * after another they cannot finish under 2000 ms. */
+    assert_true(elapsed_ms >= 500);
+    assert_true(elapsed_ms < 1500);
+    assert_int_equal((uint64_t)atomic_load(&server.metrics.udp_queue_drops), 0);
+
+    proxy_server_destroy(&server);
+    stop_python_doh_server(&upstream);
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+
 #endif
 
 /*
@@ -3470,6 +3909,8 @@ int main(void) {
         cmocka_unit_test(test_upstream_transport_doh_success),
         cmocka_unit_test(test_upstream_transport_doh_unreachable),
         cmocka_unit_test(test_upstream_transport_doh_slow_response_within_budget),
+        cmocka_unit_test(test_upstream_stage2_bootstrap_rescues_stalled_stage1),
+        cmocka_unit_test(test_dns_server_udp_queries_run_concurrently),
         cmocka_unit_test(test_upstream_transport_doh_http1_runtime_stats),
 #endif
 #if UPSTREAM_DOT_ENABLED

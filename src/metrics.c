@@ -649,6 +649,9 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "# HELP dns_encrypted_proxy_truncated_sent_total Total number of truncated UDP responses sent.\n"
             "# TYPE dns_encrypted_proxy_truncated_sent_total counter\n"
             "dns_encrypted_proxy_truncated_sent_total %llu\n"
+            "# HELP dns_encrypted_proxy_udp_queue_drops_total UDP queries dropped because the worker handoff queue was full.\n"
+            "# TYPE dns_encrypted_proxy_udp_queue_drops_total counter\n"
+            "dns_encrypted_proxy_udp_queue_drops_total %llu\n"
             "# HELP dns_encrypted_proxy_tcp_connections_total Total number of accepted TCP client connections.\n"
             "# TYPE dns_encrypted_proxy_tcp_connections_total counter\n"
             "dns_encrypted_proxy_tcp_connections_total %llu\n"
@@ -681,6 +684,7 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)atomic_load(&m->servfail_sent),
             (unsigned long long)atomic_load(&m->internal_errors_total),
             (unsigned long long)atomic_load(&m->truncated_sent),
+            (unsigned long long)atomic_load(&m->udp_queue_drops),
             (unsigned long long)atomic_load(&m->tcp_connections_total),
             (unsigned long long)atomic_load(&m->tcp_connections_rejected),
             (int)atomic_load(&m->tcp_connections_active),
@@ -768,6 +772,9 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "dns_encrypted_proxy_doh_protocol_upgrade_probes_total{result=\"attempt\"} %llu\n"
             "dns_encrypted_proxy_doh_protocol_upgrade_probes_total{result=\"success\"} %llu\n"
             "dns_encrypted_proxy_doh_protocol_upgrade_probes_total{result=\"failure\"} %llu\n"
+            "# HELP dns_encrypted_proxy_doh_pool_wait_timeouts_total DoH attempts abandoned because no pool handle came free inside the query deadline.\n"
+            "# TYPE dns_encrypted_proxy_doh_pool_wait_timeouts_total counter\n"
+            "dns_encrypted_proxy_doh_pool_wait_timeouts_total %llu\n"
             "# HELP dns_encrypted_proxy_upstream_stage1_cache_total Upstream stage1 resolver cache counters.\n"
             "# TYPE dns_encrypted_proxy_upstream_stage1_cache_total counter\n"
             "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"hit\"} %llu\n"
@@ -784,6 +791,7 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)runtime_stats.doh_upgrade_probe_attempt_total,
             (unsigned long long)runtime_stats.doh_upgrade_probe_success_total,
             (unsigned long long)runtime_stats.doh_upgrade_probe_failure_total,
+            (unsigned long long)runtime_stats.doh_pool_wait_timeouts_total,
             (unsigned long long)runtime_stats.stage1_cache_hits,
             (unsigned long long)runtime_stats.stage1_cache_misses,
             (unsigned long long)runtime_stats.stage1_cache_refreshes,

@@ -25,6 +25,17 @@
 
 #define UPSTREAM_MAX_STAGE_ATTEMPTS_PER_QUERY 12
 #define UPSTREAM_MIN_USEFUL_BUDGET_MS 25
+/* Wall clock withheld from stage1 so the bootstrap ladder still has a budget
+ * to run in. Stage1 used to be entitled to the whole deadline, so whenever
+ * the local resolver was the thing that was broken - the exact condition
+ * stage2 and stage3 exist for - they were skipped as "budget_exhausted" and
+ * the query SERVFAILed with the rescue path untouched. Sized for one UDP
+ * bootstrap lookup plus a short retry on the address it returns. */
+#define UPSTREAM_STAGE_FALLBACK_RESERVE_MS 600
+/* A stage2 lookup is a single UDP round trip to a hardcoded resolver on the
+ * local network path; capping it leaves the rest of the reserve for stage3
+ * and for the retry the bootstrap exists to enable. */
+#define UPSTREAM_STAGE2_QUERY_TIMEOUT_MS 400
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -388,6 +399,14 @@ proxy_status_t upstream_client_init(
                          mtx_rc);
     }
 
+    int transport_mtx_rc = pthread_mutex_init(&client->transport_mutex, NULL);
+    if (transport_mtx_rc != 0) {
+        pthread_mutex_destroy(&client->stage1_cache_mutex);
+        return set_error(PROXY_ERR_RESOURCE,
+                         "pthread_mutex_init transport_mutex failed (rc=%d)",
+                         transport_mtx_rc);
+    }
+
     /*
      * Lazily initialize DoH/DoT/DoQ clients so startup remains lightweight when a
      * protocol is configured but never selected on the active path.
@@ -423,33 +442,71 @@ void upstream_client_destroy(upstream_client_t *client) {
 #endif
     
     pthread_mutex_destroy(&client->stage1_cache_mutex);
+    pthread_mutex_destroy(&client->transport_mutex);
     memset(client, 0, sizeof(*client));
 }
 
+/*
+ * Lazy transport construction is double-checked: the fast path is a plain
+ * pointer read, and only the first callers serialize. Without the lock two
+ * workers arriving together each built a client, one assignment won, and the
+ * loser's connection pool leaked - invisible while UDP resolved one query at
+ * a time, reachable the moment queries run in parallel.
+ */
 #if UPSTREAM_DOH_ENABLED
 static int ensure_doh_client(upstream_client_t *client) {
-    if (client->doh_client != NULL) {
+    if (__atomic_load_n(&client->doh_client, __ATOMIC_ACQUIRE) != NULL) {
         return 0;
     }
-    return upstream_doh_client_init(&client->doh_client, &client->config);
+    pthread_mutex_lock(&client->transport_mutex);
+    int rc = 0;
+    if (client->doh_client == NULL) {
+        upstream_doh_client_t *created = NULL;
+        rc = upstream_doh_client_init(&created, &client->config);
+        if (rc == 0) {
+            __atomic_store_n(&client->doh_client, created, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&client->transport_mutex);
+    return rc;
 }
 #endif
 
 #if UPSTREAM_DOT_ENABLED
 static int ensure_dot_client(upstream_client_t *client) {
-    if (client->dot_client != NULL) {
+    if (__atomic_load_n(&client->dot_client, __ATOMIC_ACQUIRE) != NULL) {
         return 0;
     }
-    return upstream_dot_client_init(&client->dot_client, &client->config);
+    pthread_mutex_lock(&client->transport_mutex);
+    int rc = 0;
+    if (client->dot_client == NULL) {
+        upstream_dot_client_t *created = NULL;
+        rc = upstream_dot_client_init(&created, &client->config);
+        if (rc == 0) {
+            __atomic_store_n(&client->dot_client, created, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&client->transport_mutex);
+    return rc;
 }
 #endif
 
 #if UPSTREAM_DOQ_ENABLED
 static int ensure_doq_client(upstream_client_t *client) {
-    if (client->doq_client != NULL) {
+    if (__atomic_load_n(&client->doq_client, __ATOMIC_ACQUIRE) != NULL) {
         return 0;
     }
-    return upstream_doq_client_init(&client->doq_client, &client->config);
+    pthread_mutex_lock(&client->transport_mutex);
+    int rc = 0;
+    if (client->doq_client == NULL) {
+        upstream_doq_client_t *created = NULL;
+        rc = upstream_doq_client_init(&created, &client->config);
+        if (rc == 0) {
+            __atomic_store_n(&client->doq_client, created, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&client->transport_mutex);
+    return rc;
 }
 #endif
 
@@ -457,6 +514,7 @@ static int resolve_with_server(
     upstream_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -476,6 +534,7 @@ static int resolve_with_server(
                 client->doh_client,
                 server,
                 timeout_ms,
+                attempt_flags,
                 query, query_len,
                 response_out, response_len_out);
             break;
@@ -492,6 +551,7 @@ static int resolve_with_server(
                 client->dot_client,
                 server,
                 timeout_ms,
+                attempt_flags,
                 query, query_len,
                 response_out, response_len_out);
             break;
@@ -568,10 +628,35 @@ static int effective_attempt_timeout_ms(uint64_t deadline_ms, int configured_tim
     return remain < configured ? remain : configured;
 }
 
+/* Deadline stage1 must respect so the fallback stages inherit a usable
+ * budget. Never withholds more than half of what is left: with a nearly
+ * expired deadline the reserve shrinks with it instead of starving stage1. */
+static uint64_t stage1_deadline_ms(uint64_t deadline_ms) {
+    if (deadline_ms == 0) {
+        return 0;
+    }
+    uint64_t now = now_ms();
+    if (deadline_ms <= now) {
+        return deadline_ms;
+    }
+    uint64_t budget = deadline_ms - now;
+    uint64_t reserve = UPSTREAM_STAGE_FALLBACK_RESERVE_MS;
+    if (reserve > budget / 2) {
+        reserve = budget / 2;
+    }
+    return deadline_ms - reserve;
+}
+
+static int stage2_query_timeout_ms(uint64_t deadline_ms, int configured_timeout_ms) {
+    int remain = effective_attempt_timeout_ms(deadline_ms, configured_timeout_ms);
+    if (remain <= 0) {
+        return remain;
+    }
+    return remain < UPSTREAM_STAGE2_QUERY_TIMEOUT_MS ? remain : UPSTREAM_STAGE2_QUERY_TIMEOUT_MS;
+}
+
 static upstream_stage1_cache_result_t prepare_stage1_cache(upstream_client_t *client, upstream_server_t *server) {
-    pthread_mutex_lock(&client->stage1_cache_mutex);
-    upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(server);
-    pthread_mutex_unlock(&client->stage1_cache_mutex);
+    upstream_stage1_cache_result_t stage1_cache = upstream_bootstrap_stage1_prepare(client, server);
 
     if (stage1_cache == UPSTREAM_STAGE1_CACHE_HIT) {
         client_counter_inc(&client->stage_metrics.stage1_cache_hits);
@@ -823,44 +908,52 @@ static int resolve_server_with_fallback(
     uint64_t deadline_ms) {
     uint8_t *response = NULL;
     size_t response_len = 0;
-    int timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
+    /* Stage1 runs against a shortened deadline so a local resolver that hangs
+     * cannot consume the budget the bootstrap stages need to route around it. */
+    int timeout_ms = effective_attempt_timeout_ms(stage1_deadline_ms(deadline_ms), client->config.timeout_ms);
+    int stage1_attempted = 0;
 
     if (timeout_ms <= 0) {
         LOG_STAGE_EVENT(server, 1, "stage1", "skipped", "budget_exhausted", "insufficient_remaining_budget", 0);
         server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
-        return -1;
-    }
-
-    upstream_stage1_cache_result_t stage1_cache = prepare_stage1_cache(client, server);
-
-    if (unhealthy_probe) {
-        LOGF_DEBUG("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
+        /* Nothing was asked of this server, so the failure carries no
+         * evidence about it; the bootstrap ladder below still gets its turn. */
+        server->stage.last_failure_slow_response = 1;
     } else {
-        LOGF_DEBUG("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
+        upstream_stage1_cache_result_t stage1_cache = prepare_stage1_cache(client, server);
+
+        if (unhealthy_probe) {
+            LOGF_DEBUG("Upstream connect retry unhealthy: host=%s type=%s", server->host, upstream_type_name(server->type));
+        } else {
+            LOGF_DEBUG("Upstream connect stage1 local resolver: host=%s type=%s", server->host, upstream_type_name(server->type));
+        }
+
+        stage1_attempted = 1;
+        if (consume_retry_budget(retry_budget, server, "stage1") == 0 &&
+            resolve_with_server(client, server, timeout_ms, UPSTREAM_ATTEMPT_NONE, query, query_len, &response, &response_len) == 0) {
+            maybe_hydrate_stage1_cache(client, server, stage1_cache);
+            upstream_server_record_success(server);
+            *response_out = response;
+            *response_len_out = response_len;
+            return 0;
+        }
+
+        if (unhealthy_probe) {
+            LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
+        } else {
+            LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
+        }
+
+        note_stage1_failure(client, server);
     }
 
-    if (consume_retry_budget(retry_budget, server, "stage1") == 0 &&
-        resolve_with_server(client, server, timeout_ms, query, query_len, &response, &response_len) == 0) {
-        maybe_hydrate_stage1_cache(client, server, stage1_cache);
-        upstream_server_record_success(server);
-        *response_out = response;
-        *response_len_out = response_len;
-        return 0;
-    }
-
-    if (unhealthy_probe) {
-        LOGF_WARN("Upstream unhealthy retry failed: host=%s type=%s", server->host, upstream_type_name(server->type));
-    } else {
-        LOGF_WARN("Upstream failed: host=%s type=%s", server->host, upstream_type_name(server->type));
-    }
-
-    note_stage1_failure(client, server);
-
-    timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
+    timeout_ms = stage2_query_timeout_ms(deadline_ms, client->config.timeout_ms);
     if (timeout_ms <= 0) {
         LOG_STAGE_EVENT(server, 2, "stage2", "skipped", "budget_exhausted", "insufficient_remaining_budget", 0);
         server->stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
-        upstream_server_record_failure(server, &client->config);
+        if (stage1_attempted) {
+            upstream_server_record_failure(server, &client->config);
+        }
         return -1;
     }
 
@@ -872,7 +965,7 @@ static int resolve_server_with_fallback(
         timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
         if (consume_retry_budget(retry_budget, server, "stage2") == 0 &&
             timeout_ms > 0 &&
-            resolve_with_server(client, server, timeout_ms, query, query_len, &response, &response_len) == 0) {
+            resolve_with_server(client, server, timeout_ms, UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE, query, query_len, &response, &response_len) == 0) {
             upstream_server_record_success(server);
             *response_out = response;
             *response_len_out = response_len;
@@ -926,7 +1019,7 @@ static int resolve_server_with_fallback(
             timeout_ms = effective_attempt_timeout_ms(deadline_ms, client->config.timeout_ms);
             if (consume_retry_budget(retry_budget, server, "stage3") == 0 &&
                 timeout_ms > 0 &&
-                resolve_with_server(client, server, timeout_ms, query, query_len, &response, &response_len) == 0) {
+                resolve_with_server(client, server, timeout_ms, UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE, query, query_len, &response, &response_len) == 0) {
                 upstream_server_record_success(server);
                 *response_out = response;
                 *response_len_out = response_len;
@@ -1100,7 +1193,8 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             &stats_out->doh_http3_responses_total,
             &stats_out->doh_http2_responses_total,
             &stats_out->doh_http1_responses_total,
-            &stats_out->doh_http_other_responses_total);
+            &stats_out->doh_http_other_responses_total,
+            &stats_out->doh_pool_wait_timeouts_total);
     }
 
     for (int i = 0; i < client->server_count; i++) {

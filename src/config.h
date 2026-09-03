@@ -10,6 +10,11 @@
 #define MAX_URL_LEN 512
 #define MAX_HOSTS_A_OVERRIDES 64
 #define MAX_BOOTSTRAP_RESOLVERS 8
+/* Upper bounds on the UDP query workers and the queue between them and the
+ * socket reader. Both are sized to stay well clear of thread and memory
+ * exhaustion if a config typo asks for something absurd. */
+#define UDP_WORKERS_MAX 64
+#define UDP_QUEUE_CAPACITY_MAX 4096
 
 typedef struct {
     char name[256];
@@ -33,6 +38,11 @@ typedef struct {
     char upstream_urls[MAX_UPSTREAMS][MAX_URL_LEN];
     int upstream_count;
     char config_path[256];
+    /* Threads that run queries read off the UDP socket. The socket reader
+     * hands each datagram to one of them, so a slow query no longer blocks
+     * every UDP query queued behind it. */
+    int udp_workers;
+    int udp_queue_capacity;
     int tcp_idle_timeout_ms;
     int tcp_max_clients;
     int tcp_max_queries_per_conn;

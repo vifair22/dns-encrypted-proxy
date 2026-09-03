@@ -278,6 +278,43 @@ static void test_stage1_hydrate_success(void **state) {
     assert_true(s.stage.bootstrap_expires_at_ms != 0);
 }
 
+/* A lookup in flight on another thread must not stall this caller: the point
+ * of splitting getaddrinfo out of the cache lock is that nobody queues behind
+ * a blocking system resolver. */
+static void test_stage1_prepare_does_not_queue_behind_a_running_lookup(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_server_t server;
+    memset(&server, 0, sizeof(server));
+    strncpy(server.host, "localhost", sizeof(server.host) - 1);
+
+    /* Expired entry, address still known, someone else already looking. */
+    server.stage.stage1_lookup_in_flight = 1;
+    server.stage.has_stage1_cached_v4 = 1;
+    server.stage.stage1_cached_addr_v4_be = htonl(0x7F000001u);
+    server.stage.stage1_cache_expires_at_ms = 0;
+
+    assert_int_equal(upstream_bootstrap_stage1_prepare(NULL, &server), UPSTREAM_STAGE1_CACHE_HIT);
+    assert_int_equal(server.stage.has_stage1_cached_v4, 1);
+    assert_int_equal((int)server.stage.stage1_cached_addr_v4_be, (int)htonl(0x7F000001u));
+
+    /* Nothing known yet: report the miss rather than block. */
+    server.stage.has_stage1_cached_v4 = 0;
+    assert_int_equal(upstream_bootstrap_stage1_prepare(NULL, &server), UPSTREAM_STAGE1_CACHE_MISS);
+    /* The flag belongs to the thread that set it; this caller leaves it be. */
+    assert_int_equal(server.stage.stage1_lookup_in_flight, 1);
+
+    /* A lookup this caller does own clears the flag on the way out, failure
+     * included, so the next caller is free to retry. */
+    server.stage.stage1_lookup_in_flight = 0;
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_GETADDRINFO_FAIL", "1", 1);
+    assert_int_equal(upstream_bootstrap_stage1_prepare(NULL, &server), UPSTREAM_STAGE1_CACHE_MISS);
+    assert_int_equal(server.stage.stage1_lookup_in_flight, 0);
+    assert_int_equal(server.stage.has_stage1_cached_v4, 0);
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_GETADDRINFO_FAIL");
+}
+
 static void test_stage3_success_failure_and_cooldown(void **state) {
     (void)state;
     reset_stubs();
@@ -309,6 +346,7 @@ static void test_stage3_success_failure_and_cooldown(void **state) {
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_configure_paths),
+        cmocka_unit_test(test_stage1_prepare_does_not_queue_behind_a_running_lookup),
         cmocka_unit_test(test_stage2_no_resolvers),
         cmocka_unit_test(test_stage2_success_and_ttl_clamp),
         cmocka_unit_test(test_stage1_hydrate_success),

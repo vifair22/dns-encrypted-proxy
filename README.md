@@ -122,6 +122,7 @@ Main config keys:
 - `listen_addr`, `listen_port`
 - `upstreams` (comma-separated `https://...`, `tls://host[:port]`, and/or `quic://host[:port]`)
 - `upstream_timeout_ms`, `upstream_pool_size`
+- `udp_workers`, `udp_queue_capacity`
 - `max_inflight_doh`, `max_inflight_dot`, `max_inflight_doq`
 - `bootstrap_resolvers` (comma-separated IPv4 recursive resolvers used for stage2 bootstrap)
 - `cache_capacity`
