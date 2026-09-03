@@ -344,6 +344,22 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
+    if (strcmp(key, "udp_workers") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->udp_workers = parsed > UDP_WORKERS_MAX ? UDP_WORKERS_MAX : parsed;
+        }
+        return;
+    }
+
+    if (strcmp(key, "udp_queue_capacity") == 0) {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->udp_queue_capacity = parsed > UDP_QUEUE_CAPACITY_MAX ? UDP_QUEUE_CAPACITY_MAX : parsed;
+        }
+        return;
+    }
+
     if (strcmp(key, "tcp_max_clients") == 0) {
         int parsed = 0;
         if (parse_int(value, &parsed) == 0 && parsed > 0) {
@@ -480,6 +496,22 @@ static void apply_env_overrides(proxy_config_t *config) {
         }
     }
 
+    value = getenv("UDP_WORKERS");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->udp_workers = parsed > UDP_WORKERS_MAX ? UDP_WORKERS_MAX : parsed;
+        }
+    }
+
+    value = getenv("UDP_QUEUE_CAPACITY");
+    if (value != NULL && *value != '\0') {
+        int parsed = 0;
+        if (parse_int(value, &parsed) == 0 && parsed > 0) {
+            config->udp_queue_capacity = parsed > UDP_QUEUE_CAPACITY_MAX ? UDP_QUEUE_CAPACITY_MAX : parsed;
+        }
+    }
+
     value = getenv("TCP_MAX_CLIENTS");
     if (value != NULL && *value != '\0') {
         int parsed = 0;
@@ -559,6 +591,8 @@ static void set_defaults(proxy_config_t *config) {
 
     strncpy(config->config_path, "dns-encrypted-proxy.conf", sizeof(config->config_path) - 1);
 
+    config->udp_workers = 8;
+    config->udp_queue_capacity = 256;
     config->tcp_idle_timeout_ms = 10000;
     config->tcp_max_clients = 256;
     config->tcp_max_queries_per_conn = 0;
@@ -700,6 +734,8 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  max_inflight_doq=%d\n", config->max_inflight_doq);
     fprintf(out, "  cache_capacity=%d\n", config->cache_capacity);
     fprintf(out, "  failure_cache_ttl_seconds=%d\n", config->failure_cache_ttl_seconds);
+    fprintf(out, "  udp_workers=%d\n", config->udp_workers);
+    fprintf(out, "  udp_queue_capacity=%d\n", config->udp_queue_capacity);
     fprintf(out, "  tcp_idle_timeout_ms=%d\n", config->tcp_idle_timeout_ms);
     fprintf(out, "  tcp_max_clients=%d\n", config->tcp_max_clients);
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);

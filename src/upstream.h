@@ -44,6 +44,13 @@ typedef enum {
 
 #define DOH_HTTP_TIER_COUNT 3
 
+/* Per-attempt hints a transport honours when the caller already knows
+ * something about this query that the transport cannot see for itself. */
+#define UPSTREAM_ATTEMPT_NONE 0
+/* Skip the libc-resolved route: the caller just watched it fail for this
+ * query and has since obtained an address out of band. */
+#define UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE (1 << 0)
+
 typedef struct {
     uint32_t bootstrap_addr_v4_be;
     uint64_t bootstrap_expires_at_ms;
@@ -55,6 +62,9 @@ typedef struct {
     uint64_t stage1_cache_expires_at_ms;
     int has_stage1_cached_v4;
     uint32_t stage1_cached_failures;
+    /* Set while one thread is inside the blocking system lookup for this
+     * host so the others use the last known address instead of queueing. */
+    int stage1_lookup_in_flight;
 
     uint64_t iterative_last_attempt_ms;
 
@@ -167,6 +177,10 @@ typedef struct {
     upstream_doq_client_t *doq_client;
     
     pthread_mutex_t stage1_cache_mutex;
+    /* Guards the lazy creation of the per-protocol transport clients. Two
+     * workers reaching an unused transport at the same moment would each
+     * build one and one of them would be dropped on the floor. */
+    pthread_mutex_t transport_mutex;
 
     int bootstrap_resolver_count;
     char bootstrap_resolvers[UPSTREAM_MAX_BOOTSTRAP_RESOLVERS][64];
@@ -181,6 +195,9 @@ typedef struct {
     uint64_t doh_http2_responses_total;
     uint64_t doh_http1_responses_total;
     uint64_t doh_http_other_responses_total;
+    /* Attempts abandoned because no pool handle came free inside the query's
+     * own deadline: local congestion, not an upstream fault. */
+    uint64_t doh_pool_wait_timeouts_total;
     uint64_t doh_downgrade_h3_to_h2_total;
     uint64_t doh_downgrade_h3_to_h1_total;
     uint64_t doh_downgrade_h2_to_h1_total;

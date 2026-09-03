@@ -20,6 +20,7 @@ int upstream_doh_resolve(
     upstream_doh_client_t *client,
     const upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -31,7 +32,8 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
-    uint64_t *http_other_total_out);
+    uint64_t *http_other_total_out,
+    uint64_t *pool_wait_timeouts_out);
 #endif
 
 #if UPSTREAM_DOT_ENABLED
@@ -41,6 +43,7 @@ int upstream_dot_resolve(
     upstream_dot_client_t *client,
     const upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -60,6 +63,7 @@ int upstream_doq_resolve(
     upstream_doq_client_t *client,
     const upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -434,18 +438,19 @@ static void test_doh_protocol_guard_paths(void **state) {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
 
-    assert_int_equal(upstream_doh_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doh_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doh_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
-    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
-    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
-    assert_int_equal(upstream_doh_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(NULL, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, NULL, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, NULL), -1);
+    assert_int_equal(upstream_doh_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     int cap = 1;
     int in_use = 1;
     uint64_t h3 = 1, h2 = 1, h1 = 1, other = 1;
-    assert_int_equal(upstream_doh_client_get_pool_stats(NULL, &cap, &in_use, &h3, &h2, &h1, &other), -1);
+    uint64_t pool_waits = 1;
+    assert_int_equal(upstream_doh_client_get_pool_stats(NULL, &cap, &in_use, &h3, &h2, &h1, &other, &pool_waits), -1);
     assert_int_equal(h3, 0);
     assert_int_equal(cap, 0);
     assert_int_equal(in_use, 0);
@@ -481,13 +486,13 @@ static void test_dot_protocol_guard_paths(void **state) {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
 
-    assert_int_equal(upstream_dot_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_dot_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_dot_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
-    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
-    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
-    assert_int_equal(upstream_dot_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(NULL, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, NULL, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, NULL), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     server.type = UPSTREAM_TYPE_DOT;
     server.port = 853;
@@ -495,7 +500,7 @@ static void test_dot_protocol_guard_paths(void **state) {
     uint8_t *oversized_query = malloc(oversized_len);
     assert_non_null(oversized_query);
     memset(oversized_query, 0xAB, oversized_len);
-    assert_int_equal(upstream_dot_resolve(client, &server, 100, oversized_query, oversized_len, &resp, &resp_len), -1);
+    assert_int_equal(upstream_dot_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, oversized_query, oversized_len, &resp, &resp_len), -1);
     free(oversized_query);
 
     int cap = 1;
@@ -560,10 +565,11 @@ static void test_protocol_client_init_and_destroy_guards(void **state) {
 #endif
 #if UPSTREAM_DOH_ENABLED
     uint64_t h3 = 0, h2 = 0, h1 = 0, other = 0;
+    uint64_t pool_waits = 0;
 #endif
 
 #if UPSTREAM_DOH_ENABLED
-    assert_int_equal(upstream_doh_client_get_pool_stats(doh_client, &cap, &in_use, &h3, &h2, &h1, &other), 0);
+    assert_int_equal(upstream_doh_client_get_pool_stats(doh_client, &cap, &in_use, &h3, &h2, &h1, &other, &pool_waits), 0);
     assert_true(cap >= 1);
     assert_int_equal(in_use, 0);
 #endif
@@ -625,15 +631,15 @@ static void test_doq_protocol_guard_paths(void **state) {
     uint8_t *resp = NULL;
     size_t resp_len = 0;
 
-    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, NULL, 100, query, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, NULL, sizeof(query), &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, 0, &resp, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), NULL, &resp_len), -1);
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), &resp, NULL), -1);
+    assert_int_equal(upstream_doq_resolve(NULL, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, NULL, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, NULL, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, 0, &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), NULL, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, NULL), -1);
 
     server.type = UPSTREAM_TYPE_DOQ;
-    assert_int_equal(upstream_doq_resolve(client, &server, 100, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal(upstream_doq_resolve(client, &server, 100, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
 
     int cap = 1;
     int in_use = 1;

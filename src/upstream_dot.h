@@ -13,6 +13,7 @@ int upstream_dot_resolve(
     upstream_dot_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,

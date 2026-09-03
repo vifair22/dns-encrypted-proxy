@@ -25,6 +25,12 @@ static uint64_t g_now_ms = 0;
 static int g_doh_init_rc = 0;
 static int g_dot_init_rc = 0;
 static int g_doq_init_rc = 0;
+static int g_last_attempt_flags = 0;
+/* Makes the stubbed stage1 attempt advance the fake clock by the timeout it
+ * was handed, i.e. an upstream that answers nothing until the slice ends.
+ * Honoured by every transport stub so the test reads the same in each build
+ * of the DoH/DoT/DoQ matrix. */
+static int g_consume_budget = 0;
 static int g_doh_resolve_rc = -1;
 static int g_dot_resolve_rc = -1;
 static int g_doq_resolve_rc = -1;
@@ -77,6 +83,8 @@ static void reset_stubs(void) {
     g_dot_init_rc = 0;
     g_doq_init_rc = 0;
     g_doh_resolve_rc = -1;
+    g_consume_budget = 0;
+    g_last_attempt_flags = 0;
     g_dot_resolve_rc = -1;
     g_doq_resolve_rc = -1;
     g_stage2_rc = -1;
@@ -144,12 +152,16 @@ int upstream_doh_resolve(
     upstream_doh_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)client;
-    (void)timeout_ms;
+    g_last_attempt_flags = attempt_flags;
+    if (g_consume_budget && timeout_ms > 0) {
+        g_now_ms += (uint64_t)timeout_ms;
+    }
     (void)query;
     (void)query_len;
     if (g_doh_resolve_rc != 0 || g_resp_len == 0) {
@@ -173,7 +185,8 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http3_total_out,
     uint64_t *http2_total_out,
     uint64_t *http1_total_out,
-    uint64_t *http_other_total_out) {
+    uint64_t *http_other_total_out,
+    uint64_t *pool_wait_timeouts_out) {
     (void)client;
     if (capacity_out) *capacity_out = 3;
     if (in_use_out) *in_use_out = 1;
@@ -181,6 +194,7 @@ int upstream_doh_client_get_pool_stats(
     if (http2_total_out) *http2_total_out = 7;
     if (http1_total_out) *http1_total_out = 5;
     if (http_other_total_out) *http_other_total_out = 2;
+    if (pool_wait_timeouts_out) *pool_wait_timeouts_out = 4;
     return 0;
 }
 
@@ -202,13 +216,17 @@ int upstream_dot_resolve(
     upstream_dot_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)client;
     (void)server;
-    (void)timeout_ms;
+    g_last_attempt_flags = attempt_flags;
+    if (g_consume_budget && timeout_ms > 0) {
+        g_now_ms += (uint64_t)timeout_ms;
+    }
     (void)query;
     (void)query_len;
     if (g_dot_resolve_rc != 0 || g_resp_len == 0) {
@@ -251,13 +269,17 @@ int upstream_doq_resolve(
     upstream_doq_client_t *client,
     upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
     (void)client;
     (void)server;
-    (void)timeout_ms;
+    g_last_attempt_flags = attempt_flags;
+    if (g_consume_budget && timeout_ms > 0) {
+        g_now_ms += (uint64_t)timeout_ms;
+    }
     (void)query;
     (void)query_len;
     if (g_doq_resolve_rc != 0 || g_resp_len == 0) {
@@ -317,7 +339,8 @@ int upstream_bootstrap_stage1_hydrate(upstream_client_t *client, upstream_server
     return -1;
 }
 
-upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server_t *server) {
+upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_client_t *client, upstream_server_t *server) {
+    (void)client;
     (void)server;
     return UPSTREAM_STAGE1_CACHE_MISS;
 }
@@ -432,24 +455,24 @@ static void test_upstream_internal_init_and_switch_edges(void **state) {
     uint8_t q[] = {0x01};
     uint8_t *out = NULL;
     size_t out_len = 0;
-    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, UPSTREAM_ATTEMPT_NONE, q, sizeof(q), &out, &out_len), -1);
 
 #if UPSTREAM_DOH_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOH;
     g_doh_init_rc = -1;
-    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, UPSTREAM_ATTEMPT_NONE, q, sizeof(q), &out, &out_len), -1);
 #endif
 
 #if UPSTREAM_DOT_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOT;
     g_dot_init_rc = -1;
-    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, UPSTREAM_ATTEMPT_NONE, q, sizeof(q), &out, &out_len), -1);
 #endif
 
 #if UPSTREAM_DOQ_ENABLED
     bad_server.type = UPSTREAM_TYPE_DOQ;
     g_doq_init_rc = -1;
-    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, q, sizeof(q), &out, &out_len), -1);
+    assert_int_equal(resolve_with_server(&client, &bad_server, config.timeout_ms, UPSTREAM_ATTEMPT_NONE, q, sizeof(q), &out, &out_len), -1);
 #endif
 
     upstream_client_destroy(&client);
@@ -685,6 +708,76 @@ static void test_upstream_transport_timeout_uses_stage2_when_stage1_cache_missin
     upstream_client_destroy(&client);
 }
 
+/* The reserve is what keeps the bootstrap ladder reachable: stage1 may spend
+ * everything except it, and it shrinks with the deadline instead of starving
+ * stage1 when little budget is left. */
+static void test_stage_budget_reserve_math(void **state) {
+    (void)state;
+    reset_stubs();
+    g_now_ms = 1000;
+
+    /* Full budget: stage1 stops one reserve short of the query deadline. */
+    assert_int_equal(
+        (int)stage1_deadline_ms(g_now_ms + 2500),
+        (int)(g_now_ms + 2500 - UPSTREAM_STAGE_FALLBACK_RESERVE_MS));
+
+    /* Short budget: never withhold more than half of what is left. */
+    assert_int_equal((int)stage1_deadline_ms(g_now_ms + 400), (int)(g_now_ms + 200));
+
+    /* No deadline, and an already expired one, pass through untouched. */
+    assert_int_equal((int)stage1_deadline_ms(0), 0);
+    assert_int_equal((int)stage1_deadline_ms(g_now_ms), (int)g_now_ms);
+
+    /* Stage2 is one UDP round trip; it takes its cap, not the whole reserve. */
+    assert_int_equal(stage2_query_timeout_ms(g_now_ms + 2500, 2500), UPSTREAM_STAGE2_QUERY_TIMEOUT_MS);
+    assert_int_equal(stage2_query_timeout_ms(g_now_ms + 300, 2500), 300);
+    /* Below one useful round trip there is nothing left to spend. */
+    assert_int_equal(stage2_query_timeout_ms(g_now_ms + 10, 2500), 0);
+}
+
+/* The production failure: stage1 burns the whole per-server budget, so the
+ * bootstrap that exists to route around a broken local resolver was skipped
+ * as "budget_exhausted". Stage2 must run, and the retry it enables must be
+ * told not to re-use the libc route that just failed. */
+static void test_stage2_survives_a_stage1_that_spends_its_budget(void **state) {
+    (void)state;
+    reset_stubs();
+
+    /* Stage1 fails after consuming every millisecond it was given. */
+    g_doh_resolve_rc = -1;
+    g_doh_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+    g_consume_budget = 1;
+    g_stage2_rc = 0;
+    g_stage2_reason = "ok";
+    g_now_ms = 1000;
+
+    upstream_config_t cfg = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 10,
+        .unhealthy_backoff_ms = 1000,
+        .iterative_bootstrap_enabled = 0,
+    };
+    const char *urls[] = {PRIMARY_TEST_URL};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), 0);
+
+    uint8_t q[] = {0x12, 0x34};
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(resolve_any_server(&client, q, sizeof(q), &out, &out_len), -1);
+    free(out);
+
+    upstream_runtime_stats_t stats;
+    assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+    assert_int_equal(stats.stage2_attempts, 1);
+    assert_int_equal(stats.stage2_successes, 1);
+    /* The retry that follows the bootstrap must skip the local route. */
+    assert_int_equal(g_last_attempt_flags, UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE);
+
+    upstream_client_destroy(&client);
+}
+
 static void test_upstream_guard_and_limit_edges(void **state) {
     (void)state;
     reset_stubs();
@@ -794,6 +887,8 @@ int main(void) {
         cmocka_unit_test(test_upstream_parse_and_stats_edges),
         cmocka_unit_test(test_upstream_stage_metrics_matrix),
         cmocka_unit_test(test_upstream_transport_timeout_uses_stage2_when_stage1_cache_missing),
+        cmocka_unit_test(test_stage_budget_reserve_math),
+        cmocka_unit_test(test_stage2_survives_a_stage1_that_spends_its_budget),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
         cmocka_unit_test(test_record_failure_slow_response_not_health_attributed),
         cmocka_unit_test(test_upstream_ready_state),

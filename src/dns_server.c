@@ -848,7 +848,14 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
         return -1;
     }
 
-    if (server->config.failure_cache_ttl_seconds > 0) {
+    /* RFC 2308 7.1 caches the fact that a name could not be resolved. Running
+     * out of our own clock is not that fact: it says the proxy was congested,
+     * not that the name is broken. Caching those turned a cold-start burst,
+     * where every query ran to its deadline, into minutes of instant SERVFAIL
+     * for names that resolve fine. Only failures that came back with time to
+     * spare are evidence about the question. */
+    int budget_exhausted = monotonic_now_ms() >= request_deadline_ms;
+    if (server->config.failure_cache_ttl_seconds > 0 && !budget_exhausted) {
         dns_cache_store(
             &server->failure_cache,
             key,
@@ -919,6 +926,263 @@ static int create_tcp_socket(const proxy_config_t *config) {
     return fd;
 }
 
+/*
+ * One UDP query: resolve, size the answer for the client's advertised limit,
+ * and send it. Kept separate from the socket reader so the reader can hand
+ * work to the pool below instead of running it inline.
+ */
+static void handle_udp_query(
+    proxy_server_t *server,
+    int fd,
+    const uint8_t *query,
+    size_t query_len,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len) {
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+
+    if (process_query(server, query, query_len, &response, &response_len) != 0) {
+        RECORD_INTERNAL_ERROR(server, "process_query_failed", "udp_query_len=%zu", query_len);
+        return;
+    }
+
+    if (response == NULL || response_len == 0) {
+        return;
+    }
+
+    /*
+     * UDP response sizing policy:
+     * - honor query-advertised payload limit (EDNS when present)
+     * - prefer TC=1 truncation so standards-compliant clients retry TCP
+     * - fall back to SERVFAIL only if truncation packet build fails
+     */
+    size_t udp_limit = dns_udp_payload_limit_for_query(query, query_len);
+    if (response_len > udp_limit) {
+        uint8_t *truncated = NULL;
+        size_t truncated_len = 0;
+        if (build_truncated_udp_response(response, response_len, udp_limit, &truncated, &truncated_len) == 0) {
+            free(response);
+            response = truncated;
+            response_len = truncated_len;
+            atomic_fetch_add(&server->metrics.truncated_sent, 1);
+        } else {
+            free(response);
+            response = NULL;
+            response_len = 0;
+            if (build_servfail_response(query, query_len, -1, &response, &response_len) != 0) {
+                RECORD_INTERNAL_ERROR(server, "truncation_and_servfail_build_failed", "udp_limit=%zu", udp_limit);
+                return;
+            }
+            atomic_fetch_add(&server->metrics.servfail_sent, 1);
+        }
+    }
+
+    ssize_t sent = sendto(fd, response, response_len, 0, (const struct sockaddr *)client_addr, client_len);
+    if (sent == (ssize_t)response_len) {
+        metrics_record_response(server, response, response_len);
+    }
+    free(response);
+}
+
+/*
+ * UDP query workers.
+ *
+ * The socket reader used to resolve each datagram inline, so one query that
+ * spent its whole upstream budget held up every UDP query behind it - the
+ * shape that made a single slow upstream look like a total outage, with
+ * clients falling back to TCP. The reader now only reads, and hands the
+ * datagram to a small pool of workers. The queue is bounded: when every
+ * worker is busy and the queue is full the datagram is dropped, which is
+ * what a DNS client already expects under load, and counted so the shedding
+ * is visible.
+ */
+typedef struct udp_job {
+    struct udp_job *next;
+    struct sockaddr_in client_addr;
+    socklen_t client_len;
+    size_t len;
+    uint8_t data[];
+} udp_job_t;
+
+typedef struct {
+    proxy_server_t *server;
+    int fd;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    udp_job_t *head;
+    udp_job_t *tail;
+    int depth;
+    int capacity;
+    int stopping;
+    pthread_t *threads;
+    int thread_count;
+    int started;
+} udp_worker_pool_t;
+
+static void *udp_worker_main(void *arg) {
+    udp_worker_pool_t *pool = (udp_worker_pool_t *)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&pool->mutex);
+        while (pool->head == NULL && !pool->stopping) {
+            pthread_cond_wait(&pool->cond, &pool->mutex);
+        }
+        if (pool->head == NULL) {
+            pthread_mutex_unlock(&pool->mutex);
+            break;
+        }
+        udp_job_t *job = pool->head;
+        pool->head = job->next;
+        if (pool->head == NULL) {
+            pool->tail = NULL;
+        }
+        pool->depth--;
+        pthread_mutex_unlock(&pool->mutex);
+
+        handle_udp_query(pool->server, pool->fd, job->data, job->len, &job->client_addr, job->client_len);
+        free(job);
+    }
+
+    return NULL;
+}
+
+static void udp_worker_pool_stop(udp_worker_pool_t *pool) {
+    if (pool == NULL || !pool->started) {
+        return;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+    pool->stopping = 1;
+    pthread_cond_broadcast(&pool->cond);
+    pthread_mutex_unlock(&pool->mutex);
+
+    for (int i = 0; i < pool->thread_count; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+
+    /* Anything still queued at shutdown has no one left to answer it. */
+    udp_job_t *job = pool->head;
+    while (job != NULL) {
+        udp_job_t *next = job->next;
+        free(job);
+        job = next;
+    }
+    pool->head = NULL;
+    pool->tail = NULL;
+    pool->depth = 0;
+
+    free(pool->threads);
+    pool->threads = NULL;
+    pool->thread_count = 0;
+    pool->started = 0;
+    pthread_cond_destroy(&pool->cond);
+    pthread_mutex_destroy(&pool->mutex);
+}
+
+static int udp_worker_pool_start(udp_worker_pool_t *pool, proxy_server_t *server, int fd) {
+    memset(pool, 0, sizeof(*pool));
+    pool->server = server;
+    pool->fd = fd;
+
+    int workers = server->config.udp_workers;
+    if (workers <= 0) {
+        return 0; /* Explicitly disabled: the reader resolves inline. */
+    }
+    if (workers > UDP_WORKERS_MAX) {
+        workers = UDP_WORKERS_MAX;
+    }
+
+    pool->capacity = server->config.udp_queue_capacity;
+    if (pool->capacity <= 0) {
+        pool->capacity = 256;
+    }
+    if (pool->capacity > UDP_QUEUE_CAPACITY_MAX) {
+        pool->capacity = UDP_QUEUE_CAPACITY_MAX;
+    }
+
+    if (pthread_mutex_init(&pool->mutex, NULL) != 0) {
+        return -1;
+    }
+    if (pthread_cond_init(&pool->cond, NULL) != 0) {
+        pthread_mutex_destroy(&pool->mutex);
+        return -1;
+    }
+
+    pool->threads = calloc((size_t)workers, sizeof(*pool->threads));
+    if (pool->threads == NULL) {
+        pthread_cond_destroy(&pool->cond);
+        pthread_mutex_destroy(&pool->mutex);
+        return -1;
+    }
+
+    pool->started = 1;
+    for (int i = 0; i < workers; i++) {
+        if (pthread_create(&pool->threads[i], NULL, udp_worker_main, pool) != 0) {
+            /* Run with the workers that did start; only fail if none did. */
+            break;
+        }
+        pool->thread_count++;
+    }
+
+    if (pool->thread_count == 0) {
+        pool->started = 0;
+        free(pool->threads);
+        pool->threads = NULL;
+        pthread_cond_destroy(&pool->cond);
+        pthread_mutex_destroy(&pool->mutex);
+        return -1;
+    }
+
+    LOGF_INFO("UDP query workers started: threads=%d queue_capacity=%d", pool->thread_count, pool->capacity);
+    return 0;
+}
+
+/* Returns 0 when the datagram was queued, -1 when it was shed. */
+static int udp_worker_pool_submit(
+    udp_worker_pool_t *pool,
+    const uint8_t *data,
+    size_t len,
+    const struct sockaddr_in *client_addr,
+    socklen_t client_len) {
+    if (pool == NULL || !pool->started) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&pool->mutex);
+    if (pool->depth >= pool->capacity || pool->stopping) {
+        pthread_mutex_unlock(&pool->mutex);
+        return -1;
+    }
+    pthread_mutex_unlock(&pool->mutex);
+
+    udp_job_t *job = malloc(sizeof(*job) + len);
+    if (job == NULL) {
+        return -1;
+    }
+    job->next = NULL;
+    job->client_addr = *client_addr;
+    job->client_len = client_len;
+    job->len = len;
+    memcpy(job->data, data, len);
+
+    pthread_mutex_lock(&pool->mutex);
+    if (pool->depth >= pool->capacity || pool->stopping) {
+        pthread_mutex_unlock(&pool->mutex);
+        free(job);
+        return -1;
+    }
+    if (pool->tail == NULL) {
+        pool->head = job;
+    } else {
+        pool->tail->next = job;
+    }
+    pool->tail = job;
+    pool->depth++;
+    pthread_cond_signal(&pool->cond);
+    pthread_mutex_unlock(&pool->mutex);
+    return 0;
+}
+
 static void *udp_loop(void *arg) {
     socket_loop_ctx_t *ctx = (socket_loop_ctx_t *)arg;
     proxy_server_t *server = ctx->server;
@@ -932,6 +1196,13 @@ static void *udp_loop(void *arg) {
     if (buffer == NULL) {
         LOGF_ERROR("UDP loop failed to allocate receive buffer");
         return NULL;
+    }
+
+    udp_worker_pool_t pool;
+    if (udp_worker_pool_start(&pool, server, fd) != 0) {
+        /* Without workers the reader still answers queries, just one at a
+         * time; degraded service beats no listener. */
+        LOGF_ERROR("UDP query workers failed to start; resolving inline");
     }
 
     while (!should_stop(server)) {
@@ -969,49 +1240,19 @@ static void *udp_loop(void *arg) {
         }
         atomic_fetch_add(&server->metrics.queries_udp, 1);
 
-        uint8_t *response = NULL;
-        size_t response_len = 0;
-        if (process_query(server, buffer, (size_t)n, &response, &response_len) != 0) {
-            RECORD_INTERNAL_ERROR(server, "process_query_failed", "udp_query_len=%zd", n);
+        /* Hand off when the pool is running; resolving inline here is what
+         * used to let one slow query stall the whole UDP listener. */
+        if (pool.started) {
+            if (udp_worker_pool_submit(&pool, buffer, (size_t)n, &client_addr, client_len) != 0) {
+                atomic_fetch_add(&server->metrics.udp_queue_drops, 1);
+            }
             continue;
         }
 
-        if (response != NULL && response_len > 0) {
-            /*
-             * UDP response sizing policy:
-             * - honor query-advertised payload limit (EDNS when present)
-             * - prefer TC=1 truncation so standards-compliant clients retry TCP
-             * - fall back to SERVFAIL only if truncation packet build fails
-             */
-            size_t udp_limit = dns_udp_payload_limit_for_query(buffer, (size_t)n);
-            if (response_len > udp_limit) {
-                uint8_t *truncated = NULL;
-                size_t truncated_len = 0;
-                if (build_truncated_udp_response(response, response_len, udp_limit, &truncated, &truncated_len) == 0) {
-                    free(response);
-                    response = truncated;
-                    response_len = truncated_len;
-                    atomic_fetch_add(&server->metrics.truncated_sent, 1);
-                } else {
-                    free(response);
-                    response = NULL;
-                    response_len = 0;
-                    if (build_servfail_response(buffer, (size_t)n, -1, &response, &response_len) != 0) {
-                        RECORD_INTERNAL_ERROR(server, "truncation_and_servfail_build_failed", "udp_limit=%zu response_len=%zu", udp_limit, response_len);
-                        continue;
-                    }
-                    atomic_fetch_add(&server->metrics.servfail_sent, 1);
-                }
-            }
-
-            ssize_t sent = sendto(fd, response, response_len, 0, (struct sockaddr *)&client_addr, client_len);
-            if (sent == (ssize_t)response_len) {
-                metrics_record_response(server, response, response_len);
-            }
-            free(response);
-        }
+        handle_udp_query(server, fd, buffer, (size_t)n, &client_addr, client_len);
     }
 
+    udp_worker_pool_stop(&pool);
     free(buffer);
     if (strcmp(exit_reason, "stop_requested") == 0) {
         LOGF_INFO("UDP loop thread stopped");

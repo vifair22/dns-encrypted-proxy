@@ -6,13 +6,19 @@
 #include "upstream_bootstrap.h"
 
 #include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #define FACILITATOR_MAX_MEMBERS 32
 #define MEMBER_FAILURE_COOLDOWN_MS 500ULL
-#define MEMBER_REFRESH_JITTER_MS 250ULL
+/* How often a ready member re-checks the address it dials, and how far apart
+ * consecutive slots are held so a provider's members never all come due in
+ * the same pass. Lockstep refreshes cost nothing while lookups are fast and
+ * everything when they are not. */
+#define MEMBER_REFRESH_INTERVAL_MS UINT64_C(250)
+#define MEMBER_REFRESH_SLOT_STAGGER_MS UINT64_C(40)
 
 static void log_allocator_stage_event(
     const char *caller_func,
@@ -48,9 +54,7 @@ static int allocator_connect_member(upstream_facilitator_t *fac, upstream_member
         timeout_ms = 300;
     }
 
-    pthread_mutex_lock(&client->stage1_cache_mutex);
-    upstream_stage1_cache_result_t stage1 = upstream_bootstrap_stage1_prepare(server);
-    pthread_mutex_unlock(&client->stage1_cache_mutex);
+    upstream_stage1_cache_result_t stage1 = upstream_bootstrap_stage1_prepare(client, server);
 
     if (stage1 == UPSTREAM_STAGE1_CACHE_HIT || stage1 == UPSTREAM_STAGE1_CACHE_REFRESHED) {
         if (stage1 == UPSTREAM_STAGE1_CACHE_REFRESHED) {
@@ -355,6 +359,21 @@ static int member_is_dispatchable(upstream_member_t *member, uint64_t now) {
 
 static uint32_t provider_penalty_score(const upstream_facilitator_t *fac, int provider, uint64_t now);
 
+/* Publish the address TTL and the next refresh deadline for a member that
+ * just verified its route. Slots are spread across the interval so a
+ * provider's members come due one at a time rather than in a burst. */
+static void member_mark_connected(upstream_member_t *member, const upstream_server_t *server, uint64_t now) {
+    uint64_t ttl_target = now + 5000ULL;
+    if (server->stage.has_stage1_cached_v4 && server->stage.stage1_cache_expires_at_ms > now) {
+        ttl_target = server->stage.stage1_cache_expires_at_ms;
+    } else if (server->stage.has_bootstrap_v4 && server->stage.bootstrap_expires_at_ms > now) {
+        ttl_target = server->stage.bootstrap_expires_at_ms;
+    }
+    member->ttl_expire_ms = ttl_target;
+    uint64_t slot_offset = member->slot_index > 0 ? (uint64_t)member->slot_index : UINT64_C(0);
+    member->refresh_due_ms = now + MEMBER_REFRESH_INTERVAL_MS + slot_offset * MEMBER_REFRESH_SLOT_STAGGER_MS;
+}
+
 static void *allocator_thread_main(void *arg) {
     upstream_facilitator_t *fac = (upstream_facilitator_t *)arg;
     while (1) {
@@ -378,14 +397,7 @@ static void *allocator_thread_main(void *arg) {
             }
             if (state == UPSTREAM_MEMBER_CONNECTING) {
                 if (allocator_connect_member(fac, member, now) == 0) {
-                    uint64_t ttl_target = now + 5000ULL;
-                    if (server->stage.has_stage1_cached_v4 && server->stage.stage1_cache_expires_at_ms > now) {
-                        ttl_target = server->stage.stage1_cache_expires_at_ms;
-                    } else if (server->stage.has_bootstrap_v4 && server->stage.bootstrap_expires_at_ms > now) {
-                        ttl_target = server->stage.bootstrap_expires_at_ms;
-                    }
-                    member->ttl_expire_ms = ttl_target;
-                    member->refresh_due_ms = now + MEMBER_REFRESH_JITTER_MS;
+                    member_mark_connected(member, server, now_ms());
                     member_set_error(member, 0, NULL);
                     MEMBER_SET_STATE(member, UPSTREAM_MEMBER_READY, "allocator_connect_success");
                 } else {
@@ -401,8 +413,20 @@ static void *allocator_thread_main(void *arg) {
                     continue;
                 }
                 if (member->refresh_due_ms != 0 && now >= member->refresh_due_ms) {
-                    member->refresh_due_ms = now + MEMBER_REFRESH_JITTER_MS;
-                    MEMBER_SET_STATE(member, UPSTREAM_MEMBER_CONNECTING, "allocator_refresh_due");
+                    /* Refresh in place. Dropping to CONNECTING first made the
+                     * member undispatchable for the length of the address
+                     * check, so a slow system resolver took the whole fleet
+                     * out at once and queries died at their deadline without
+                     * a single upstream attempt. The member keeps serving its
+                     * current address; only a failed check unseats it. */
+                    if (allocator_connect_member(fac, member, now) == 0) {
+                        member_mark_connected(member, server, now_ms());
+                        member_set_error(member, 0, NULL);
+                    } else {
+                        member->next_retry_ms = now_ms() + MEMBER_FAILURE_COOLDOWN_MS;
+                        member_set_error(member, 1, "allocator_refresh_failed");
+                        MEMBER_SET_STATE(member, UPSTREAM_MEMBER_FAILED, "allocator_refresh_failed");
+                    }
                     continue;
                 }
             }

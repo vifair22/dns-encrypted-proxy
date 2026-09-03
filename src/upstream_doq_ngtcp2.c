@@ -849,6 +849,7 @@ static int doq_ngtcp2_exchange_on_fd(
 int upstream_doq_ngtcp2_resolve(
     const upstream_server_t *server,
     int timeout_ms,
+    int attempt_flags,
     const uint8_t *query,
     size_t query_len,
     uint8_t **response_out,
@@ -887,7 +888,14 @@ int upstream_doq_ngtcp2_resolve(
     int total_timeout_ms = timeout_ms > 0 ? timeout_ms : 1000;
     uint64_t overall_deadline = now_ns() + (uint64_t)total_timeout_ms * UINT64_C(1000000);
 
-    if (server->stage.has_stage1_cached_v4) {
+    /* Same contract as the other transports: once the caller has watched the
+     * libc route fail for this query, the stage1 cache is no better - it came
+     * from that resolver - so go straight to the bootstrapped address. */
+    int skip_local_route =
+        (attempt_flags & UPSTREAM_ATTEMPT_SKIP_LOCAL_ROUTE) != 0 &&
+        server->stage.has_bootstrap_v4;
+
+    if (server->stage.has_stage1_cached_v4 && !skip_local_route) {
         uint64_t now = now_ns();
         if (now < overall_deadline) {
             int remaining_ms = (int)((overall_deadline - now) / 1000000ULL);
@@ -950,11 +958,14 @@ int upstream_doq_ngtcp2_resolve(
     hints.ai_protocol = IPPROTO_UDP;
 
     struct addrinfo *res = NULL;
-    if (result != 0 && (test_force_getaddrinfo_fail() || getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL)) {
-        primary_reason = "getaddrinfo_failed";
-        LOG_DOQ_ATTEMPT_FAILURE(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
-        free(stream_data);
-        return -1;
+    if (result != 0 && !skip_local_route) {
+        if (test_force_getaddrinfo_fail() || getaddrinfo(server->host, port_text, &hints, &res) != 0 || res == NULL) {
+            /* A failed system lookup is the case the bootstrap address exists
+             * for, so fall through to it rather than giving up here. */
+            primary_reason = "getaddrinfo_failed";
+            LOG_DOQ_ATTEMPT_FAILURE(server, "primary request", primary_reason, 0, 0, total_timeout_ms);
+            res = NULL;
+        }
     }
 
     for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {

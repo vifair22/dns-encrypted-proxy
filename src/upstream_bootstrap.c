@@ -5,8 +5,10 @@
 #include "iterative_resolver.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -25,6 +27,21 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+/* Test hook: point stage2 at a mock resolver on an unprivileged port so the
+ * bootstrap path can be exercised end to end without binding port 53. */
+static int bootstrap_dns_port(void) {
+    const char *v = getenv("DNS_ENCRYPTED_PROXY_TEST_BOOTSTRAP_DNS_PORT");
+    if (v != NULL && *v != '\0') {
+        errno = 0;
+        char *end = NULL;
+        long port = strtol(v, &end, 10);
+        if (errno == 0 && end != NULL && *end == '\0' && port > 0 && port <= 65535) {
+            return (int)port;
+        }
+    }
+    return BOOTSTRAP_DNS_PORT;
 }
 
 static int test_force_getaddrinfo_fail(void) {
@@ -240,7 +257,7 @@ static int stage2_query_resolver(
     struct sockaddr_in dst;
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
-    dst.sin_port = htons(BOOTSTRAP_DNS_PORT);
+    dst.sin_port = htons((uint16_t)bootstrap_dns_port());
     dst.sin_addr = resolver_addr;
 
     if (sendto(fd, query, off, 0, (struct sockaddr *)&dst, sizeof(dst)) != (ssize_t)off) {
@@ -439,15 +456,45 @@ int upstream_bootstrap_try_stage3(upstream_server_t *server, int timeout_ms, con
     return 0;
 }
 
-upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server_t *server) {
+/* The stage1 cache is shared, so its reads and writes are serialized. The
+ * lookup itself must not be: getaddrinfo takes no timeout and blocks for
+ * seconds whenever the system resolver is slow, and holding the cache lock
+ * across it funnelled every worker in the proxy through one stalled call. */
+static void stage1_cache_lock(upstream_client_t *client) {
+    if (client != NULL) {
+        pthread_mutex_lock(&client->stage1_cache_mutex);
+    }
+}
+
+static void stage1_cache_unlock(upstream_client_t *client) {
+    if (client != NULL) {
+        pthread_mutex_unlock(&client->stage1_cache_mutex);
+    }
+}
+
+upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_client_t *client, upstream_server_t *server) {
     if (server == NULL) {
         return UPSTREAM_STAGE1_CACHE_MISS;
     }
 
+    stage1_cache_lock(client);
     uint64_t now = now_ms();
     if (server->stage.has_stage1_cached_v4 && now < server->stage.stage1_cache_expires_at_ms) {
+        stage1_cache_unlock(client);
         return UPSTREAM_STAGE1_CACHE_HIT;
     }
+
+    if (server->stage.stage1_lookup_in_flight) {
+        /* Another thread is already inside getaddrinfo for this host. Waiting
+         * for it would rebuild the very pile-up this lock split removes, so
+         * take the address we still have - stale beats blocked, and the
+         * route ladder covers a stale answer - and let that thread publish. */
+        int have_address = server->stage.has_stage1_cached_v4;
+        stage1_cache_unlock(client);
+        return have_address ? UPSTREAM_STAGE1_CACHE_HIT : UPSTREAM_STAGE1_CACHE_MISS;
+    }
+    server->stage.stage1_lookup_in_flight = 1;
+    stage1_cache_unlock(client);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -462,7 +509,10 @@ upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server
         gai = getaddrinfo(server->host, NULL, &hints, &res);
     }
     if (gai != 0 || res == NULL) {
+        stage1_cache_lock(client);
+        server->stage.stage1_lookup_in_flight = 0;
         server->stage.has_stage1_cached_v4 = 0;
+        stage1_cache_unlock(client);
         return UPSTREAM_STAGE1_CACHE_MISS;
     }
 
@@ -473,10 +523,14 @@ upstream_stage1_cache_result_t upstream_bootstrap_stage1_prepare(upstream_server
      * getaddrinfo result correctly. */
     struct sockaddr_in sin;
     memcpy(&sin, res->ai_addr, sizeof(sin));
+    freeaddrinfo(res);
+
+    stage1_cache_lock(client);
+    server->stage.stage1_lookup_in_flight = 0;
     server->stage.stage1_cached_addr_v4_be = sin.sin_addr.s_addr;
     server->stage.has_stage1_cached_v4 = 1;
-    server->stage.stage1_cache_expires_at_ms = now + STAGE1_CACHE_TTL_MS;
-    freeaddrinfo(res);
+    server->stage.stage1_cache_expires_at_ms = now_ms() + STAGE1_CACHE_TTL_MS;
+    stage1_cache_unlock(client);
     return UPSTREAM_STAGE1_CACHE_REFRESHED;
 }
 
