@@ -185,6 +185,7 @@ Each attempt is handed the remaining budget minus `DOH_FALLBACK_RESERVE_MS` (300
 The proxy actively probes upgrades and tracks per-upstream "forced tier" state with backoff so a flaky h3 path doesn't keep failing first on every query:
 
 - On transport failure at a higher tier, the upstream is forced down (h3→h2 or h2→h1) for `DOH_UPGRADE_BACKOFF_BASE_MS` × `2^attempts` (capped at `DOH_UPGRADE_BACKOFF_MAX_MS`).
+- A pin needs evidence about the *protocol*, not just a lower tier answering. h3 rides QUIC over UDP, so failing to connect at all counts against it (the blocked-UDP case, still subject to the consecutive-failure threshold). h2 and h1 share the same TCP and TLS path, so a pin out of h2 needs a failure that reached the peer or died in the handshake where ALPN is negotiated. Without that rule an h2 attempt failing on the libc route while h1 answered on the bootstrap route read as a protocol verdict, and cost h2 multiplexing on every query until the next upgrade probe.
 - After backoff, an upgrade probe goes back to the higher tier. Probe outcomes are tracked separately in counters.
 - The active forced tier is exported per-upstream as `dns_encrypted_proxy_upstream_doh_forced_http_tier{...} 0|1|2` (h3/h2/h1).
 

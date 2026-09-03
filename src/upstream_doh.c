@@ -906,10 +906,17 @@ int upstream_doh_resolve(
     uint32_t slow_override_addr_v4_be = 0;
     const char *slow_phase = "primary request";
 
+    /* Whether a tier above the one that answered failed on the same route in a
+     * way that says anything about the protocol. Only that is grounds for a
+     * downgrade pin; see the check after the loop. */
+    int protocol_failure_on_route = 0;
+
     for (int route = first_route; route < route_count && result != 0 && !slow_response; route++) {
         int use_override_v4 = 0;
         uint32_t override_addr_v4_be = 0;
         const char *phase = "primary request";
+
+        protocol_failure_on_route = 0;
 
         if (route == 1 && server->stage.has_stage1_cached_v4) {
             use_override_v4 = 1;
@@ -971,6 +978,21 @@ int upstream_doh_resolve(
             }
             final_failure_class = attempt_class;
             server->stage.last_failure_class = (int)final_failure_class;
+
+            /* What counts as evidence about the protocol depends on the tier.
+             * h3 rides QUIC over UDP, so failing to get a connection at all
+             * genuinely implicates it - that is the blocked-UDP case, and the
+             * consecutive-failure threshold below guards against blips. h2 and
+             * h1 share the same TCP and TLS path, so only a transfer that
+             * reached the peer, or one that died in the handshake where ALPN
+             * is negotiated, says anything about the version; a connection
+             * that never came up says the route is broken, and the route is
+             * the same for both. */
+            if (tier == DOH_HTTP_TIER_H3 ||
+                attempt_err.request_sent ||
+                attempt_class == UPSTREAM_FAILURE_CLASS_TLS) {
+                protocol_failure_on_route = 1;
+            }
 
             if (attempt_err.curl_rc == CURLE_OPERATION_TIMEDOUT && attempt_err.request_sent) {
                 /* The request reached the upstream; the answer was just
@@ -1073,7 +1095,14 @@ int upstream_doh_resolve(
     int h3_pin_gated = (forced_tier == DOH_HTTP_TIER_H3 &&
                         successful_tier > DOH_HTTP_TIER_H3 &&
                         server->stage.doh_h3_consecutive_failures < DOH_DOWNGRADE_H3_CONSECUTIVE_THRESHOLD);
-    if (successful_tier > forced_tier && !h3_pin_gated) {
+    /* "A lower tier answered" is not by itself a protocol verdict. Production
+     * pinned dns.google to h1 for hours because the h2 attempt failed on the
+     * libc route while h1 succeeded on the bootstrap route - a routing
+     * difference read as a protocol one, costing h2 multiplexing on every
+     * query until the upgrade probe came round. Pin only when a higher tier
+     * failed on the route that answered, and failed in a way that implicates
+     * the protocol. */
+    if (successful_tier > forced_tier && !h3_pin_gated && protocol_failure_on_route) {
         if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H2) {
             __atomic_add_fetch(&server->stage.doh_downgrade_h3_to_h2_total, 1, __ATOMIC_RELAXED);
         } else if (forced_tier == DOH_HTTP_TIER_H3 && successful_tier == DOH_HTTP_TIER_H1) {
