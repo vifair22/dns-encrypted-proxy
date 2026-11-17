@@ -337,7 +337,8 @@ static void mock_tls_server_join_and_destroy(mock_tls_server_t *server) {
 }
 
 static int resolve_test_cert_paths(char *cert_out, size_t cert_out_len, char *key_out, size_t key_out_len) {
-    /* Test cwd depends on which build tree ctest invoked us from:
+    /* `make test` runs from the repo root; the deeper candidates cover
+     * running a test binary by hand from inside build/:
      *   repo root             -> tests/certs/...
      *   build/<variant>/      -> ../../tests/certs/...
      *   build/matrix/<combo>/ -> ../../../tests/certs/... */
@@ -624,9 +625,15 @@ static int send_tcp_query_on_fd(int fd, const uint8_t *query, size_t query_len, 
 }
 
 static const char *resolve_proxy_binary_path(void) {
-    /* All ready-to-run binaries live in <repo>/build/bin/ regardless of which
-     * variant (release/debug/asan/coverage) was configured. The relative path
-     * depends on the test's working directory at the time ctest invokes it. */
+    /* `make test` names the proxy built alongside this test binary: the
+     * feature matrix gives every combination its own bin dir, so the default
+     * build/bin/ copy may belong to a different transport set. */
+    const char *from_env = getenv("DNS_ENCRYPTED_PROXY_TEST_BIN");
+    if (from_env != NULL && from_env[0] != '\0' && access(from_env, X_OK) == 0) {
+        return from_env;
+    }
+
+    /* Fallbacks for running a test binary by hand from a few likely cwds. */
     static const char *const candidates[] = {
         "./dns-encrypted-proxy",            /* cwd = build/bin/ */
         "../bin/dns-encrypted-proxy",       /* cwd = build/<variant>/ */

@@ -15,7 +15,7 @@ test:
   tags:
     - docker
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3 autoconf automake libtool git
+    - apk add --no-cache bash make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3 autoconf automake libtool git
     - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
     - git clone --depth 1 -b v1.12.0 https://github.com/ngtcp2/ngtcp2 /tmp/ngtcp2
     - cd /tmp/ngtcp2
@@ -27,7 +27,7 @@ test:
     - export LD_LIBRARY_PATH=/usr/local/lib
     - cd "$CI_PROJECT_DIR"
   script:
-    - sh tools/ci_test_matrix.sh
+    - bash tools/ci_test_matrix.sh
   artifacts:
     when: on_failure
     paths:
@@ -42,22 +42,13 @@ analyze:
   needs:
     - test
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig clang-extra-tools cppcheck git bash
+    - apk add --no-cache make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig clang-extra-tools cppcheck git bash
     - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
   script:
-    # cppcheck and stack-usage gate; lint is advisory and surfaces findings
-    # without failing the job (clang-tidy ≥ 18 returns non-zero on any
-    # finding; existing backlog tracked separately).
-    - cmake -S . -B build/analyze
-        -DCMAKE_BUILD_TYPE=Debug
-        -DC_LOG_PATH=/tmp/c-log
-        -DENABLE_ANALYZER=ON
-        -DENABLE_STACK_USAGE_CHECK=ON
-        -DENABLE_UPSTREAM_DOQ=OFF
-    - cmake --build build/analyze -j
-    - cmake --build build/analyze --target cppcheck
-    - cmake --build build/analyze --target stack-usage
-    - cmake --build build/analyze --target lint
+    # -fanalyzer (via -Werror), cppcheck and stack-usage gate; clang-tidy is
+    # advisory and surfaces findings without failing the job (clang-tidy >= 18
+    # returns non-zero on any finding; existing backlog tracked separately).
+    - make -j"$(nproc)" analyze C_LOG_PATH=/tmp/c-log DOQ=0
   allow_failure: false
 
 coverage:
@@ -68,19 +59,12 @@ coverage:
   needs:
     - test
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig gcovr git
+    - apk add --no-cache make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig gcovr python3 git
     - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
   script:
-    # Coverage build runs the full ctest suite under gcov instrumentation,
-    # then gcovr enforces the line-coverage threshold (default 80%, set
-    # via -DCOVERAGE_LINE_THRESHOLD on the configure line).
-    - cmake -S . -B build/coverage
-        -DCMAKE_BUILD_TYPE=Debug
-        -DC_LOG_PATH=/tmp/c-log
-        -DENABLE_COVERAGE=ON
-        -DENABLE_UPSTREAM_DOQ=OFF
-    - cmake --build build/coverage -j
-    - cmake --build build/coverage --target coverage
+    # Runs the full suite under gcov, then gcovr gates on line coverage
+    # (COVERAGE_LINE_THRESHOLD, default 80) before writing the HTML report.
+    - make -j"$(nproc)" coverage C_LOG_PATH=/tmp/c-log DOQ=0
   artifacts:
     when: always
     paths:
