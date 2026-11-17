@@ -277,7 +277,7 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_upstream_dispatch_members` | gauge | `state` | Members in each state (§4.3). |
 | `dns_encrypted_proxy_upstream_dispatch_inflight` | gauge | `provider` | Inflight job count per provider. |
 | `dns_encrypted_proxy_upstream_dispatch_penalty` | gauge | `provider` | Routing penalty applied to flaky providers. |
-| `dns_encrypted_proxy_upstream_dispatch_events_total` | counter | `event` | requeue / drop / budget_exhausted. |
+| `dns_encrypted_proxy_upstream_dispatch_events_total` | counter | `event` | requeue / drop / budget_exhausted / reconnect (SIGHUP requests carried out, see 6.4). |
 | `dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg` | gauge | — | Rolling avg job-queue wait. |
 | `dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max` | gauge | — | Worst observed wait since boot. |
 | `dns_encrypted_proxy_upstream_dispatch_queue_wait_bucket` | counter | `le` | Histogram (1, 5, 10, 25, 50, 100, 250, 500, 1000, +Inf ms). |
@@ -332,6 +332,7 @@ can use `Type=notify`:
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/dns-encrypted-proxy /etc/dns-encrypted-proxy.conf
+ExecReload=/bin/kill -HUP $MAINPID
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -360,6 +361,51 @@ variable rather than surfacing later as a start timeout. A failed send after
 startup is logged at WARN and does not stop the proxy. Outside systemd the
 variable is unset and all of this is a no-op. `AF_UNIX` must stay in
 `RestrictAddressFamilies` for the notification to get out.
+
+### 6.4 Signals and route changes
+
+| Signal | Effect |
+|---|---|
+| `SIGTERM`, `SIGINT` | Clean shutdown; `STOPPING=1` to systemd. |
+| `SIGHUP` | Drop and redial every pooled upstream connection. The process keeps running and keeps serving. |
+
+`SIGHUP` exists for a host whose default route moves, typically a router's
+WAN failover daemon. Pooled DoH and DoT connections are bound to the old
+path; without a nudge each one has to time out on its own before the proxy
+redials, which reads as a stall of several upstream timeouts after every
+failover. A systemd unit wires it as `ExecReload=/bin/kill -HUP $MAINPID`, so
+`systemctl reload dns-encrypted-proxy` is the operator spelling.
+
+What one `SIGHUP` does:
+
+1. The handler bumps an atomic generation counter and returns (it is
+   async-signal-safe; nothing else runs in signal context).
+2. Within about 10 ms the dispatch allocator thread sees the new generation
+   and carries it out:
+   - each live transport marks its pool stale. DoH replaces each curl easy
+     handle, which owns its connection cache; DoT closes each TLS connection.
+     This happens on the slot's next checkout, so a connection a worker is
+     using at that moment is never touched from another thread; that query
+     finishes or times out on the old path, and its next one dials fresh.
+     DoQ opens a QUIC connection per query and has nothing pooled.
+   - per-server penalties earned on the old path are cleared: health
+     backoff, transport retry suppression, the stage2 bootstrap cooldown and
+     any DoH HTTP-version pin (re-learned on the new path).
+   - members in cooldown or failed retry immediately; ready members re-verify
+     their route in place on the normal slot stagger and keep serving
+     meanwhile.
+3. `dispatch_events_total{event="reconnect"}` increments and an INFO line
+   (`Upstream reconnect requested`) is logged.
+
+Deliberately kept: the resolved upstream addresses (stage1 cache and stage2
+bootstrap addresses). Provider IPs do not depend on which WAN is up, and on a
+router the system resolver used to re-resolve them may itself be a dnsmasq
+that forwards to this proxy, which would turn a reconnect into a bootstrap
+loop. Several `SIGHUP`s in quick succession coalesce into as many allocator
+passes as it observes, each cheap.
+
+A `SIGHUP` that arrives before the upstream client exists (early in startup)
+is ignored rather than terminating the process.
 
 ---
 

@@ -186,6 +186,11 @@ typedef struct {
     char bootstrap_resolvers[UPSTREAM_MAX_BOOTSTRAP_RESOLVERS][64];
 
     upstream_stage_metrics_t stage_metrics;
+
+    /* Bumped by upstream_client_request_reconnect (possibly from a signal
+     * handler); the dispatch allocator thread notices the change and runs
+     * upstream_client_apply_reconnect. Accessed only through __atomic. */
+    unsigned reconnect_generation;
 } upstream_client_t;
 
 typedef struct {
@@ -309,5 +314,25 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
 int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats_t *stats_out);
 int upstream_client_set_bootstrap_ipv4(upstream_client_t *client, const char *host, uint32_t addr_v4_be);
 int upstream_is_ready(const upstream_client_t *client);
+
+/*
+ * Ask for every pooled upstream connection to be dropped and redialled.
+ * Meant for a route change (WAN failover): connections pinned to the old
+ * path would otherwise keep timing out until each one is individually
+ * declared dead. Async-signal-safe: it only bumps reconnect_generation; the
+ * work happens later in upstream_client_apply_reconnect.
+ */
+void upstream_client_request_reconnect(upstream_client_t *client);
+unsigned upstream_client_reconnect_generation(const upstream_client_t *client);
+
+/*
+ * Carry out a reconnect request in normal thread context: tell each live
+ * transport to recycle its pooled connections on next checkout, and clear
+ * the penalties (health backoff, transport suppression, stage2 cooldown,
+ * DoH protocol pin) that were earned on the old path. Resolved upstream
+ * addresses are kept on purpose: provider IPs do not depend on the WAN, and
+ * on a router the system resolver may itself route through this proxy.
+ */
+void upstream_client_apply_reconnect(upstream_client_t *client);
 
 #endif /* UPSTREAM_H */

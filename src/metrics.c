@@ -361,6 +361,7 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"budget_exhausted\"} %llu\n"
                     "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"requeued\"} %llu\n"
                     "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"dropped\"} %llu\n"
+                    "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"reconnect\"} %llu\n"
                     "# HELP dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg Average queue wait before worker execution.\n"
                     "# TYPE dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg gauge\n"
                     "dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_avg %f\n"
@@ -392,6 +393,7 @@ static int append_upstream_metrics(char *out, size_t out_size, size_t *offset) {
                     (unsigned long long)fs.budget_exhausted_total,
                     (unsigned long long)fs.requeued_total,
                     (unsigned long long)fs.dropped_total,
+                    (unsigned long long)fs.reconnects_total,
                     fs.queue_wait_samples_total == 0 ? 0.0 : (double)fs.queue_wait_ms_total / (double)fs.queue_wait_samples_total,
                     (unsigned long long)fs.queue_wait_ms_max,
                     (unsigned long long)fs.queue_wait_le_1ms,

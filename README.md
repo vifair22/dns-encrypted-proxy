@@ -115,6 +115,17 @@ Version and help:
 
 The version string embeds the semver from `release_version`, the configure-time UTC timestamp, and the build variant (`release`, `debug`, `asan`, `coverage`, …). It also prints on the first INFO line at startup so crash logs self-identify.
 
+Signals and service management:
+
+- `SIGTERM` / `SIGINT`: clean shutdown.
+- `SIGHUP`: drop and redial every pooled upstream connection without
+  restarting, for a route change such as WAN failover
+  (`ExecReload=/bin/kill -HUP $MAINPID` in a unit).
+- systemd `Type=notify` is supported natively (no libsystemd): `READY=1` once
+  the listeners are bound, `STOPPING=1` on shutdown.
+
+Details in `Manual.md` sections 6.3 and 6.4.
+
 ## Configuration
 
 By default the proxy reads `dns-encrypted-proxy.conf` if present. You can also pass an explicit config path:

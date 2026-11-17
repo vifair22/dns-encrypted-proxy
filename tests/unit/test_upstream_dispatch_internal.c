@@ -112,6 +112,23 @@ void upstream_bootstrap_stage1_invalidate(upstream_server_t *server) {
     (void)server;
 }
 
+/* Reconnect plumbing: generation behaves like the real one; applying is
+ * only counted, since what it resets is upstream.c's business. */
+static int g_apply_reconnect_calls = 0;
+
+void upstream_client_request_reconnect(upstream_client_t *client) {
+    (void)__atomic_add_fetch(&client->reconnect_generation, 1u, __ATOMIC_RELEASE);
+}
+
+unsigned upstream_client_reconnect_generation(const upstream_client_t *client) {
+    return __atomic_load_n(&client->reconnect_generation, __ATOMIC_ACQUIRE);
+}
+
+void upstream_client_apply_reconnect(upstream_client_t *client) {
+    (void)client;
+    __atomic_add_fetch(&g_apply_reconnect_calls, 1, __ATOMIC_RELAXED);
+}
+
 #include "../../src/upstream_dispatch.c"
 
 static void reset_stubs(void) {
@@ -119,6 +136,7 @@ static void reset_stubs(void) {
     g_resolve_sleep_ms = 0;
     g_stage1_prepare_delay_ms = 0;
     g_stage1_prepare_running = 0;
+    g_apply_reconnect_calls = 0;
     for (int i = 0; i < UPSTREAM_MAX_SERVERS; i++) {
         g_resolve_result[i] = -1;
     }
@@ -379,8 +397,99 @@ static void test_inflight_failure_drain_no_job_loss(void **state) {
     destroy_test_client(&client);
 }
 
+/*
+ * What one reconnect does to the fleet, without threads: benched members are
+ * due immediately, ready members re-verify on the normal slot stagger, and
+ * members mid-flight are left alone.
+ */
+static void test_apply_reconnect_rearms_members(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_client_t client;
+    init_test_client(&client);
+    client.server_count = 1;
+
+    upstream_member_t members[4];
+    memset(members, 0, sizeof(members));
+    for (int i = 0; i < 4; i++) {
+        members[i].slot_index = i;
+        members[i].transport_suppress_until_ms = 99999;
+    }
+    atomic_store(&members[0].state, UPSTREAM_MEMBER_COOLDOWN);
+    members[0].next_retry_ms = 60000;
+    atomic_store(&members[1].state, UPSTREAM_MEMBER_FAILED);
+    members[1].next_retry_ms = 60000;
+    atomic_store(&members[2].state, UPSTREAM_MEMBER_READY);
+    members[2].refresh_due_ms = 60000;
+    atomic_store(&members[3].state, UPSTREAM_MEMBER_BUSY);
+    members[3].refresh_due_ms = 60000;
+    members[3].next_retry_ms = 60000;
+
+    upstream_facilitator_t fac;
+    memset(&fac, 0, sizeof(fac));
+    fac.upstream = &client;
+    fac.members = members;
+    fac.member_count = 4;
+
+    allocator_apply_reconnect(&fac, 1000);
+
+    assert_int_equal(g_apply_reconnect_calls, 1);
+    assert_int_equal((int)atomic_load(&fac.reconnects_total), 1);
+    assert_int_equal(members[0].next_retry_ms, 1000);
+    assert_int_equal(members[1].next_retry_ms, 1000);
+    assert_int_equal(members[2].refresh_due_ms, 1000 + 2 * MEMBER_REFRESH_SLOT_STAGGER_MS);
+    assert_int_equal(members[3].refresh_due_ms, 60000);
+    assert_int_equal(members[3].next_retry_ms, 60000);
+    for (int i = 0; i < 4; i++) {
+        assert_int_equal(members[i].transport_suppress_until_ms, 0);
+    }
+
+    destroy_test_client(&client);
+}
+
+/* The running allocator notices each request exactly once. */
+static void test_allocator_applies_each_reconnect_request_once(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_client_t client;
+    init_test_client(&client);
+    client.server_count = 1;
+    client.config.pool_size = 1;
+    client.config.timeout_ms = 1000;
+    client.servers[0].type = UPSTREAM_TYPE_DOH;
+
+    upstream_facilitator_t fac;
+    assert_int_equal(upstream_facilitator_init(&fac, &client), PROXY_OK);
+
+    struct timespec tick = {.tv_sec = 0, .tv_nsec = 10L * 1000 * 1000};
+    for (int round = 1; round <= 2; round++) {
+        upstream_client_request_reconnect(&client);
+        for (int waited = 0; waited < 200 && (int)atomic_load(&fac.reconnects_total) < round; waited++) {
+            nanosleep(&tick, NULL);
+        }
+        assert_int_equal((int)atomic_load(&fac.reconnects_total), round);
+    }
+
+    /* No new request: a few more allocator passes must not re-apply. */
+    struct timespec settle = {.tv_sec = 0, .tv_nsec = 100L * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    assert_int_equal((int)atomic_load(&fac.reconnects_total), 2);
+    assert_int_equal(__atomic_load_n(&g_apply_reconnect_calls, __ATOMIC_RELAXED), 2);
+
+    upstream_facilitator_stats_t stats;
+    assert_int_equal(upstream_facilitator_get_stats(&fac, &stats), 0);
+    assert_int_equal(stats.reconnects_total, 2);
+
+    upstream_facilitator_destroy(&fac);
+    destroy_test_client(&client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_apply_reconnect_rearms_members),
+        cmocka_unit_test(test_allocator_applies_each_reconnect_request_once),
         cmocka_unit_test(test_priority_fallback_to_second_provider),
         cmocka_unit_test(test_deadline_expired_fails_fast),
         cmocka_unit_test(test_dispatch_stats_exposed),
