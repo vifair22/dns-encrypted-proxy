@@ -4,6 +4,7 @@ FROM alpine:edge AS build
 
 RUN apk add --no-cache \
     build-base \
+    bash \
     binutils \
     git \
     pkgconfig \
@@ -13,13 +14,14 @@ RUN apk add --no-cache \
 
 WORKDIR /src
 
+# Copied ahead of src so a c-log pin change, and only that, refetches it.
+COPY tools/fetch_c_log.sh tools/c-log.ref ./tools/
+RUN tools/fetch_c_log.sh /opt/c-log
+
 COPY Makefile ./
 COPY release_version ./
 COPY src ./src
 COPY dns-encrypted-proxy.conf.example ./
-
-ARG C_LOG_CACHE_BUST=1
-RUN rm -rf /opt/c-log && echo "$C_LOG_CACHE_BUST" >/tmp/c_log_cache_bust && git clone --depth 1 https://git.airies.net/vifair22/c-log /opt/c-log
 
 RUN make -j"$(nproc)" proxy BUILD=release DOQ=0 C_LOG_PATH=/opt/c-log \
     && strip /src/build/bin/dns-encrypted-proxy

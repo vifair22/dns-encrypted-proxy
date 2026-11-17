@@ -119,4 +119,4 @@ Use the dedicated CI test image and run the same matrix script used by GitLab:
 tools/run_ci_tests_docker.sh
 ```
 
-This builds `Dockerfile.ci-test`, installs ngtcp2 v1.12.0 and c-log, and runs `tools/ci_test_matrix.sh` across all upstream feature combinations. Container builds go to `build/matrix-ci/` so they never share objects with a host build in `build/matrix/`.
+This builds `Dockerfile.ci-test`, installs ngtcp2 v1.12.0 and the pinned c-log (`tools/c-log.ref`), and runs `tools/ci_test_matrix.sh` across all upstream feature combinations. Container builds go to `build/matrix-ci/` so they never share objects with a host build in `build/matrix/`.

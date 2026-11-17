@@ -65,6 +65,11 @@ The build is a plain Makefile. It needs a checkout of
 `../c-log`) plus libcurl and OpenSSL development headers found through
 `pkg-config`. `make help` lists variants and targets.
 
+CI and both Docker images build against the c-log commit pinned in
+`tools/c-log.ref`; `tools/fetch_c_log.sh DEST` fetches exactly that commit
+(`C_LOG_REF=<sha>` overrides it to try a c-log change). Bump the pin
+deliberately, in its own commit.
+
 Build artifacts land under `build/`:
 
 - `build/release/`, `build/debug/`, `build/asan/`, `build/coverage/`, `build/analyze/`: per-variant objects (`BUILD=<variant>`, default `release`)
