@@ -43,6 +43,7 @@ static void test_config_defaults(void **state) {
     assert_int_equal(config.tcp_max_queries_per_conn, 0);
     assert_int_equal(config.metrics_enabled, 1);
     assert_int_equal(config.metrics_port, 9090);
+    assert_string_equal(config.metrics_addr, "0.0.0.0");
     assert_string_equal(config.log_level, "INFO");
     assert_int_equal(config.bootstrap_resolver_count, 2);
     assert_string_equal(config.bootstrap_resolvers[0], "8.8.8.8");
@@ -441,6 +442,39 @@ static void test_config_validation_failures_from_env(void **state) {
     setenv("METRICS_PORT", "0", 1);
     assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), PROXY_ERR_CONFIG);
     clear_config_env_vars();
+
+    setenv("METRICS_ADDR", "not-an-address", 1);
+    assert_int_equal(config_load(&config, "/nonexistent/path/config.conf"), PROXY_ERR_CONFIG);
+    assert_non_null(strstr(proxy_error_message(), "metrics_addr"));
+    clear_config_env_vars();
+}
+
+/*
+ * metrics_addr lets a multi-homed host (a router) keep the unauthenticated
+ * metrics listener off its WAN side. File sets it, env overrides the file.
+ */
+static void test_config_metrics_addr_file_and_env(void **state) {
+    (void)state;
+
+    clear_config_env_vars();
+
+    char path[] = "/tmp/dnsproxy_metrics_addr_XXXXXX";
+    int fd = mkstemp(path);
+    assert_true(fd >= 0);
+    const char *body = "metrics_addr=192.168.10.1\n";
+    assert_int_equal(write(fd, body, strlen(body)), (ssize_t)strlen(body));
+    close(fd);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, path), PROXY_OK);
+    assert_string_equal(config.metrics_addr, "192.168.10.1");
+
+    setenv("METRICS_ADDR", "127.0.0.1", 1);
+    assert_int_equal(config_load(&config, path), PROXY_OK);
+    assert_string_equal(config.metrics_addr, "127.0.0.1");
+
+    clear_config_env_vars();
+    unlink(path);
 }
 
 static void test_config_hosts_a_parse_and_lookup(void **state) {
@@ -576,6 +610,7 @@ int main(void) {
         cmocka_unit_test(test_config_all_env_overrides_and_empty_tokens),
         cmocka_unit_test(test_config_invalid_lines_and_empty_explicit_path),
         cmocka_unit_test(test_config_validation_failures_from_env),
+        cmocka_unit_test(test_config_metrics_addr_file_and_env),
         cmocka_unit_test(test_config_hosts_a_parse_and_lookup),
         cmocka_unit_test(test_config_hosts_a_duplicate_and_capacity),
         cmocka_unit_test(test_config_bootstrap_resolvers_parse_and_override),
