@@ -5,9 +5,10 @@ FROM alpine:latest
 RUN apk add --no-cache \
     autoconf \
     automake \
-    cmake \
+    bash \
     cmocka-dev \
     curl-dev \
+    gcovr \
     gcc \
     git \
     libtool \
