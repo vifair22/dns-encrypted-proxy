@@ -25,17 +25,26 @@ Three transports are wired up. DoH is enabled by default; DoT is enabled by defa
 
 The default Release build is what production runs. Other variants exist for specific concerns.
 
-| Variant | Configure | Purpose |
+The build is a single Makefile; one variant per invocation, selected with `BUILD=`.
+
+| Variant | Invocation | Purpose |
 |---|---|---|
-| Release | `-DCMAKE_BUILD_TYPE=Release` | Production. `-O3 -flto`, hardened. |
-| Debug | `-DCMAKE_BUILD_TYPE=Debug` | `-Og -g`, useful with gdb. |
-| ASAN | `-DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON` | AddressSanitizer for memory bugs. |
-| Coverage | `-DENABLE_COVERAGE=ON` | gcov instrumentation, drives the `coverage` target. |
-| Analyze | `-DENABLE_ANALYZER=ON -DENABLE_STACK_USAGE_CHECK=ON` | `gcc -fanalyzer` on production sources, emits `.su` files. |
+| Release | `make BUILD=release` (default) | Production. `-O3 -flto`, section GC, hardened. |
+| Debug | `make BUILD=debug` | `-Og -g`, useful with gdb. |
+| ASAN | `make BUILD=asan` | AddressSanitizer for memory bugs. |
+| Coverage | `make coverage` | gcov instrumentation; runs the suite and gates on line coverage. |
+| Analyze | `make analyze` | `gcc -fanalyzer` and `-fstack-usage` on production sources, then cppcheck, the stack limit and clang-tidy. |
 
-Per-protocol toggles: `-DENABLE_UPSTREAM_DOH=ON|OFF`, `-DENABLE_UPSTREAM_DOT=ON|OFF`, `-DENABLE_UPSTREAM_DOQ=ON|OFF`. At least one must be on.
+Per-protocol toggles: `DOH=0|1`, `DOT=0|1`, `DOQ=0|1`. At least one must be on.
 
-All ready-to-run binaries land in `build/bin/` regardless of variant — last build wins.
+Other knobs: `C_LOG_PATH` (c-log checkout, default `../c-log`), `WERROR=0` (drop
+`-Werror`, for toolchains newer than CI's), `OBJ_DIR`/`BIN_DIR` (override the
+output directories), `STACK_USAGE_LIMIT`, `COVERAGE_LINE_THRESHOLD`.
+
+Objects go to `build/<variant>/`; ready-to-run binaries land in `build/bin/`
+regardless of variant, so the last build wins. Changing a toggle or variant
+inside one object directory triggers a rebuild: every object depends on a
+`.flags` file holding the full compile line.
 
 ---
 
@@ -87,6 +96,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 |---|---|---|---|---|
 | `metrics_enabled` | `1` | bool | `METRICS_ENABLED` | `0` disables the metrics server. |
 | `metrics_port` | `9090` | port | `METRICS_PORT` | HTTP endpoint, separate from DNS port. |
+| `metrics_addr` | `0.0.0.0` | IPv4 | `METRICS_ADDR` | Bind address for the metrics listener. It has no auth, so on a multi-homed host (a router) bind it to an internal address. Rejected at config load if it is not an IPv4 literal. |
 | `log_level` | `INFO` | DEBUG/INFO/WARN/ERROR | `LOG_LEVEL` | Lower is more verbose. |
 
 ---
@@ -313,10 +323,14 @@ docker run --rm -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
 
 The container listens on `:53` inside; the host port mapping needs to be unprivileged on the host or run as root.
 
-### 6.3 systemd unit (sketch)
+### 6.3 systemd
+
+The proxy speaks the `sd_notify` protocol itself (no libsystemd), so the unit
+can use `Type=notify`:
 
 ```
 [Service]
+Type=notify
 ExecStart=/usr/local/bin/dns-encrypted-proxy /etc/dns-encrypted-proxy.conf
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -326,6 +340,26 @@ PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_UNIX
 Restart=on-failure
 ```
+
+What it sends to `$NOTIFY_SOCKET`:
+
+| When | Datagram |
+|---|---|
+| UDP and TCP listeners bound, metrics listener up, serving threads started | `READY=1` + `STATUS=Serving DNS on <addr>:<port>` |
+| SIGTERM or SIGINT received (sent from the handler) | `STOPPING=1` |
+
+`READY=1` deliberately does not wait for an upstream. A host that boots with
+its WAN down would otherwise hold the unit in `activating` until
+`TimeoutStartSec` and restart-loop; the proxy is useful as soon as it can
+answer (cache, `hosts_a`, SERVFAIL fast). Upstream health is what `/readyz`
+reports.
+
+`NOTIFY_SOCKET` may be a filesystem path or an `@abstract` name. Anything else
+(for example a `vsock:` address) fails startup with an error naming the
+variable rather than surfacing later as a start timeout. A failed send after
+startup is logged at WARN and does not stop the proxy. Outside systemd the
+variable is unset and all of this is a no-op. `AF_UNIX` must stay in
+`RestrictAddressFamilies` for the notification to get out.
 
 ---
 
@@ -394,14 +428,15 @@ This is the same script CI runs — it builds all 7 DoH/DoT/DoQ combinations and
 | `src/upstream_doq_ngtcp2.c` / `.h` | ngtcp2-based DoQ transport. |
 | `src/iterative_resolver.c` | Stage-3 resolver (root → TLD → authoritative). |
 | `src/metrics.c` | Prometheus exposition + `/healthz` / `/readyz`. |
+| `src/sd_notify.c` / `.h` | systemd readiness notification over `$NOTIFY_SOCKET`. |
 | `src/logger.c` | Thin wrapper over the c-log dependency. |
 
 Dependencies that have to be present at build time:
 
-- `c-log` (header-only, the project's own structured logger; path via `-DC_LOG_PATH`).
-- `libcurl` if `ENABLE_UPSTREAM_DOH=ON`.
-- `openssl` if `ENABLE_UPSTREAM_DOT=ON` or `ENABLE_UPSTREAM_DOQ=ON`.
-- `ngtcp2` + an ngtcp2 OpenSSL-family crypto module if `ENABLE_UPSTREAM_DOQ=ON`.
-- `cmocka` if `BUILD_TESTS=ON`.
-- `gcovr` if `ENABLE_COVERAGE=ON` and you want the `coverage` target.
+- `c-log` (header-only, the project's own structured logger; path via `C_LOG_PATH=`, default `../c-log`).
+- `libcurl` if `DOH=1`.
+- `openssl` if `DOT=1` or `DOQ=1`.
+- `ngtcp2` + an ngtcp2 OpenSSL-family crypto module if `DOQ=1`.
+- `cmocka` for the `tests` and `test` targets.
+- `gcovr` for the `coverage` target.
 - `clang-tidy` and `cppcheck` for the `lint` and `cppcheck` targets respectively.

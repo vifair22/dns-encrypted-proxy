@@ -1061,11 +1061,22 @@ proxy_status_t metrics_server_start(
     dns_cache_t *cache,
     upstream_client_t *upstream,
     upstream_facilitator_t *facilitator,
+    const char *bind_addr,
     int port) {
-    if (m == NULL || port <= 0 || port > 65535) {
+    if (m == NULL || bind_addr == NULL || port <= 0 || port > 65535) {
         return set_error(PROXY_ERR_INVALID_ARG,
-                         "m=%p port=%d (expected 1..65535)",
-                         (const void *)m, port);
+                         "m=%p bind_addr=%p port=%d (expected 1..65535)",
+                         (const void *)m, (const void *)bind_addr, port);
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, bind_addr, &addr.sin_addr) != 1) {
+        return set_error(PROXY_ERR_INVALID_ARG,
+                         "metrics bind address '%s' is not IPv4",
+                         bind_addr);
     }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1077,17 +1088,11 @@ proxy_status_t metrics_server_start(
     int reuse = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         close(fd);
         return set_error_errno(PROXY_ERR_NETWORK,
-                               "bind metrics socket on 0.0.0.0:%d",
-                               port);
+                               "bind metrics socket on %s:%d",
+                               bind_addr, port);
     }
     if (listen(fd, 32) != 0) {
         close(fd);

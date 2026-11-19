@@ -24,6 +24,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -337,7 +339,8 @@ static void mock_tls_server_join_and_destroy(mock_tls_server_t *server) {
 }
 
 static int resolve_test_cert_paths(char *cert_out, size_t cert_out_len, char *key_out, size_t key_out_len) {
-    /* Test cwd depends on which build tree ctest invoked us from:
+    /* `make test` runs from the repo root; the deeper candidates cover
+     * running a test binary by hand from inside build/:
      *   repo root             -> tests/certs/...
      *   build/<variant>/      -> ../../tests/certs/...
      *   build/matrix/<combo>/ -> ../../../tests/certs/... */
@@ -624,9 +627,15 @@ static int send_tcp_query_on_fd(int fd, const uint8_t *query, size_t query_len, 
 }
 
 static const char *resolve_proxy_binary_path(void) {
-    /* All ready-to-run binaries live in <repo>/build/bin/ regardless of which
-     * variant (release/debug/asan/coverage) was configured. The relative path
-     * depends on the test's working directory at the time ctest invokes it. */
+    /* `make test` names the proxy built alongside this test binary: the
+     * feature matrix gives every combination its own bin dir, so the default
+     * build/bin/ copy may belong to a different transport set. */
+    const char *from_env = getenv("DNS_ENCRYPTED_PROXY_TEST_BIN");
+    if (from_env != NULL && from_env[0] != '\0' && access(from_env, X_OK) == 0) {
+        return from_env;
+    }
+
+    /* Fallbacks for running a test binary by hand from a few likely cwds. */
     static const char *const candidates[] = {
         "./dns-encrypted-proxy",            /* cwd = build/bin/ */
         "../bin/dns-encrypted-proxy",       /* cwd = build/<variant>/ */
@@ -2691,7 +2700,7 @@ static void test_metrics_endpoint_http_paths(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, port), PROXY_OK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", port), PROXY_OK);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -2747,7 +2756,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, port), PROXY_OK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, "127.0.0.1", port), PROXY_OK);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -3051,6 +3060,107 @@ static void test_main_invalid_config_exits_nonzero(void **state) {
 /*
  * Test: main starts server and exits cleanly on SIGTERM
  */
+/*
+ * systemd Type=notify end to end: the real binary, a fake notification
+ * socket. READY=1 must arrive only once the DNS listeners are bound (the
+ * port is already taken when it lands) and must not wait for an upstream
+ * (the only upstream here is dead). SIGTERM must produce STOPPING=1.
+ */
+static void test_main_sd_notify_ready_and_stopping(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    int metrics_port = reserve_unused_port();
+    int dead_upstream = reserve_unused_port();
+    assert_true(listen_port > 0);
+    assert_true(metrics_port > 0);
+    assert_true(dead_upstream > 0);
+
+    char notify_name[64];
+    snprintf(notify_name, sizeof(notify_name), "@dnsproxy-it-notify-%ld", (long)getpid());
+    int notify_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    assert_true(notify_fd >= 0);
+    struct sockaddr_un notify_addr;
+    memset(&notify_addr, 0, sizeof(notify_addr));
+    notify_addr.sun_family = AF_UNIX;
+    size_t notify_len = strlen(notify_name);
+    memcpy(notify_addr.sun_path, notify_name, notify_len);
+    notify_addr.sun_path[0] = '\0';
+    assert_int_equal(bind(notify_fd, (struct sockaddr *)&notify_addr,
+                          (socklen_t)(offsetof(struct sockaddr_un, sun_path) + notify_len)), 0);
+    struct timeval rcv_timeout = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(notify_fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        "metrics_enabled=1\n"
+        "metrics_addr=127.0.0.1\n"
+        "metrics_port=%d\n",
+        listen_port,
+        dead_upstream,
+        metrics_port);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    setenv("NOTIFY_SOCKET", notify_name, 1);
+    pid_t pid = spawn_main_with_config(cfg_path);
+    unsetenv("NOTIFY_SOCKET");
+    assert_true(pid > 0);
+
+    char buf[256];
+    ssize_t got = recv(notify_fd, buf, sizeof(buf) - 1, 0);
+    assert_true(got > 0);
+    buf[got] = '\0';
+    char expected[128];
+    snprintf(expected, sizeof(expected), "READY=1\nSTATUS=Serving DNS on 127.0.0.1:%d", listen_port);
+    assert_string_equal(buf, expected);
+
+    /* Listener is really bound by the time READY arrives. */
+    int probe = socket(AF_INET, SOCK_DGRAM, 0);
+    assert_true(probe >= 0);
+    struct sockaddr_in probe_addr;
+    memset(&probe_addr, 0, sizeof(probe_addr));
+    probe_addr.sin_family = AF_INET;
+    probe_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    probe_addr.sin_port = htons((uint16_t)listen_port);
+    assert_int_not_equal(bind(probe, (struct sockaddr *)&probe_addr, sizeof(probe_addr)), 0);
+    close(probe);
+
+    /* metrics_addr took effect: the listener answers on loopback. */
+    int mfd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(mfd >= 0);
+    struct sockaddr_in maddr;
+    memset(&maddr, 0, sizeof(maddr));
+    maddr.sin_family = AF_INET;
+    maddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    maddr.sin_port = htons((uint16_t)metrics_port);
+    assert_int_equal(connect(mfd, (struct sockaddr *)&maddr, sizeof(maddr)), 0);
+    close(mfd);
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+    got = recv(notify_fd, buf, sizeof(buf) - 1, 0);
+    assert_true(got > 0);
+    buf[got] = '\0';
+    assert_string_equal(buf, "STOPPING=1");
+
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+
+    close(notify_fd);
+    remove_temp_file(cfg_path);
+}
+
 static void test_main_start_and_signal_shutdown(void **state) {
     (void)state;
 
@@ -3418,9 +3528,11 @@ static void test_runtime_api_invalid_arguments(void **state) {
     dns_cache_t cache;
     assert_int_equal(dns_cache_init(&cache, 8), PROXY_OK);
 
-    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, 9090), PROXY_ERR_INVALID_ARG);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 0), PROXY_ERR_INVALID_ARG);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 70000), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, "127.0.0.1", 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, NULL, 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "::1", 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", 0), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", 70000), PROXY_ERR_INVALID_ARG);
 
     int busy_fd = socket(AF_INET, SOCK_STREAM, 0);
     assert_true(busy_fd >= 0);
@@ -3437,7 +3549,7 @@ static void test_runtime_api_invalid_arguments(void **state) {
     assert_int_equal(bind(busy_fd, (struct sockaddr *)&busy_addr, sizeof(busy_addr)), 0);
     assert_int_equal(listen(busy_fd, 1), 0);
 
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, busy_port), PROXY_ERR_NETWORK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", busy_port), PROXY_ERR_NETWORK);
     close(busy_fd);
 
     metrics_server_stop();
@@ -3945,6 +4057,7 @@ int main(void) {
         cmocka_unit_test(test_dns_server_tcp_servfail_path),
         cmocka_unit_test(test_main_invalid_config_exits_nonzero),
         cmocka_unit_test(test_main_start_and_signal_shutdown),
+        cmocka_unit_test(test_main_sd_notify_ready_and_stopping),
         cmocka_unit_test(test_main_metrics_bind_failure_exits_nonzero),
         cmocka_unit_test(test_main_server_init_failure_exits_nonzero),
         cmocka_unit_test(test_main_runtime_bind_failure_exits_nonzero),

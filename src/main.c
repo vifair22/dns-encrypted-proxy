@@ -4,6 +4,7 @@
 #include "dns_server.h"
 #include "logger.h"
 #include "metrics.h"
+#include "sd_notify.h"
 #include "version.h"
 
 #include <signal.h>
@@ -14,6 +15,8 @@ static volatile sig_atomic_t g_stop = 0;
 
 static void handle_signal(int sig) {
     (void)sig;
+    static const char stopping[] = "STOPPING=1";
+    sd_notify_send_signal_safe(stopping, sizeof(stopping) - 1);
     g_stop = 1;
 }
 
@@ -61,6 +64,13 @@ int main(int argc, char **argv) {
 
     logger_set_level(config.log_level);
 
+    /* Fatal on a bad NOTIFY_SOCKET: under Type=notify, carrying on would
+     * only turn a clear error into a start timeout. */
+    if (sd_notify_init() != PROXY_OK) {
+        LOGF_ERROR("systemd notification setup failed: %s", proxy_error_message());
+        return 1;
+    }
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
@@ -78,18 +88,19 @@ int main(int argc, char **argv) {
     }
 
     if (config.metrics_enabled) {
-        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_port) != PROXY_OK) {
-            LOGF_ERROR("Failed to start metrics server on port %d: %s", config.metrics_port, proxy_error_message());
+        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_addr, config.metrics_port) != PROXY_OK) {
+            LOGF_ERROR("Failed to start metrics server on %s:%d: %s", config.metrics_addr, config.metrics_port, proxy_error_message());
             proxy_server_destroy(&server);
             return 1;
         }
-        LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_port);
+        LOGF_INFO("Metrics endpoint listening on %s:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_addr, config.metrics_port);
     }
 
     proxy_status_t rc = proxy_server_run(&server);
 
     metrics_server_stop();
     proxy_server_destroy(&server);
+    sd_notify_close();
 
     if (rc != PROXY_OK) {
         LOGF_ERROR("Proxy server runtime error: %s", proxy_error_message());

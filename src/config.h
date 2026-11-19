@@ -48,6 +48,7 @@ typedef struct {
     int tcp_max_queries_per_conn;
     int metrics_enabled;
     int metrics_port;
+    char metrics_addr[64];
     char log_level[16];
     int bootstrap_resolver_count;
     char bootstrap_resolvers[MAX_BOOTSTRAP_RESOLVERS][64];
