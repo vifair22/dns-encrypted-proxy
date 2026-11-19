@@ -1,5 +1,5 @@
 #!/bin/sh
-# Wrapper around clang-tidy used by the CMake 'lint' / 'lint-strict' targets.
+# Wrapper around clang-tidy used by the Makefile 'lint' / 'lint-strict' targets.
 #
 # Usage: run_clang_tidy.sh <strict|advisory> <build-dir> <source-files...>
 #

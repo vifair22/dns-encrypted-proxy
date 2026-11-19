@@ -62,6 +62,7 @@ static inline void clear_config_env_vars(void) {
     unsetenv("TCP_MAX_CLIENTS");
     unsetenv("TCP_MAX_QUERIES_PER_CONN");
     unsetenv("METRICS_PORT");
+    unsetenv("METRICS_ADDR");
     unsetenv("METRICS_ENABLED");
     unsetenv("LOG_LEVEL");
     unsetenv("HOSTS_A");

@@ -337,7 +337,8 @@ static void mock_tls_server_join_and_destroy(mock_tls_server_t *server) {
 }
 
 static int resolve_test_cert_paths(char *cert_out, size_t cert_out_len, char *key_out, size_t key_out_len) {
-    /* Test cwd depends on which build tree ctest invoked us from:
+    /* `make test` runs from the repo root; the deeper candidates cover
+     * running a test binary by hand from inside build/:
      *   repo root             -> tests/certs/...
      *   build/<variant>/      -> ../../tests/certs/...
      *   build/matrix/<combo>/ -> ../../../tests/certs/... */
@@ -624,9 +625,15 @@ static int send_tcp_query_on_fd(int fd, const uint8_t *query, size_t query_len, 
 }
 
 static const char *resolve_proxy_binary_path(void) {
-    /* All ready-to-run binaries live in <repo>/build/bin/ regardless of which
-     * variant (release/debug/asan/coverage) was configured. The relative path
-     * depends on the test's working directory at the time ctest invokes it. */
+    /* `make test` names the proxy built alongside this test binary: the
+     * feature matrix gives every combination its own bin dir, so the default
+     * build/bin/ copy may belong to a different transport set. */
+    const char *from_env = getenv("DNS_ENCRYPTED_PROXY_TEST_BIN");
+    if (from_env != NULL && from_env[0] != '\0' && access(from_env, X_OK) == 0) {
+        return from_env;
+    }
+
+    /* Fallbacks for running a test binary by hand from a few likely cwds. */
     static const char *const candidates[] = {
         "./dns-encrypted-proxy",            /* cwd = build/bin/ */
         "../bin/dns-encrypted-proxy",       /* cwd = build/<variant>/ */
@@ -2691,7 +2698,7 @@ static void test_metrics_endpoint_http_paths(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, port), PROXY_OK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", port), PROXY_OK);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -2747,7 +2754,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, port), PROXY_OK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, "127.0.0.1", port), PROXY_OK);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -3418,9 +3425,11 @@ static void test_runtime_api_invalid_arguments(void **state) {
     dns_cache_t cache;
     assert_int_equal(dns_cache_init(&cache, 8), PROXY_OK);
 
-    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, 9090), PROXY_ERR_INVALID_ARG);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 0), PROXY_ERR_INVALID_ARG);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 70000), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, "127.0.0.1", 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, NULL, 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "::1", 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", 0), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", 70000), PROXY_ERR_INVALID_ARG);
 
     int busy_fd = socket(AF_INET, SOCK_STREAM, 0);
     assert_true(busy_fd >= 0);
@@ -3437,7 +3446,7 @@ static void test_runtime_api_invalid_arguments(void **state) {
     assert_int_equal(bind(busy_fd, (struct sockaddr *)&busy_addr, sizeof(busy_addr)), 0);
     assert_int_equal(listen(busy_fd, 1), 0);
 
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, busy_port), PROXY_ERR_NETWORK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", busy_port), PROXY_ERR_NETWORK);
     close(busy_fd);
 
     metrics_server_stop();

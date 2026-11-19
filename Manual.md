@@ -25,17 +25,26 @@ Three transports are wired up. DoH is enabled by default; DoT is enabled by defa
 
 The default Release build is what production runs. Other variants exist for specific concerns.
 
-| Variant | Configure | Purpose |
+The build is a single Makefile; one variant per invocation, selected with `BUILD=`.
+
+| Variant | Invocation | Purpose |
 |---|---|---|
-| Release | `-DCMAKE_BUILD_TYPE=Release` | Production. `-O3 -flto`, hardened. |
-| Debug | `-DCMAKE_BUILD_TYPE=Debug` | `-Og -g`, useful with gdb. |
-| ASAN | `-DCMAKE_BUILD_TYPE=Debug -DENABLE_ASAN=ON` | AddressSanitizer for memory bugs. |
-| Coverage | `-DENABLE_COVERAGE=ON` | gcov instrumentation, drives the `coverage` target. |
-| Analyze | `-DENABLE_ANALYZER=ON -DENABLE_STACK_USAGE_CHECK=ON` | `gcc -fanalyzer` on production sources, emits `.su` files. |
+| Release | `make BUILD=release` (default) | Production. `-O3 -flto`, section GC, hardened. |
+| Debug | `make BUILD=debug` | `-Og -g`, useful with gdb. |
+| ASAN | `make BUILD=asan` | AddressSanitizer for memory bugs. |
+| Coverage | `make coverage` | gcov instrumentation; runs the suite and gates on line coverage. |
+| Analyze | `make analyze` | `gcc -fanalyzer` and `-fstack-usage` on production sources, then cppcheck, the stack limit and clang-tidy. |
 
-Per-protocol toggles: `-DENABLE_UPSTREAM_DOH=ON|OFF`, `-DENABLE_UPSTREAM_DOT=ON|OFF`, `-DENABLE_UPSTREAM_DOQ=ON|OFF`. At least one must be on.
+Per-protocol toggles: `DOH=0|1`, `DOT=0|1`, `DOQ=0|1`. At least one must be on.
 
-All ready-to-run binaries land in `build/bin/` regardless of variant — last build wins.
+Other knobs: `C_LOG_PATH` (c-log checkout, default `../c-log`), `WERROR=0` (drop
+`-Werror`, for toolchains newer than CI's), `OBJ_DIR`/`BIN_DIR` (override the
+output directories), `STACK_USAGE_LIMIT`, `COVERAGE_LINE_THRESHOLD`.
+
+Objects go to `build/<variant>/`; ready-to-run binaries land in `build/bin/`
+regardless of variant, so the last build wins. Changing a toggle or variant
+inside one object directory triggers a rebuild: every object depends on a
+`.flags` file holding the full compile line.
 
 ---
 
@@ -87,6 +96,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 |---|---|---|---|---|
 | `metrics_enabled` | `1` | bool | `METRICS_ENABLED` | `0` disables the metrics server. |
 | `metrics_port` | `9090` | port | `METRICS_PORT` | HTTP endpoint, separate from DNS port. |
+| `metrics_addr` | `0.0.0.0` | IPv4 | `METRICS_ADDR` | Bind address for the metrics listener. It has no auth, so on a multi-homed host (a router) bind it to an internal address. Rejected at config load if it is not an IPv4 literal. |
 | `log_level` | `INFO` | DEBUG/INFO/WARN/ERROR | `LOG_LEVEL` | Lower is more verbose. |
 
 ---
@@ -398,10 +408,10 @@ This is the same script CI runs — it builds all 7 DoH/DoT/DoQ combinations and
 
 Dependencies that have to be present at build time:
 
-- `c-log` (header-only, the project's own structured logger; path via `-DC_LOG_PATH`).
-- `libcurl` if `ENABLE_UPSTREAM_DOH=ON`.
-- `openssl` if `ENABLE_UPSTREAM_DOT=ON` or `ENABLE_UPSTREAM_DOQ=ON`.
-- `ngtcp2` + an ngtcp2 OpenSSL-family crypto module if `ENABLE_UPSTREAM_DOQ=ON`.
-- `cmocka` if `BUILD_TESTS=ON`.
-- `gcovr` if `ENABLE_COVERAGE=ON` and you want the `coverage` target.
+- `c-log` (header-only, the project's own structured logger; path via `C_LOG_PATH=`, default `../c-log`).
+- `libcurl` if `DOH=1`.
+- `openssl` if `DOT=1` or `DOQ=1`.
+- `ngtcp2` + an ngtcp2 OpenSSL-family crypto module if `DOQ=1`.
+- `cmocka` for the `tests` and `test` targets.
+- `gcovr` for the `coverage` target.
 - `clang-tidy` and `cppcheck` for the `lint` and `cppcheck` targets respectively.
