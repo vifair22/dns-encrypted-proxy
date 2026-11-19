@@ -57,23 +57,24 @@ Notes on DoH HTTP version selection:
 Build (release):
 
 ```bash
-cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/release
+make -j proxy C_LOG_PATH=../c-log
 ```
+
+The build is a plain Makefile. It needs a checkout of
+[c-log](https://git.airies.net/vifair22/c-log) (`C_LOG_PATH`, default
+`../c-log`) plus libcurl and OpenSSL development headers found through
+`pkg-config`. `make help` lists variants and targets.
 
 Build artifacts land under `build/`:
 
-- `build/release/`, `build/debug/`, `build/asan/`, `build/coverage/` — per-variant CMake trees (intermediates, `Makefile`, `CMakeFiles/`)
-- `build/bin/` — ready-to-run binaries (`dns-encrypted-proxy`, all `test_*`, benchmark tools). Shared across variants; last build wins.
-- `build/matrix/<combo>/` — protocol feature-matrix builds produced by `tools/ci_test_matrix.sh`
+- `build/release/`, `build/debug/`, `build/asan/`, `build/coverage/`, `build/analyze/`: per-variant objects (`BUILD=<variant>`, default `release`)
+- `build/bin/`: ready-to-run binaries (`dns-encrypted-proxy`, all `test_*`, benchmark tools). Shared across variants; last build wins.
+- `build/matrix/<combo>/`: protocol feature-matrix builds produced by `tools/ci_test_matrix.sh`, each with its own `bin/`
 
-Optional upstream provider build flags (DoH/DoT ON by default, DoQ OFF by default):
+Optional upstream transports (DoH/DoT on by default, DoQ off by default):
 
 ```bash
-cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_UPSTREAM_DOH=ON \
-  -DENABLE_UPSTREAM_DOT=ON \
-  -DENABLE_UPSTREAM_DOQ=ON
+make -j proxy DOH=1 DOT=1 DOQ=1
 ```
 
 Tip: verify HTTP/3 availability in your runtime image/host with:
@@ -86,7 +87,7 @@ Look for `HTTP3` in the `Features` list.
 
 DoQ uses ngtcp2 and requires ngtcp2 + OpenSSL-family crypto modules when enabled.
 
-Current DoQ status: experimental and disabled by default; implementation exists behind `-DENABLE_UPSTREAM_DOQ=ON`, but interoperability is still provider/environment dependent.
+Current DoQ status: experimental and disabled by default; implementation exists behind `DOQ=1`, but interoperability is still provider/environment dependent.
 
 Run:
 
