@@ -264,6 +264,12 @@ static void log_doh_attempt_failure_impl(
 struct upstream_doh_client {
     CURL **pool_handles;
     int *pool_in_use;
+    /* Reconnect generation each handle was last (re)created under. A handle
+     * whose value trails `generation` is recycled when next checked out: a
+     * curl easy handle owns its connection cache, so replacing the handle is
+     * what drops connections pinned to a dead route. */
+    unsigned *pool_generation;
+    unsigned generation;
     int pool_size;
     pthread_mutex_t pool_mutex;
     pthread_cond_t pool_cond;
@@ -478,6 +484,42 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     return chunk;
 }
 
+/*
+ * Claim free slot i (pool_mutex held; released here). A handle from before
+ * the latest reconnect request is replaced after the unlock: the slot is
+ * ours once in_use is set, and curl_easy_init/cleanup should not run under
+ * the pool lock. If a fresh handle cannot be made the old one is used and
+ * left stale so the next checkout tries again.
+ */
+static int pool_take_slot_locked(upstream_doh_client_t *client, int i, CURL **handle_out, int *slot_out) {
+    client->pool_in_use[i] = 1;
+    unsigned want = __atomic_load_n(&client->generation, __ATOMIC_ACQUIRE);
+    int stale = client->pool_generation[i] != want;
+    pthread_mutex_unlock(&client->pool_mutex);
+
+    if (stale) {
+        CURL *fresh = curl_easy_init();
+        if (fresh != NULL) {
+            curl_easy_cleanup(client->pool_handles[i]);
+            client->pool_handles[i] = fresh;
+            client->pool_generation[i] = want;
+        } else {
+            LOGF_WARN("DoH reconnect: curl_easy_init failed for pool slot %d; reusing old handle", i);
+        }
+    }
+
+    *handle_out = client->pool_handles[i];
+    *slot_out = i;
+    return 0;
+}
+
+void upstream_doh_client_request_reconnect(upstream_doh_client_t *client) {
+    if (client == NULL) {
+        return;
+    }
+    (void)__atomic_add_fetch(&client->generation, 1u, __ATOMIC_RELEASE);
+}
+
 static int pool_acquire(upstream_doh_client_t *client, uint64_t deadline_ms, CURL **handle_out, int *slot_out) {
     /*
      * Blocking acquire gives simple backpressure: callers wait instead of
@@ -494,11 +536,7 @@ static int pool_acquire(upstream_doh_client_t *client, uint64_t deadline_ms, CUR
     for (;;) {
         for (int i = 0; i < client->pool_size; i++) {
             if (!client->pool_in_use[i]) {
-                client->pool_in_use[i] = 1;
-                *handle_out = client->pool_handles[i];
-                *slot_out = i;
-                pthread_mutex_unlock(&client->pool_mutex);
-                return 0;
+                return pool_take_slot_locked(client, i, handle_out, slot_out);
             }
         }
 
@@ -527,11 +565,7 @@ static int pool_acquire(upstream_doh_client_t *client, uint64_t deadline_ms, CUR
             /* Re-check the slots once: a release may have raced the timeout. */
             for (int i = 0; i < client->pool_size; i++) {
                 if (!client->pool_in_use[i]) {
-                    client->pool_in_use[i] = 1;
-                    *handle_out = client->pool_handles[i];
-                    *slot_out = i;
-                    pthread_mutex_unlock(&client->pool_mutex);
-                    return 0;
+                    return pool_take_slot_locked(client, i, handle_out, slot_out);
                 }
             }
             pthread_mutex_unlock(&client->pool_mutex);
@@ -741,9 +775,11 @@ proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, cons
     int pool_size = client->pool_size;
     client->pool_handles = calloc((size_t)pool_size, sizeof(*client->pool_handles));
     client->pool_in_use = calloc((size_t)pool_size, sizeof(*client->pool_in_use));
-    if (client->pool_handles == NULL || client->pool_in_use == NULL) {
+    client->pool_generation = calloc((size_t)pool_size, sizeof(*client->pool_generation));
+    if (client->pool_handles == NULL || client->pool_in_use == NULL || client->pool_generation == NULL) {
         free(client->pool_handles);
         free(client->pool_in_use);
+        free(client->pool_generation);
         pthread_cond_destroy(&client->pool_cond);
         pthread_mutex_destroy(&client->pool_mutex);
         curl_global_cleanup();
@@ -761,6 +797,7 @@ proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, cons
             }
             free(client->pool_handles);
             free(client->pool_in_use);
+            free(client->pool_generation);
             pthread_cond_destroy(&client->pool_cond);
             pthread_mutex_destroy(&client->pool_mutex);
             curl_global_cleanup();
@@ -796,6 +833,7 @@ void upstream_doh_client_destroy(upstream_doh_client_t *client) {
 
     free(client->pool_handles);
     free(client->pool_in_use);
+    free(client->pool_generation);
 
     if (client->initialized) {
         pthread_cond_destroy(&client->pool_cond);

@@ -35,6 +35,9 @@ typedef struct {
     int in_use;
     char host[256];
     int port;
+    /* Reconnect generation this slot was last checked against; see
+     * upstream_dot_client_request_reconnect. */
+    unsigned generation;
 } dot_connection_t;
 
 struct upstream_dot_client {
@@ -44,6 +47,7 @@ struct upstream_dot_client {
     pthread_mutex_t pool_mutex;
     pthread_cond_t pool_cond;
     int initialized;
+    unsigned generation;
 };
 
 static uint16_t read_u16(const uint8_t *ptr) {
@@ -337,16 +341,33 @@ static int pool_acquire(upstream_dot_client_t *client, dot_connection_t **conn_o
     for (;;) {
         for (int i = 0; i < client->pool_size; i++) {
             if (!client->pool[i].in_use) {
-                client->pool[i].in_use = 1;
-                *conn_out = &client->pool[i];
-                *slot_out = i;
+                dot_connection_t *conn = &client->pool[i];
+                conn->in_use = 1;
+                unsigned want = __atomic_load_n(&client->generation, __ATOMIC_ACQUIRE);
+                int stale = conn->generation != want;
+                conn->generation = want;
                 pthread_mutex_unlock(&client->pool_mutex);
+                /* The slot is ours now, so closing it cannot race a worker.
+                 * The caller sees no live connection and dials fresh over
+                 * whatever route the kernel now picks. */
+                if (stale) {
+                    close_connection(conn);
+                }
+                *conn_out = conn;
+                *slot_out = i;
                 return 0;
             }
         }
 
         pthread_cond_wait(&client->pool_cond, &client->pool_mutex);
     }
+}
+
+void upstream_dot_client_request_reconnect(upstream_dot_client_t *client) {
+    if (client == NULL) {
+        return;
+    }
+    (void)__atomic_add_fetch(&client->generation, 1u, __ATOMIC_RELEASE);
 }
 
 static void pool_release(upstream_dot_client_t *client, int slot) {

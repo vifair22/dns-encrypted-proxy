@@ -4,6 +4,7 @@
 #include "dns_server.h"
 #include "logger.h"
 #include "metrics.h"
+#include "sd_notify.h"
 #include "version.h"
 
 #include <signal.h>
@@ -11,10 +12,28 @@
 #include <string.h>
 
 static volatile sig_atomic_t g_stop = 0;
+/* Set once the upstream client exists; SIGHUP before then has nothing to
+ * reconnect and is dropped. */
+static upstream_client_t *volatile g_reconnect_target = NULL;
 
 static void handle_signal(int sig) {
     (void)sig;
+    static const char stopping[] = "STOPPING=1";
+    sd_notify_send_signal_safe(stopping, sizeof(stopping) - 1);
     g_stop = 1;
+}
+
+/*
+ * SIGHUP: drop and redial every pooled upstream connection. A WAN failover
+ * daemon (or systemd ExecReload) sends it when the default route moves.
+ * Only bumps an atomic generation; the dispatch allocator does the work.
+ */
+static void handle_reconnect_signal(int sig) {
+    (void)sig;
+    upstream_client_t *target = g_reconnect_target;
+    if (target != NULL) {
+        upstream_client_request_reconnect(target);
+    }
 }
 
 static void print_version(void) {
@@ -36,6 +55,11 @@ static void print_usage(const char *progname) {
     printf("Options:\n");
     printf("  -h, --help          Show this help and exit.\n");
     printf("  -v, --version       Print version and exit.\n");
+    printf("\n");
+    printf("Signals:\n");
+    printf("  SIGTERM, SIGINT     Shut down cleanly.\n");
+    printf("  SIGHUP              Drop and redial all pooled upstream connections\n");
+    printf("                      (for a route change, e.g. WAN failover).\n");
 }
 
 int main(int argc, char **argv) {
@@ -61,11 +85,26 @@ int main(int argc, char **argv) {
 
     logger_set_level(config.log_level);
 
+    /* Fatal on a bad NOTIFY_SOCKET: under Type=notify, carrying on would
+     * only turn a clear error into a start timeout. */
+    if (sd_notify_init() != PROXY_OK) {
+        LOGF_ERROR("systemd notification setup failed: %s", proxy_error_message());
+        return 1;
+    }
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+
+    /* Installed before the server exists so an early SIGHUP is ignored
+     * rather than killing the process (SIGHUP's default action). */
+    struct sigaction sa_hup;
+    memset(&sa_hup, 0, sizeof(sa_hup));
+    sa_hup.sa_handler = handle_reconnect_signal;
+    sa_hup.sa_flags = SA_RESTART;
+    sigaction(SIGHUP, &sa_hup, NULL);
 
     LOGF_INFO("dns-encrypted-proxy %s starting", PROXY_VERSION_FULL);
     LOGF_INFO("Loaded configuration from %s", config.config_path);
@@ -77,19 +116,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    g_reconnect_target = &server.upstream;
+
     if (config.metrics_enabled) {
-        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_port) != PROXY_OK) {
-            LOGF_ERROR("Failed to start metrics server on port %d: %s", config.metrics_port, proxy_error_message());
+        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_addr, config.metrics_port) != PROXY_OK) {
+            LOGF_ERROR("Failed to start metrics server on %s:%d: %s", config.metrics_addr, config.metrics_port, proxy_error_message());
+            g_reconnect_target = NULL;
             proxy_server_destroy(&server);
             return 1;
         }
-        LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_port);
+        LOGF_INFO("Metrics endpoint listening on %s:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_addr, config.metrics_port);
     }
 
     proxy_status_t rc = proxy_server_run(&server);
 
+    g_reconnect_target = NULL;
     metrics_server_stop();
     proxy_server_destroy(&server);
+    sd_notify_close();
 
     if (rc != PROXY_OK) {
         LOGF_ERROR("Proxy server runtime error: %s", proxy_error_message());

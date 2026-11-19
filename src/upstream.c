@@ -20,6 +20,7 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <strings.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
@@ -416,6 +417,61 @@ proxy_status_t upstream_client_init(
     client->doq_client = NULL;
 
     return PROXY_OK;
+}
+
+/* A signal handler may call upstream_client_request_reconnect; an atomic RMW
+ * is only async-signal-safe when it does not fall back to a lock. */
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2,
+               "reconnect_generation must be lock-free for signal-handler use");
+
+void upstream_client_request_reconnect(upstream_client_t *client) {
+    if (client == NULL) {
+        return;
+    }
+    (void)__atomic_add_fetch(&client->reconnect_generation, 1u, __ATOMIC_RELEASE);
+}
+
+unsigned upstream_client_reconnect_generation(const upstream_client_t *client) {
+    if (client == NULL) {
+        return 0;
+    }
+    return __atomic_load_n(&client->reconnect_generation, __ATOMIC_ACQUIRE);
+}
+
+void upstream_client_apply_reconnect(upstream_client_t *client) {
+    if (client == NULL) {
+        return;
+    }
+
+    /* transport_mutex keeps a transport from being created half-way through
+     * this; one created after it starts on fresh connections anyway. */
+    pthread_mutex_lock(&client->transport_mutex);
+#if UPSTREAM_DOH_ENABLED
+    if (client->doh_client != NULL) {
+        upstream_doh_client_request_reconnect(client->doh_client);
+    }
+#endif
+#if UPSTREAM_DOT_ENABLED
+    if (client->dot_client != NULL) {
+        upstream_dot_client_request_reconnect(client->dot_client);
+    }
+#endif
+    /* DoQ opens a fresh QUIC connection per query; nothing pooled to drop. */
+    pthread_mutex_unlock(&client->transport_mutex);
+
+    for (int i = 0; i < client->server_count; i++) {
+        upstream_server_t *server = &client->servers[i];
+        server->health.healthy = 1;
+        server->health.consecutive_failures = 0;
+        server->stage.transport_retry_suppress_until_ms = 0;
+        server->stage.stage2_next_retry_ms = 0;
+        /* Protocol pins are evidence about the path as much as the server;
+         * 0 is re-clamped to the top usable tier on the next resolve. */
+        server->stage.doh_forced_http_tier = 0;
+        server->stage.doh_upgrade_failures = 0;
+        server->stage.doh_h3_consecutive_failures = 0;
+        server->stage.doh_upgrade_retry_after_ms = 0;
+    }
 }
 
 void upstream_client_destroy(upstream_client_t *client) {

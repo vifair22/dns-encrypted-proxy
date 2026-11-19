@@ -19,7 +19,7 @@ fi
 
 su_files=$(find "$BUILD_DIR" -name '*.su' 2>/dev/null || true)
 if [ -z "$su_files" ]; then
-    echo "stack-usage: no .su files found under $BUILD_DIR — was -DENABLE_STACK_USAGE_CHECK=ON used?" >&2
+    echo "stack-usage: no .su files found under $BUILD_DIR; was it built with BUILD=analyze?" >&2
     exit 2
 fi
 
