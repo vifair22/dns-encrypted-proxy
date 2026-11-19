@@ -374,6 +374,35 @@ static void member_mark_connected(upstream_member_t *member, const upstream_serv
     member->refresh_due_ms = now + MEMBER_REFRESH_INTERVAL_MS + slot_offset * MEMBER_REFRESH_SLOT_STAGGER_MS;
 }
 
+/*
+ * Carry out a reconnect request: transports recycle pooled connections on
+ * next checkout, server penalties from the old path are cleared, members
+ * that were benched retry now, and ready members re-verify their route in
+ * place (staggered like a normal refresh, so they keep serving meanwhile).
+ */
+static void allocator_apply_reconnect(upstream_facilitator_t *fac, uint64_t now) {
+    upstream_client_apply_reconnect(fac->upstream);
+
+    int benched = 0;
+    for (int i = 0; i < fac->member_count; i++) {
+        upstream_member_t *member = &fac->members[i];
+        int state = atomic_load(&member->state);
+        member->transport_suppress_until_ms = 0;
+        if (state == UPSTREAM_MEMBER_COOLDOWN || state == UPSTREAM_MEMBER_FAILED) {
+            member->next_retry_ms = now;
+            benched++;
+        } else if (state == UPSTREAM_MEMBER_READY) {
+            uint64_t slot_offset = member->slot_index > 0 ? (uint64_t)member->slot_index : UINT64_C(0);
+            member->refresh_due_ms = now + slot_offset * MEMBER_REFRESH_SLOT_STAGGER_MS;
+        }
+    }
+
+    atomic_fetch_add(&fac->reconnects_total, 1);
+    LOGF_INFO("Upstream reconnect requested: pooled connections will be redialled; "
+              "members=%d benched_retrying=%d",
+              fac->member_count, benched);
+}
+
 static void *allocator_thread_main(void *arg) {
     upstream_facilitator_t *fac = (upstream_facilitator_t *)arg;
     while (1) {
@@ -385,6 +414,13 @@ static void *allocator_thread_main(void *arg) {
         }
 
         uint64_t now = now_ms();
+
+        unsigned reconnect_gen = upstream_client_reconnect_generation(fac->upstream);
+        if (reconnect_gen != fac->applied_reconnect_generation) {
+            fac->applied_reconnect_generation = reconnect_gen;
+            allocator_apply_reconnect(fac, now);
+        }
+
         for (int i = 0; i < fac->member_count; i++) {
             upstream_member_t *member = &fac->members[i];
             upstream_server_t *server = &fac->upstream->servers[member->provider_index];
@@ -800,6 +836,7 @@ proxy_status_t upstream_facilitator_init(upstream_facilitator_t *facilitator, up
     memset(facilitator, 0, sizeof(*facilitator));
     facilitator->upstream = upstream;
     facilitator->running = 1;
+    facilitator->applied_reconnect_generation = upstream_client_reconnect_generation(upstream);
 
     facilitator->provider_count = upstream->server_count;
     if (facilitator->provider_count <= 0) {
@@ -1112,6 +1149,7 @@ int upstream_facilitator_get_stats(
     stats_out->budget_exhausted_total = (uint64_t)atomic_load(&facilitator->budget_exhausted_total);
     stats_out->requeued_total = (uint64_t)atomic_load(&facilitator->requeued_total);
     stats_out->dropped_total = (uint64_t)atomic_load(&facilitator->dropped_total);
+    stats_out->reconnects_total = (uint64_t)atomic_load(&facilitator->reconnects_total);
     stats_out->queue_wait_samples_total = (uint64_t)atomic_load(&facilitator->queue_wait_samples_total);
     stats_out->queue_wait_ms_total = (uint64_t)atomic_load(&facilitator->queue_wait_ms_total);
     stats_out->queue_wait_ms_max = (uint64_t)atomic_load(&facilitator->queue_wait_ms_max);

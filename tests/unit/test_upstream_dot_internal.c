@@ -672,8 +672,54 @@ static void test_dot_resolve_success_and_failures(void **state) {
     upstream_dot_client_destroy(client);
 }
 
+/*
+ * A reconnect closes each pooled TLS connection on its next checkout, so the
+ * caller sees no live connection and dials again over the current route.
+ */
+static void test_dot_reconnect_closes_pooled_connection_on_checkout(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t cfg = {.timeout_ms = 100, .pool_size = 1};
+    upstream_dot_client_t *client = NULL;
+    assert_int_equal(upstream_dot_client_init(&client, &cfg), PROXY_OK);
+
+    client->pool[0].fd = 9;
+    client->pool[0].ssl = (SSL *)(uintptr_t)0x55;
+    strcpy(client->pool[0].host, "dns.example");
+    client->pool[0].port = 853;
+
+    dot_connection_t *conn = NULL;
+    int slot = -1;
+    assert_int_equal(pool_acquire(client, &conn, &slot), 0);
+    assert_int_equal(conn->fd, 9);
+    assert_int_equal(g_close_calls, 0);
+    pool_release(client, slot);
+
+    upstream_dot_client_request_reconnect(client);
+    assert_int_equal(pool_acquire(client, &conn, &slot), 0);
+    assert_int_equal(conn->fd, -1);
+    assert_null(conn->ssl);
+    assert_string_equal(conn->host, "");
+    assert_int_equal(g_close_calls, 1);
+    assert_int_equal(g_ssl_free_calls, 1);
+    pool_release(client, slot);
+
+    /* Already current: a second checkout leaves the slot alone. */
+    client->pool[0].fd = 10;
+    assert_int_equal(pool_acquire(client, &conn, &slot), 0);
+    assert_int_equal(conn->fd, 10);
+    assert_int_equal(g_close_calls, 1);
+    conn->fd = -1;
+    pool_release(client, slot);
+
+    upstream_dot_client_request_reconnect(NULL);
+    upstream_dot_client_destroy(client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
+        cmocka_unit_test(test_dot_reconnect_closes_pooled_connection_on_checkout),
         cmocka_unit_test(test_connect_with_timeout_edge_paths),
         cmocka_unit_test(test_ssl_io_helpers),
         cmocka_unit_test(test_dot_client_init_failure_paths),

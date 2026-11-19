@@ -3161,6 +3161,92 @@ static void test_main_sd_notify_ready_and_stopping(void **state) {
     remove_temp_file(cfg_path);
 }
 
+/*
+ * SIGHUP end to end: the process must survive it (SIGHUP's default action
+ * is to terminate), and the dispatch allocator must act on each one, which
+ * shows on /metrics as the reconnect event counter.
+ */
+static int metrics_reconnect_count(int metrics_port) {
+    /* Heap, not stack: the full exposition is tens of KB and test frames
+     * count against the same 64 KB stack-usage limit as production. */
+    const size_t body_size = 65536;
+    char *body = malloc(body_size);
+    if (body == NULL) {
+        return -1;
+    }
+    int count = -1;
+    if (http_get_local(metrics_port, "/metrics", body, body_size) == 0) {
+        const char *key = "dns_encrypted_proxy_upstream_dispatch_events_total{event=\"reconnect\"} ";
+        const char *at = strstr(body, key);
+        if (at != NULL) {
+            count = atoi(at + strlen(key));
+        }
+    }
+    free(body);
+    return count;
+}
+
+static void test_main_sighup_reconnects_and_keeps_running(void **state) {
+    (void)state;
+
+    int listen_port = reserve_unused_port();
+    int metrics_port = reserve_unused_port();
+    int dead_upstream = reserve_unused_port();
+    assert_true(listen_port > 0);
+    assert_true(metrics_port > 0);
+    assert_true(dead_upstream > 0);
+
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=150\n"
+        "upstream_pool_size=1\n"
+        "cache_capacity=128\n"
+        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        "metrics_enabled=1\n"
+        "metrics_addr=127.0.0.1\n"
+        "metrics_port=%d\n",
+        listen_port,
+        dead_upstream,
+        metrics_port);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+
+    struct timespec tick = {.tv_sec = 0, .tv_nsec = 20L * 1000 * 1000};
+    int count = -1;
+    for (int i = 0; i < 150 && count < 0; i++) {
+        nanosleep(&tick, NULL);
+        count = metrics_reconnect_count(metrics_port);
+    }
+    assert_int_equal(count, 0);
+
+    for (int round = 1; round <= 2; round++) {
+        assert_int_equal(kill(pid, SIGHUP), 0);
+        for (int i = 0; i < 150 && count < round; i++) {
+            nanosleep(&tick, NULL);
+            count = metrics_reconnect_count(metrics_port);
+        }
+        assert_int_equal(count, round);
+        int status = 0;
+        assert_int_equal(waitpid(pid, &status, WNOHANG), 0);
+    }
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+}
+
 static void test_main_start_and_signal_shutdown(void **state) {
     (void)state;
 
@@ -4058,6 +4144,7 @@ int main(void) {
         cmocka_unit_test(test_main_invalid_config_exits_nonzero),
         cmocka_unit_test(test_main_start_and_signal_shutdown),
         cmocka_unit_test(test_main_sd_notify_ready_and_stopping),
+        cmocka_unit_test(test_main_sighup_reconnects_and_keeps_running),
         cmocka_unit_test(test_main_metrics_bind_failure_exits_nonzero),
         cmocka_unit_test(test_main_server_init_failure_exits_nonzero),
         cmocka_unit_test(test_main_runtime_bind_failure_exits_nonzero),
