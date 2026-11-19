@@ -33,6 +33,7 @@ deprecate APIs the code still uses), add `WERROR=0` to build locally; CI keeps
 - `./build/bin/test_dns_message`
 - `./build/bin/test_dns_message_internal`
 - `./build/bin/test_upstream`
+- `./build/bin/test_sd_notify`
 - `./build/bin/test_upstream_internal`
 - `./build/bin/test_upstream_bootstrap_internal`
 - `./build/bin/test_upstream_dispatch_internal`

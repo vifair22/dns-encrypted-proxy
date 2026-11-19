@@ -138,7 +138,7 @@ CURL_LIBS     := $(or $(call pkg_libs,libcurl),-lcurl)
 # --------------------------------------------------------------------------
 LIB_SRCS := src/errors.c src/config.c src/cache.c src/dns_message.c src/logger.c \
 	src/iterative_resolver.c src/upstream_bootstrap.c src/upstream_dispatch.c \
-	src/upstream.c src/dns_server.c src/metrics.c
+	src/upstream.c src/dns_server.c src/metrics.c src/sd_notify.c
 ifeq ($(DOH),1)
 LIB_SRCS += src/upstream_doh.c
 endif
@@ -159,7 +159,7 @@ PROXY := $(BIN_DIR)/dns-encrypted-proxy
 #   LIB    links every production object (black-box over the public API)
 #   AMALG  #includes one src/*.c and links errors.o for set_error
 #   SOLO   #includes its unit and needs nothing else from src/
-TESTS_LIB := test_errors test_config test_cache test_dns_message test_upstream
+TESTS_LIB := test_errors test_config test_cache test_dns_message test_upstream test_sd_notify
 TESTS_AMALG := test_cache_internal test_metrics_internal test_dns_server_internal \
 	test_iterative_resolver_internal test_upstream_bootstrap_internal \
 	test_upstream_internal test_upstream_dispatch_internal
@@ -269,6 +269,9 @@ $(TESTS_AMALG:%=$(BIN_DIR)/%): $(BIN_DIR)/%: $(OBJ_DIR)/tests/unit/%.o $(ERR_OBJ
 	@mkdir -p $(@D)
 	@echo "  LD    $@"
 	@$(CC) $(BASE_LDFLAGS) $^ $(CMOCKA_LIBS) $(LIBS) -o $@
+
+# dns_server.c signals readiness; its amalgamated test needs the notifier.
+$(BIN_DIR)/test_dns_server_internal: $(OBJ_DIR)/src/sd_notify.o
 
 $(TESTS_SOLO:%=$(BIN_DIR)/%) $(TESTS_DOQ_NGTCP2:%=$(BIN_DIR)/%): $(BIN_DIR)/%: $(OBJ_DIR)/tests/unit/%.o
 	@mkdir -p $(@D)

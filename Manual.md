@@ -323,10 +323,14 @@ docker run --rm -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
 
 The container listens on `:53` inside; the host port mapping needs to be unprivileged on the host or run as root.
 
-### 6.3 systemd unit (sketch)
+### 6.3 systemd
+
+The proxy speaks the `sd_notify` protocol itself (no libsystemd), so the unit
+can use `Type=notify`:
 
 ```
 [Service]
+Type=notify
 ExecStart=/usr/local/bin/dns-encrypted-proxy /etc/dns-encrypted-proxy.conf
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -336,6 +340,26 @@ PrivateTmp=true
 RestrictAddressFamilies=AF_INET AF_UNIX
 Restart=on-failure
 ```
+
+What it sends to `$NOTIFY_SOCKET`:
+
+| When | Datagram |
+|---|---|
+| UDP and TCP listeners bound, metrics listener up, serving threads started | `READY=1` + `STATUS=Serving DNS on <addr>:<port>` |
+| SIGTERM or SIGINT received (sent from the handler) | `STOPPING=1` |
+
+`READY=1` deliberately does not wait for an upstream. A host that boots with
+its WAN down would otherwise hold the unit in `activating` until
+`TimeoutStartSec` and restart-loop; the proxy is useful as soon as it can
+answer (cache, `hosts_a`, SERVFAIL fast). Upstream health is what `/readyz`
+reports.
+
+`NOTIFY_SOCKET` may be a filesystem path or an `@abstract` name. Anything else
+(for example a `vsock:` address) fails startup with an error naming the
+variable rather than surfacing later as a start timeout. A failed send after
+startup is logged at WARN and does not stop the proxy. Outside systemd the
+variable is unset and all of this is a no-op. `AF_UNIX` must stay in
+`RestrictAddressFamilies` for the notification to get out.
 
 ---
 
@@ -404,6 +428,7 @@ This is the same script CI runs — it builds all 7 DoH/DoT/DoQ combinations and
 | `src/upstream_doq_ngtcp2.c` / `.h` | ngtcp2-based DoQ transport. |
 | `src/iterative_resolver.c` | Stage-3 resolver (root → TLD → authoritative). |
 | `src/metrics.c` | Prometheus exposition + `/healthz` / `/readyz`. |
+| `src/sd_notify.c` / `.h` | systemd readiness notification over `$NOTIFY_SOCKET`. |
 | `src/logger.c` | Thin wrapper over the c-log dependency. |
 
 Dependencies that have to be present at build time:
