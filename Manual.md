@@ -323,24 +323,54 @@ docker run --rm -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
 
 The container listens on `:53` inside; the host port mapping needs to be unprivileged on the host or run as root.
 
-### 6.3 systemd
+### 6.3 systemd and the Debian package
 
-The proxy speaks the `sd_notify` protocol itself (no libsystemd), so the unit
-can use `Type=notify`:
+CI builds a Debian trixie amd64 package: the release binary, tested on
+trixie, plus a hardened unit. The package is distributed as a job artifact,
+not through a registry:
 
+| Pipeline | Job | Artifact | Version | Kept |
+|---|---|---|---|---|
+| Tag `vX.Y.Z` (must match `release_version`) | `deb_release` | `build/deb/dns-encrypted-proxy_X.Y.Z_amd64.deb` | `X.Y.Z` | Never expires |
+| Anything else | `deb` | `build/deb/dns-encrypted-proxy_<semver>~dev<iid>.g<sha>_amd64.deb` | sorts below the release | 1 month |
+
+Another project's CI fetches a release with its own job token, once that
+project is on this project's CI/CD job token allowlist (the router,
+`vifair22/router`, is):
+
+```bash
+curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" -o dns-encrypted-proxy.deb \
+  "https://git.airies.net/api/v4/projects/215/jobs/artifacts/v0.2.0/raw/build/deb/dns-encrypted-proxy_0.2.0_amd64.deb?job=deb_release"
 ```
-[Service]
-Type=notify
-ExecStart=/usr/local/bin/dns-encrypted-proxy /etc/dns-encrypted-proxy.conf
-ExecReload=/bin/kill -HUP $MAINPID
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-RestrictAddressFamilies=AF_INET AF_UNIX
-Restart=on-failure
-```
+
+| Path | What |
+|---|---|
+| `/usr/sbin/dns-encrypted-proxy` | Binary (DoH + DoT, no DoQ). |
+| `/etc/dns-encrypted-proxy/dns-encrypted-proxy.conf` | Config, a dpkg conffile (local edits survive upgrades). |
+| `/usr/lib/systemd/system/dns-encrypted-proxy.service` | Unit (`packaging/dns-encrypted-proxy.service`). |
+| `/usr/share/doc/dns-encrypted-proxy/` | README, this manual, copyright. |
+
+Depends are derived by `dpkg-shlibdeps` from the binary (libc6, libcurl4t64,
+libssl3t64) plus `procps` for the `/bin/kill` that `ExecReload` runs.
+
+The package installs the unit **disabled** and its maintainer scripts never
+enable or start it; `systemctl enable --now dns-encrypted-proxy` is the
+admin's call. They do run `daemon-reload`, `try-restart` an already-running
+instance on upgrade (so it does not keep executing the replaced binary), and
+stop it on removal.
+
+The unit runs as `Type=notify` with `DynamicUser=yes`, only
+`CAP_NET_BIND_SERVICE`, and a strict sandbox (`ProtectSystem=strict`,
+`SystemCallFilter=@system-service`, `MemoryDenyWriteExecute`, address
+families limited to `AF_INET AF_INET6 AF_UNIX AF_NETLINK`).
+`ExecReload=/bin/kill -HUP $MAINPID` maps `systemctl reload` to the
+reconnect in 6.4. The proxy speaks the `sd_notify` protocol itself (no
+libsystemd).
+
+On a router whose system resolver forwards to this proxy, upstream hostnames
+cannot be resolved through the system resolver at cold start; the stage2
+`bootstrap_resolvers` cover that, so keep them pointed at resolvers reachable
+without this proxy.
 
 What it sends to `$NOTIFY_SOCKET`:
 
