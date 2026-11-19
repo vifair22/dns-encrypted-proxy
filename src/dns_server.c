@@ -4,6 +4,7 @@
 
 #include "dns_message.h"
 #include "logger.h"
+#include "sd_notify.h"
 #include "upstream_bootstrap.h"
 
 #include <arpa/inet.h>
@@ -1625,6 +1626,18 @@ proxy_status_t proxy_server_run(proxy_server_t *server) {
         return set_error(PROXY_ERR_RESOURCE,
                          "pthread_create TCP accept loop failed (rc=%d)",
                          tcp_rc);
+    }
+
+    /*
+     * Ready means the listeners are bound and serving, not that an upstream
+     * has answered: a router booting with the WAN down would otherwise time
+     * out its start and restart-loop. Upstream health is /readyz's job.
+     */
+    char ready_state[160];
+    snprintf(ready_state, sizeof(ready_state), "READY=1\nSTATUS=Serving DNS on %s:%d",
+             server->config.listen_addr, server->config.listen_port);
+    if (sd_notify_send(ready_state) != PROXY_OK) {
+        LOGF_WARN("systemd readiness notification failed: %s", proxy_error_message());
     }
 
     pthread_join(udp_thread, NULL);

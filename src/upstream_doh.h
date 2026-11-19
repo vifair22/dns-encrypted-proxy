@@ -9,6 +9,10 @@
 
 proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client_out, const upstream_config_t *config);
 void upstream_doh_client_destroy(upstream_doh_client_t *client);
+/* Mark every pooled connection stale: each is closed and redialled the next
+ * time it is checked out, so connections a worker holds right now are never
+ * touched from another thread. */
+void upstream_doh_client_request_reconnect(upstream_doh_client_t *client);
 int upstream_doh_resolve(
     upstream_doh_client_t *client,
     upstream_server_t *server,

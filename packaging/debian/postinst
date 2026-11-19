@@ -1,0 +1,14 @@
+#!/bin/sh
+# Never enables or starts the unit: the package ships it disabled and the
+# admin (or the image build) decides. A running instance is restarted on
+# upgrade so it does not keep executing the replaced binary.
+set -e
+
+if [ "$1" = "configure" ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -n "$2" ]; then
+        systemctl try-restart dns-encrypted-proxy.service >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

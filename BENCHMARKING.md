@@ -8,8 +8,7 @@ This repository includes two benchmark tools:
 ## Build Benchmarks
 
 ```bash
-cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=ON
-cmake --build build/release
+make -j bench
 ```
 
 Benchmark binaries land in `build/bin/` alongside the proxy.

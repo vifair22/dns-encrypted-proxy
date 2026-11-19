@@ -1339,6 +1339,52 @@ static void test_doh_h3_to_h1_pin_gated_below_threshold(void **state) {
     upstream_doh_client_destroy(client);
 }
 
+/*
+ * A curl easy handle owns its connection cache, so a reconnect replaces the
+ * handle. Idle handles are swapped on their next checkout; the replacement
+ * is created before the old one is freed, and a failed create keeps the old
+ * handle and retries on the following checkout.
+ */
+static void test_doh_reconnect_recycles_pool_handles(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {.timeout_ms = 100, .pool_size = 1};
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+
+    CURL *h = NULL;
+    int slot = -1;
+    assert_int_equal(pool_acquire(client, now_ms() + 1000, &h, &slot), 0);
+    CURL *original = h;
+    pool_release(client, slot);
+
+    assert_int_equal(pool_acquire(client, now_ms() + 1000, &h, &slot), 0);
+    assert_ptr_equal(h, original);
+    pool_release(client, slot);
+
+    upstream_doh_client_request_reconnect(client);
+    int inits_before = g_curl_easy_init_calls;
+    g_curl_easy_init_fail_at = inits_before + 1;
+    assert_int_equal(pool_acquire(client, now_ms() + 1000, &h, &slot), 0);
+    assert_ptr_equal(h, original);
+    pool_release(client, slot);
+
+    g_curl_easy_init_fail_at = 0;
+    assert_int_equal(pool_acquire(client, now_ms() + 1000, &h, &slot), 0);
+    assert_ptr_not_equal(h, original);
+    CURL *recycled = h;
+    pool_release(client, slot);
+
+    /* Stays fresh until the next request. */
+    assert_int_equal(pool_acquire(client, now_ms() + 1000, &h, &slot), 0);
+    assert_ptr_equal(h, recycled);
+    pool_release(client, slot);
+
+    upstream_doh_client_request_reconnect(NULL);
+    upstream_doh_client_destroy(client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_write_callback_growth),
@@ -1365,6 +1411,7 @@ int main(void) {
         cmocka_unit_test(test_doh_slow_response_retry_failure_stops_ladder),
         cmocka_unit_test(test_doh_transport_failure_is_health_attributable),
         cmocka_unit_test(test_doh_h3_to_h1_pin_gated_below_threshold),
+        cmocka_unit_test(test_doh_reconnect_recycles_pool_handles),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
