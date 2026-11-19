@@ -384,6 +384,12 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
         return;
     }
 
+    if (strcmp(key, "metrics_addr") == 0) {
+        strncpy(config->metrics_addr, value, sizeof(config->metrics_addr) - 1);
+        config->metrics_addr[sizeof(config->metrics_addr) - 1] = '\0';
+        return;
+    }
+
     if (strcmp(key, "metrics_enabled") == 0) {
         int parsed = 0;
         if (parse_int(value, &parsed) == 0) {
@@ -536,6 +542,12 @@ static void apply_env_overrides(proxy_config_t *config) {
         }
     }
 
+    value = getenv("METRICS_ADDR");
+    if (value != NULL && *value != '\0') {
+        strncpy(config->metrics_addr, value, sizeof(config->metrics_addr) - 1);
+        config->metrics_addr[sizeof(config->metrics_addr) - 1] = '\0';
+    }
+
     value = getenv("METRICS_ENABLED");
     if (value != NULL && *value != '\0') {
         int parsed = 0;
@@ -598,6 +610,7 @@ static void set_defaults(proxy_config_t *config) {
     config->tcp_max_queries_per_conn = 0;
     config->metrics_enabled = 1;
     config->metrics_port = 9090;
+    strncpy(config->metrics_addr, "0.0.0.0", sizeof(config->metrics_addr) - 1);
     strncpy(config->log_level, "INFO", sizeof(config->log_level) - 1);
     bootstrap_resolvers_clear(config);
     strncpy(config->bootstrap_resolvers[0], "8.8.8.8", sizeof(config->bootstrap_resolvers[0]) - 1);
@@ -710,6 +723,15 @@ proxy_status_t config_load(proxy_config_t *config, const char *explicit_path) {
                          config->metrics_port);
     }
 
+    /* Checked here rather than left to bind(): a typo should fail config
+     * load with the key named, not surface later as a metrics bind error. */
+    struct in_addr metrics_in;
+    if (inet_pton(AF_INET, config->metrics_addr, &metrics_in) != 1) {
+        return set_error(PROXY_ERR_CONFIG,
+                         "metrics_addr must be an IPv4 address (got '%s')",
+                         config->metrics_addr);
+    }
+
     if (config->metrics_enabled != 0 && config->metrics_enabled != 1) {
         return set_error(PROXY_ERR_CONFIG,
                          "metrics_enabled must be 0 or 1 (got %d)",
@@ -741,6 +763,7 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  tcp_max_queries_per_conn=%d\n", config->tcp_max_queries_per_conn);
     fprintf(out, "  metrics_enabled=%d\n", config->metrics_enabled);
     fprintf(out, "  metrics_port=%d\n", config->metrics_port);
+    fprintf(out, "  metrics_addr=%s\n", config->metrics_addr);
     fprintf(out, "  log_level=%s\n", config->log_level);
     fprintf(out, "  bootstrap_resolvers=");
     for (int i = 0; i < config->bootstrap_resolver_count; i++) {

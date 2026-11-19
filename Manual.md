@@ -96,6 +96,7 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 |---|---|---|---|---|
 | `metrics_enabled` | `1` | bool | `METRICS_ENABLED` | `0` disables the metrics server. |
 | `metrics_port` | `9090` | port | `METRICS_PORT` | HTTP endpoint, separate from DNS port. |
+| `metrics_addr` | `0.0.0.0` | IPv4 | `METRICS_ADDR` | Bind address for the metrics listener. It has no auth, so on a multi-homed host (a router) bind it to an internal address. Rejected at config load if it is not an IPv4 literal. |
 | `log_level` | `INFO` | DEBUG/INFO/WARN/ERROR | `LOG_LEVEL` | Lower is more verbose. |
 
 ---

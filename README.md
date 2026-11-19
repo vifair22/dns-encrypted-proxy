@@ -134,7 +134,7 @@ Main config keys:
 - `cache_capacity`
 - `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`
-- `metrics_enabled`, `metrics_port`
+- `metrics_enabled`, `metrics_port`, `metrics_addr` (IPv4 bind address for the metrics listener, default `0.0.0.0`)
 - `log_level` (`DEBUG`, `INFO`, `WARN`, `ERROR`)
 
 Environment override support includes:
@@ -146,7 +146,7 @@ Environment override support includes:
 - `CACHE_CAPACITY`
 - `HOSTS_A`
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
-- `METRICS_ENABLED`, `METRICS_PORT`
+- `METRICS_ENABLED`, `METRICS_PORT`, `METRICS_ADDR`
 - `LOG_LEVEL`
 
 `hosts_a` behavior:
@@ -167,7 +167,7 @@ Prometheus endpoint:
 
 - route: `GET /metrics`
 - health probes: `GET /healthz` and `GET /readyz`
-- bind: `0.0.0.0:<metrics_port>`
+- bind: `<metrics_addr>:<metrics_port>` (default `0.0.0.0:9090`). The listener has no auth; on a multi-homed host bind it to an internal address.
 - format: `text/plain; version=0.0.4`
 
 Includes counters/gauges for query volume, upstream success/failure, cache entries/evictions/expirations/bytes, TCP connection state, response codes, and upstream-dispatch internals (queue depth, member states, queue-wait histogram, requeue/drop/budget-exhausted events).

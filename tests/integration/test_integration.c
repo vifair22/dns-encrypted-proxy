@@ -2698,7 +2698,7 @@ static void test_metrics_endpoint_http_paths(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, port), PROXY_OK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", port), PROXY_OK);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -2754,7 +2754,7 @@ static void test_metrics_endpoint_with_upstream_labels(void **state) {
 
     int port = reserve_unused_port();
     assert_true(port > 0);
-    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, port), PROXY_OK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, &upstream, NULL, "127.0.0.1", port), PROXY_OK);
 
     char body[32768];
     assert_int_equal(http_get_local(port, "/metrics", body, sizeof(body)), 0);
@@ -3425,9 +3425,11 @@ static void test_runtime_api_invalid_arguments(void **state) {
     dns_cache_t cache;
     assert_int_equal(dns_cache_init(&cache, 8), PROXY_OK);
 
-    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, 9090), PROXY_ERR_INVALID_ARG);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 0), PROXY_ERR_INVALID_ARG);
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, 70000), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(NULL, &cache, NULL, NULL, "127.0.0.1", 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, NULL, 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "::1", 9090), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", 0), PROXY_ERR_INVALID_ARG);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", 70000), PROXY_ERR_INVALID_ARG);
 
     int busy_fd = socket(AF_INET, SOCK_STREAM, 0);
     assert_true(busy_fd >= 0);
@@ -3444,7 +3446,7 @@ static void test_runtime_api_invalid_arguments(void **state) {
     assert_int_equal(bind(busy_fd, (struct sockaddr *)&busy_addr, sizeof(busy_addr)), 0);
     assert_int_equal(listen(busy_fd, 1), 0);
 
-    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, busy_port), PROXY_ERR_NETWORK);
+    assert_int_equal(metrics_server_start(&metrics, &cache, NULL, NULL, "127.0.0.1", busy_port), PROXY_ERR_NETWORK);
     close(busy_fd);
 
     metrics_server_stop();

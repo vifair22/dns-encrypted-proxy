@@ -78,12 +78,12 @@ int main(int argc, char **argv) {
     }
 
     if (config.metrics_enabled) {
-        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_port) != PROXY_OK) {
-            LOGF_ERROR("Failed to start metrics server on port %d: %s", config.metrics_port, proxy_error_message());
+        if (metrics_server_start(&server.metrics, &server.cache, &server.upstream, &server.upstream_facilitator, config.metrics_addr, config.metrics_port) != PROXY_OK) {
+            LOGF_ERROR("Failed to start metrics server on %s:%d: %s", config.metrics_addr, config.metrics_port, proxy_error_message());
             proxy_server_destroy(&server);
             return 1;
         }
-        LOGF_INFO("Metrics endpoint listening on 0.0.0.0:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_port);
+        LOGF_INFO("Metrics endpoint listening on %s:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_addr, config.metrics_port);
     }
 
     proxy_status_t rc = proxy_server_run(&server);
