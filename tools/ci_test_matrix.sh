@@ -1,51 +1,37 @@
-#!/bin/sh
-set -eu
-
-if [ "${BASH_VERSION-}" ]; then
-  set -o pipefail
-fi
+#!/bin/bash
+# Build and test every transport combination (DoH x DoT x DoQ, minus all-off).
+#
+# Each combination gets its own object and bin dir under $BUILD_ROOT so a
+# rerun never links or runs a binary built for a different transport set.
+set -euo pipefail
 
 if [ -z "${C_LOG_PATH:-}" ]; then
-  if [ -d /tmp/c-log ]; then
-    C_LOG_PATH=/tmp/c-log
-  elif [ -d /opt/c-log ]; then
-    C_LOG_PATH=/opt/c-log
-  else
-    echo "C_LOG_PATH is not set and no default c-log path exists" >&2
-    exit 1
-  fi
+  for candidate in /tmp/c-log /opt/c-log ../c-log; do
+    if [ -f "$candidate/log.h" ]; then
+      C_LOG_PATH=$candidate
+      break
+    fi
+  done
+fi
+if [ -z "${C_LOG_PATH:-}" ]; then
+  echo "C_LOG_PATH is not set and no default c-log checkout exists" >&2
+  exit 1
 fi
 
 BUILD_ROOT="${BUILD_ROOT:-build/matrix}"
-BUILD_TESTS="${BUILD_TESTS:-ON}"
-BUILD_BENCHMARKS="${BUILD_BENCHMARKS:-OFF}"
+BUILD="${BUILD:-debug}"
+JOBS="${JOBS:-$(nproc)}"
 
-mkdir -p "$BUILD_ROOT"
-
-for doh in OFF ON; do
-  for dot in OFF ON; do
-    for doq in OFF ON; do
-      if [ "$doh" = "OFF" ] && [ "$dot" = "OFF" ] && [ "$doq" = "OFF" ]; then
-        continue
-      fi
-
+for doh in 0 1; do
+  for dot in 0 1; do
+    for doq in 0 1; do
+      [ "$doh$dot$doq" = "000" ] && continue
       combo="doh-${doh}_dot-${dot}_doq-${doq}"
       bdir="$BUILD_ROOT/$combo"
-
-      echo "==> Configure $combo"
-      cmake -S . -B "$bdir" \
-        -DC_LOG_PATH="$C_LOG_PATH" \
-        -DBUILD_TESTS="$BUILD_TESTS" \
-        -DBUILD_BENCHMARKS="$BUILD_BENCHMARKS" \
-        -DENABLE_UPSTREAM_DOH="$doh" \
-        -DENABLE_UPSTREAM_DOT="$dot" \
-        -DENABLE_UPSTREAM_DOQ="$doq"
-
-      echo "==> Build $combo"
-      cmake --build "$bdir" -j
-
-      echo "==> Test $combo"
-      ctest --test-dir "$bdir" --output-on-failure --timeout 30
+      echo "==> $combo"
+      make --no-print-directory -j"$JOBS" test \
+        BUILD="$BUILD" DOH="$doh" DOT="$dot" DOQ="$doq" \
+        C_LOG_PATH="$C_LOG_PATH" OBJ_DIR="$bdir" BIN_DIR="$bdir/bin"
     done
   done
 done

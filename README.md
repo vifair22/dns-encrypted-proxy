@@ -57,23 +57,29 @@ Notes on DoH HTTP version selection:
 Build (release):
 
 ```bash
-cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/release
+make -j proxy C_LOG_PATH=../c-log
 ```
+
+The build is a plain Makefile. It needs a checkout of
+[c-log](https://git.airies.net/vifair22/c-log) (`C_LOG_PATH`, default
+`../c-log`) plus libcurl and OpenSSL development headers found through
+`pkg-config`. `make help` lists variants and targets.
+
+CI and both Docker images build against the c-log commit pinned in
+`tools/c-log.ref`; `tools/fetch_c_log.sh DEST` fetches exactly that commit
+(`C_LOG_REF=<sha>` overrides it to try a c-log change). Bump the pin
+deliberately, in its own commit.
 
 Build artifacts land under `build/`:
 
-- `build/release/`, `build/debug/`, `build/asan/`, `build/coverage/` — per-variant CMake trees (intermediates, `Makefile`, `CMakeFiles/`)
-- `build/bin/` — ready-to-run binaries (`dns-encrypted-proxy`, all `test_*`, benchmark tools). Shared across variants; last build wins.
-- `build/matrix/<combo>/` — protocol feature-matrix builds produced by `tools/ci_test_matrix.sh`
+- `build/release/`, `build/debug/`, `build/asan/`, `build/coverage/`, `build/analyze/`: per-variant objects (`BUILD=<variant>`, default `release`)
+- `build/bin/`: ready-to-run binaries (`dns-encrypted-proxy`, all `test_*`, benchmark tools). Shared across variants; last build wins.
+- `build/matrix/<combo>/`: protocol feature-matrix builds produced by `tools/ci_test_matrix.sh`, each with its own `bin/`
 
-Optional upstream provider build flags (DoH/DoT ON by default, DoQ OFF by default):
+Optional upstream transports (DoH/DoT on by default, DoQ off by default):
 
 ```bash
-cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_UPSTREAM_DOH=ON \
-  -DENABLE_UPSTREAM_DOT=ON \
-  -DENABLE_UPSTREAM_DOQ=ON
+make -j proxy DOH=1 DOT=1 DOQ=1
 ```
 
 Tip: verify HTTP/3 availability in your runtime image/host with:
@@ -86,7 +92,7 @@ Look for `HTTP3` in the `Features` list.
 
 DoQ uses ngtcp2 and requires ngtcp2 + OpenSSL-family crypto modules when enabled.
 
-Current DoQ status: experimental and disabled by default; implementation exists behind `-DENABLE_UPSTREAM_DOQ=ON`, but interoperability is still provider/environment dependent.
+Current DoQ status: experimental and disabled by default; implementation exists behind `DOQ=1`, but interoperability is still provider/environment dependent.
 
 Run:
 
@@ -109,6 +115,17 @@ Version and help:
 
 The version string embeds the semver from `release_version`, the configure-time UTC timestamp, and the build variant (`release`, `debug`, `asan`, `coverage`, …). It also prints on the first INFO line at startup so crash logs self-identify.
 
+Signals and service management:
+
+- `SIGTERM` / `SIGINT`: clean shutdown.
+- `SIGHUP`: drop and redial every pooled upstream connection without
+  restarting, for a route change such as WAN failover
+  (`ExecReload=/bin/kill -HUP $MAINPID` in a unit).
+- systemd `Type=notify` is supported natively (no libsystemd): `READY=1` once
+  the listeners are bound, `STOPPING=1` on shutdown.
+
+Details in `Manual.md` sections 6.3 and 6.4.
+
 ## Configuration
 
 By default the proxy reads `dns-encrypted-proxy.conf` if present. You can also pass an explicit config path:
@@ -128,7 +145,7 @@ Main config keys:
 - `cache_capacity`
 - `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`
-- `metrics_enabled`, `metrics_port`
+- `metrics_enabled`, `metrics_port`, `metrics_addr` (IPv4 bind address for the metrics listener, default `0.0.0.0`)
 - `log_level` (`DEBUG`, `INFO`, `WARN`, `ERROR`)
 
 Environment override support includes:
@@ -140,7 +157,7 @@ Environment override support includes:
 - `CACHE_CAPACITY`
 - `HOSTS_A`
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
-- `METRICS_ENABLED`, `METRICS_PORT`
+- `METRICS_ENABLED`, `METRICS_PORT`, `METRICS_ADDR`
 - `LOG_LEVEL`
 
 `hosts_a` behavior:
@@ -161,7 +178,7 @@ Prometheus endpoint:
 
 - route: `GET /metrics`
 - health probes: `GET /healthz` and `GET /readyz`
-- bind: `0.0.0.0:<metrics_port>`
+- bind: `<metrics_addr>:<metrics_port>` (default `0.0.0.0:9090`). The listener has no auth; on a multi-homed host bind it to an internal address.
 - format: `text/plain; version=0.0.4`
 
 Includes counters/gauges for query volume, upstream success/failure, cache entries/evictions/expirations/bytes, TCP connection state, response codes, and upstream-dispatch internals (queue depth, member states, queue-wait histogram, requeue/drop/budget-exhausted events).

@@ -44,6 +44,7 @@ proxy_status_t metrics_server_start(
     dns_cache_t *cache,
     upstream_client_t *upstream,
     upstream_facilitator_t *facilitator,
+    const char *bind_addr,
     int port);
 void metrics_server_stop(void);
 

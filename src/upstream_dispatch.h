@@ -105,6 +105,11 @@ typedef struct upstream_facilitator {
     atomic_uint_fast64_t budget_exhausted_total;
     atomic_uint_fast64_t requeued_total;
     atomic_uint_fast64_t dropped_total;
+    /* Reconnect requests the allocator has carried out. */
+    atomic_uint_fast64_t reconnects_total;
+    /* Last upstream reconnect_generation the allocator acted on; touched
+     * only by the allocator thread after init. */
+    unsigned applied_reconnect_generation;
 
     atomic_uint_fast64_t queue_wait_samples_total;
     atomic_uint_fast64_t queue_wait_ms_total;
@@ -136,6 +141,7 @@ typedef struct {
     uint64_t budget_exhausted_total;
     uint64_t requeued_total;
     uint64_t dropped_total;
+    uint64_t reconnects_total;
     uint64_t queue_wait_samples_total;
     uint64_t queue_wait_ms_total;
     uint64_t queue_wait_ms_max;

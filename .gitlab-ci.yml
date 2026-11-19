@@ -15,8 +15,8 @@ test:
   tags:
     - docker
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3 autoconf automake libtool git
-    - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
+    - apk add --no-cache bash make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig python3 autoconf automake libtool git
+    - bash tools/fetch_c_log.sh /tmp/c-log
     - git clone --depth 1 -b v1.12.0 https://github.com/ngtcp2/ngtcp2 /tmp/ngtcp2
     - cd /tmp/ngtcp2
     - autoreconf -fi
@@ -27,7 +27,7 @@ test:
     - export LD_LIBRARY_PATH=/usr/local/lib
     - cd "$CI_PROJECT_DIR"
   script:
-    - sh tools/ci_test_matrix.sh
+    - bash tools/ci_test_matrix.sh
   artifacts:
     when: on_failure
     paths:
@@ -42,22 +42,13 @@ analyze:
   needs:
     - test
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig clang-extra-tools cppcheck git bash
-    - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
+    - apk add --no-cache make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig clang-extra-tools cppcheck git bash
+    - bash tools/fetch_c_log.sh /tmp/c-log
   script:
-    # cppcheck and stack-usage gate; lint is advisory and surfaces findings
-    # without failing the job (clang-tidy ≥ 18 returns non-zero on any
-    # finding; existing backlog tracked separately).
-    - cmake -S . -B build/analyze
-        -DCMAKE_BUILD_TYPE=Debug
-        -DC_LOG_PATH=/tmp/c-log
-        -DENABLE_ANALYZER=ON
-        -DENABLE_STACK_USAGE_CHECK=ON
-        -DENABLE_UPSTREAM_DOQ=OFF
-    - cmake --build build/analyze -j
-    - cmake --build build/analyze --target cppcheck
-    - cmake --build build/analyze --target stack-usage
-    - cmake --build build/analyze --target lint
+    # -fanalyzer (via -Werror), cppcheck and stack-usage gate; clang-tidy is
+    # advisory and surfaces findings without failing the job (clang-tidy >= 18
+    # returns non-zero on any finding; existing backlog tracked separately).
+    - make -j"$(nproc)" analyze C_LOG_PATH=/tmp/c-log DOQ=0
   allow_failure: false
 
 coverage:
@@ -68,19 +59,12 @@ coverage:
   needs:
     - test
   before_script:
-    - apk add --no-cache cmake make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig gcovr git
-    - git clone --depth 1 https://git.airies.net/vifair22/c-log /tmp/c-log
+    - apk add --no-cache make gcc musl-dev curl-dev openssl-dev cmocka-dev pkgconfig gcovr python3 git bash
+    - bash tools/fetch_c_log.sh /tmp/c-log
   script:
-    # Coverage build runs the full ctest suite under gcov instrumentation,
-    # then gcovr enforces the line-coverage threshold (default 80%, set
-    # via -DCOVERAGE_LINE_THRESHOLD on the configure line).
-    - cmake -S . -B build/coverage
-        -DCMAKE_BUILD_TYPE=Debug
-        -DC_LOG_PATH=/tmp/c-log
-        -DENABLE_COVERAGE=ON
-        -DENABLE_UPSTREAM_DOQ=OFF
-    - cmake --build build/coverage -j
-    - cmake --build build/coverage --target coverage
+    # Runs the full suite under gcov, then gcovr gates on line coverage
+    # (COVERAGE_LINE_THRESHOLD, default 80) before writing the HTML report.
+    - make -j"$(nproc)" coverage C_LOG_PATH=/tmp/c-log DOQ=0
   artifacts:
     when: always
     paths:
@@ -98,7 +82,7 @@ build:
   script:
     - docker info
     - docker login -u gitlab-ci-token -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
-    - docker build --pull --build-arg C_LOG_CACHE_BUST="$CI_PIPELINE_ID" -t "$IMAGE:$TAG" .
+    - docker build --pull -t "$IMAGE:$TAG" .
     - docker run -d --rm --name dns-encrypted-proxy-smoke "$IMAGE:$TAG"
     - sleep 2
     - test -n "$(docker ps --filter name=dns-encrypted-proxy-smoke -q)"
@@ -106,6 +90,76 @@ build:
     - docker push "$IMAGE:$TAG"
   needs:
     - test
+
+# Debian trixie package for bare-metal hosts (the router). Built, tested and
+# packaged on trixie itself so the binary links the libcurl/libssl ABI the
+# host runs, and dpkg-shlibdeps derives Depends from that same link.
+#
+# Distribution is the job artifact itself: the router's CI fetches it from
+# deb_release on a vX.Y.Z tag through the jobs/artifacts API with its own
+# CI_JOB_TOKEN (vifair22/router is on this project's job token allowlist).
+.deb_build:
+  stage: build
+  image: debian:trixie
+  tags:
+    - docker
+  needs:
+    - test
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends build-essential pkgconf libcurl4-openssl-dev libssl-dev libcmocka-dev python3 git ca-certificates dpkg-dev systemd
+    - bash tools/fetch_c_log.sh /tmp/c-log
+  script:
+    - |
+      SEMVER="$(tr -d '[:space:]' < release_version)"
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        if [ "$CI_COMMIT_TAG" != "v$SEMVER" ]; then
+          echo "tag $CI_COMMIT_TAG does not match release_version $SEMVER" >&2
+          exit 1
+        fi
+        DEB_VERSION="$SEMVER"
+      else
+        # '~' sorts below the release itself, so a dev build never shadows it.
+        DEB_VERSION="${SEMVER}~dev${CI_PIPELINE_IID}.g${CI_COMMIT_SHORT_SHA}"
+      fi
+      echo "DEB_VERSION=$DEB_VERSION" > deb.env
+      echo "Debian version: $DEB_VERSION"
+    # The suite runs against the release build, so the binary that ships is
+    # the binary that was tested, on the toolchain it ships for.
+    - make -j"$(nproc)" test BUILD=release DOQ=0 C_LOG_PATH=/tmp/c-log
+    - mkdir -p build/deb-stage
+    - strip -o build/deb-stage/dns-encrypted-proxy build/bin/dns-encrypted-proxy
+    - . ./deb.env && bash tools/build_deb.sh build/deb-stage/dns-encrypted-proxy "$DEB_VERSION" build/deb
+    # Install-verify: package installs, binary runs, unit parses, and the
+    # unit stays disabled (the package must never enable it).
+    - apt-get install -y --no-install-recommends ./build/deb/*.deb
+    - dns-encrypted-proxy --version
+    - systemd-analyze verify /usr/lib/systemd/system/dns-encrypted-proxy.service
+    - test "$(systemctl is-enabled dns-encrypted-proxy.service || true)" = "disabled"
+    - dpkg-query -W -f='${Conffiles}\n' dns-encrypted-proxy | grep -q /etc/dns-encrypted-proxy/dns-encrypted-proxy.conf
+
+# Every non-tag pipeline: a dev build (<semver>~dev<iid>.g<sha>) for review.
+deb:
+  extends: .deb_build
+  artifacts:
+    paths:
+      - build/deb/*.deb
+    expire_in: 1 month
+  rules:
+    - if: '$CI_COMMIT_TAG == null'
+
+# Release tags: the artifact the router consumes. It never expires, so any
+# released version stays fetchable by tag.
+deb_release:
+  extends: .deb_build
+  artifacts:
+    paths:
+      - build/deb/*.deb
+    expire_in: never
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
 
 generate_deploy_child_pipeline:
   stage: deploy

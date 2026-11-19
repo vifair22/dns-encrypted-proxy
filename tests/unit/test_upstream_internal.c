@@ -134,6 +134,19 @@ static int upstream_wrap_clock_gettime(clockid_t clk, struct timespec *ts) {
     return 0;
 }
 
+static int g_doh_reconnect_calls = 0;
+static int g_dot_reconnect_calls = 0;
+
+void upstream_doh_client_request_reconnect(upstream_doh_client_t *client) {
+    (void)client;
+    g_doh_reconnect_calls++;
+}
+
+void upstream_dot_client_request_reconnect(upstream_dot_client_t *client) {
+    (void)client;
+    g_dot_reconnect_calls++;
+}
+
 proxy_status_t upstream_doh_client_init(upstream_doh_client_t **client, const upstream_config_t *config) {
     (void)config;
     if (g_doh_init_rc != 0) {
@@ -880,6 +893,85 @@ static void test_upstream_ready_state(void **state) {
     assert_int_equal(upstream_is_ready(&client), 1);
 }
 
+/*
+ * A reconnect clears what the old path taught us about each server and tells
+ * each transport that exists to recycle. Resolved addresses survive.
+ */
+static void test_apply_reconnect_resets_path_penalties(void **state) {
+    (void)state;
+    /* Two servers of whichever transport this build has, so the reset is
+     * exercised in every cell of the DoH/DoT/DoQ matrix. */
+#if UPSTREAM_DOH_ENABLED
+    const char *urls[] = {"https://dns.example/dns-query", "https://dns2.example/dns-query"};
+#elif UPSTREAM_DOT_ENABLED
+    const char *urls[] = {"tls://dot.example:853", "tls://dot2.example:853"};
+#else
+    const char *urls[] = {"quic://doq.example:853", "quic://doq2.example:853"};
+#endif
+    upstream_config_t config = {.timeout_ms = 50, .pool_size = 1, .max_failures_before_unhealthy = 1, .unhealthy_backoff_ms = 1000};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 2, &config), PROXY_OK);
+
+    g_doh_reconnect_calls = 0;
+    g_dot_reconnect_calls = 0;
+
+    /* No transport created yet: nothing to tell. */
+    upstream_client_apply_reconnect(&client);
+    assert_int_equal(g_doh_reconnect_calls, 0);
+    assert_int_equal(g_dot_reconnect_calls, 0);
+
+    client.doh_client = (upstream_doh_client_t *)(uintptr_t)0x1000;
+    client.dot_client = (upstream_dot_client_t *)(uintptr_t)0x2000;
+    for (int i = 0; i < client.server_count; i++) {
+        upstream_server_t *s = &client.servers[i];
+        s->health.healthy = 0;
+        s->health.consecutive_failures = 7;
+        s->stage.transport_retry_suppress_until_ms = 99999;
+        s->stage.stage2_next_retry_ms = 99999;
+        s->stage.doh_forced_http_tier = 2;
+        s->stage.doh_upgrade_failures = 3;
+        s->stage.doh_h3_consecutive_failures = 4;
+        s->stage.doh_upgrade_retry_after_ms = 99999;
+        s->stage.has_stage1_cached_v4 = 1;
+        s->stage.stage1_cached_addr_v4_be = 0x01020304u;
+        s->stage.has_bootstrap_v4 = 1;
+    }
+
+    unsigned gen0 = upstream_client_reconnect_generation(&client);
+    upstream_client_request_reconnect(&client);
+    assert_int_equal(upstream_client_reconnect_generation(&client), gen0 + 1);
+    upstream_client_request_reconnect(NULL);
+    assert_int_equal(upstream_client_reconnect_generation(NULL), 0);
+
+    upstream_client_apply_reconnect(&client);
+#if UPSTREAM_DOH_ENABLED
+    assert_int_equal(g_doh_reconnect_calls, 1);
+#endif
+#if UPSTREAM_DOT_ENABLED
+    assert_int_equal(g_dot_reconnect_calls, 1);
+#endif
+    for (int i = 0; i < client.server_count; i++) {
+        upstream_server_t *s = &client.servers[i];
+        assert_int_equal(s->health.healthy, 1);
+        assert_int_equal(s->health.consecutive_failures, 0);
+        assert_int_equal(s->stage.transport_retry_suppress_until_ms, 0);
+        assert_int_equal(s->stage.stage2_next_retry_ms, 0);
+        assert_int_equal(s->stage.doh_forced_http_tier, 0);
+        assert_int_equal(s->stage.doh_upgrade_failures, 0);
+        assert_int_equal(s->stage.doh_h3_consecutive_failures, 0);
+        assert_int_equal(s->stage.doh_upgrade_retry_after_ms, 0);
+        assert_int_equal(s->stage.has_stage1_cached_v4, 1);
+        assert_int_equal(s->stage.stage1_cached_addr_v4_be, 0x01020304u);
+        assert_int_equal(s->stage.has_bootstrap_v4, 1);
+    }
+    upstream_client_apply_reconnect(NULL);
+
+    /* The fake transport pointers must not reach the real destructors. */
+    client.doh_client = NULL;
+    client.dot_client = NULL;
+    upstream_client_destroy(&client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_upstream_resolve_last_resort_unhealthy),
@@ -892,6 +984,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
         cmocka_unit_test(test_record_failure_slow_response_not_health_attributed),
         cmocka_unit_test(test_upstream_ready_state),
+        cmocka_unit_test(test_apply_reconnect_resets_path_penalties),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);
