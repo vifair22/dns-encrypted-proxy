@@ -82,7 +82,11 @@ build:
   script:
     - docker info
     - docker login -u gitlab-ci-token -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
-    - docker build --pull -t "$IMAGE:$TAG" .
+    # --provenance=false --sbom=false: a plain single manifest. With
+    # attestations buildx pushes an OCI index, and this registry rejects it
+    # with "blob unknown" after every layer has uploaded (pipelines 3305 and
+    # 5749). vifair-overlay, c-backup and gitlab-infra carry the same flags.
+    - docker build --pull --provenance=false --sbom=false -t "$IMAGE:$TAG" .
     - docker run -d --rm --name dns-encrypted-proxy-smoke "$IMAGE:$TAG"
     - sleep 2
     - test -n "$(docker ps --filter name=dns-encrypted-proxy-smoke -q)"
