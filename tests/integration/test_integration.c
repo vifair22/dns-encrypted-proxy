@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -1802,6 +1803,375 @@ static void test_upstream_stage2_bootstrap_rescues_stalled_stage1(void **state) 
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_BOOTSTRAP_DNS_PORT");
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
     unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+
+/*
+ * Minimal HTTP/2 DoH upstream that answers the first request on each
+ * connection and then goes silent on it: later requests are read and never
+ * answered, while the TCP connection stays open. To libcurl that looks the
+ * same as a connection whose NAT mapping vanished mid-stream (a router
+ * reboot flushing conntrack), which is the case where h2 keeps multiplexing
+ * new requests onto a socket nothing will ever answer. HTTP/1.1 cannot show
+ * the bug: libcurl closes an h1 connection when a transfer on it aborts.
+ *
+ * It speaks just enough of RFC 9113 for libcurl: its own SETTINGS, ACKs,
+ * PING replies, and a response made of one HEADERS frame (":status: 200",
+ * HPACK static index 8) plus one DATA frame. Request headers are never
+ * decoded; a request is complete when its stream carries END_STREAM.
+ */
+#define H2_MOCK_MAX_CONNS 16
+#define H2_FRAME_DATA 0x0u
+#define H2_FRAME_HEADERS 0x1u
+#define H2_FRAME_SETTINGS 0x4u
+#define H2_FRAME_PING 0x6u
+#define H2_FRAME_GOAWAY 0x7u
+#define H2_FLAG_END_STREAM 0x1u
+#define H2_FLAG_ACK 0x1u
+#define H2_FLAG_END_HEADERS 0x4u
+
+typedef struct {
+    SSL_CTX *ctx;
+    int listen_fd;
+    int port;
+    pthread_t accept_thread;
+    pthread_t conn_threads[H2_MOCK_MAX_CONNS];
+    int conn_fds[H2_MOCK_MAX_CONNS];
+    int conn_count;
+    pthread_mutex_t mutex;
+    volatile sig_atomic_t stop;
+    unsigned connections;
+    unsigned answered;
+    unsigned swallowed;
+} h2_silencing_server_t;
+
+typedef struct {
+    h2_silencing_server_t *server;
+    int fd;
+} h2_conn_arg_t;
+
+static int h2_mock_alpn_select(
+    SSL *ssl,
+    const unsigned char **out,
+    unsigned char *outlen,
+    const unsigned char *in,
+    unsigned int inlen,
+    void *arg) {
+    (void)ssl;
+    (void)arg;
+    unsigned int i = 0;
+    while (i < inlen) {
+        unsigned int len = in[i];
+        if (i + 1 + len > inlen) {
+            break;
+        }
+        if (len == 2 && in[i + 1] == 'h' && in[i + 2] == '2') {
+            *out = &in[i + 1];
+            *outlen = 2;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += 1 + len;
+    }
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+static int h2_write_frame(SSL *ssl, uint8_t type, uint8_t flags, uint32_t stream, const uint8_t *payload, size_t len) {
+    uint8_t hdr[9];
+    hdr[0] = (uint8_t)((len >> 16) & 0xFFu);
+    hdr[1] = (uint8_t)((len >> 8) & 0xFFu);
+    hdr[2] = (uint8_t)(len & 0xFFu);
+    hdr[3] = type;
+    hdr[4] = flags;
+    hdr[5] = (uint8_t)((stream >> 24) & 0x7Fu);
+    hdr[6] = (uint8_t)((stream >> 16) & 0xFFu);
+    hdr[7] = (uint8_t)((stream >> 8) & 0xFFu);
+    hdr[8] = (uint8_t)(stream & 0xFFu);
+    if (ssl_write_all(ssl, hdr, sizeof(hdr)) != 0) {
+        return -1;
+    }
+    if (len > 0 && ssl_write_all(ssl, payload, len) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Wait until a frame can be read or the server is stopping. */
+static int h2_wait_readable(SSL *ssl, int fd, const h2_silencing_server_t *server) {
+    while (!server->stop) {
+        if (SSL_pending(ssl) > 0) {
+            return 0;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN};
+        int rc = poll(&pfd, 1, 100);
+        if (rc > 0) {
+            return 0;
+        }
+        if (rc < 0) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static void *h2_silencing_conn_main(void *arg) {
+    h2_conn_arg_t *conn = (h2_conn_arg_t *)arg;
+    h2_silencing_server_t *server = conn->server;
+    int fd = conn->fd;
+    free(conn);
+
+    /* The fd stays open until stop: closing it here would let the stopper's
+     * shutdown() land on a reused descriptor. SSL_set_fd does not take
+     * ownership, so SSL_free leaves it alone. */
+    SSL *ssl = SSL_new(server->ctx);
+    if (ssl == NULL) {
+        return NULL;
+    }
+    SSL_set_fd(ssl, fd);
+    if (SSL_accept(ssl) != 1) {
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    static const char PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    uint8_t preface[sizeof(PREFACE) - 1];
+    if (ssl_read_all(ssl, preface, sizeof(preface)) != 0 ||
+        memcmp(preface, PREFACE, sizeof(preface)) != 0 ||
+        h2_write_frame(ssl, H2_FRAME_SETTINGS, 0, 0, NULL, 0) != 0) {
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    int answered_here = 0;
+    uint8_t payload[16384];
+    for (;;) {
+        uint8_t hdr[9];
+        if (h2_wait_readable(ssl, fd, server) != 0 || ssl_read_all(ssl, hdr, sizeof(hdr)) != 0) {
+            break;
+        }
+        size_t len = ((size_t)hdr[0] << 16) | ((size_t)hdr[1] << 8) | (size_t)hdr[2];
+        uint8_t type = hdr[3];
+        uint8_t flags = hdr[4];
+        uint32_t stream = ((uint32_t)(hdr[5] & 0x7Fu) << 24) | ((uint32_t)hdr[6] << 16) |
+                          ((uint32_t)hdr[7] << 8) | (uint32_t)hdr[8];
+        if (len > sizeof(payload) || (len > 0 && ssl_read_all(ssl, payload, len) != 0)) {
+            break;
+        }
+
+        if (type == H2_FRAME_SETTINGS && (flags & H2_FLAG_ACK) == 0) {
+            if (h2_write_frame(ssl, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, NULL, 0) != 0) {
+                break;
+            }
+        } else if (type == H2_FRAME_PING && (flags & H2_FLAG_ACK) == 0) {
+            if (h2_write_frame(ssl, H2_FRAME_PING, H2_FLAG_ACK, 0, payload, len) != 0) {
+                break;
+            }
+        } else if (type == H2_FRAME_GOAWAY) {
+            break;
+        } else if ((type == H2_FRAME_HEADERS || type == H2_FRAME_DATA) && (flags & H2_FLAG_END_STREAM) != 0) {
+            if (answered_here) {
+                pthread_mutex_lock(&server->mutex);
+                server->swallowed++;
+                pthread_mutex_unlock(&server->mutex);
+                continue;
+            }
+            static const uint8_t STATUS_200[] = {0x88};
+            if (h2_write_frame(ssl, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, stream, STATUS_200, sizeof(STATUS_200)) != 0 ||
+                h2_write_frame(ssl, H2_FRAME_DATA, H2_FLAG_END_STREAM, stream,
+                               DNS_RESPONSE_WWW_EXAMPLE_COM_A, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN) != 0) {
+                break;
+            }
+            answered_here = 1;
+            pthread_mutex_lock(&server->mutex);
+            server->answered++;
+            pthread_mutex_unlock(&server->mutex);
+        }
+    }
+
+    SSL_free(ssl);
+    return NULL;
+}
+
+static void *h2_silencing_accept_main(void *arg) {
+    h2_silencing_server_t *server = (h2_silencing_server_t *)arg;
+    while (!server->stop) {
+        struct pollfd pfd = {.fd = server->listen_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 100) <= 0) {
+            continue;
+        }
+        int fd = accept(server->listen_fd, NULL, NULL);
+        if (fd < 0) {
+            continue;
+        }
+        h2_conn_arg_t *conn = malloc(sizeof(*conn));
+        pthread_mutex_lock(&server->mutex);
+        int slot = server->conn_count;
+        if (conn == NULL || slot >= H2_MOCK_MAX_CONNS) {
+            pthread_mutex_unlock(&server->mutex);
+            free(conn);
+            close(fd);
+            continue;
+        }
+        conn->server = server;
+        conn->fd = fd;
+        server->conn_fds[slot] = fd;
+        if (pthread_create(&server->conn_threads[slot], NULL, h2_silencing_conn_main, conn) != 0) {
+            pthread_mutex_unlock(&server->mutex);
+            free(conn);
+            close(fd);
+            continue;
+        }
+        server->conn_count++;
+        server->connections++;
+        pthread_mutex_unlock(&server->mutex);
+    }
+    return NULL;
+}
+
+static int h2_silencing_server_start(h2_silencing_server_t *server, const char *cert_path, const char *key_path) {
+    memset(server, 0, sizeof(*server));
+    server->listen_fd = -1;
+
+    server->ctx = SSL_CTX_new(TLS_server_method());
+    if (server->ctx == NULL ||
+        SSL_CTX_use_certificate_file(server->ctx, cert_path, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_use_PrivateKey_file(server->ctx, key_path, SSL_FILETYPE_PEM) != 1) {
+        goto fail;
+    }
+    SSL_CTX_set_alpn_select_cb(server->ctx, h2_mock_alpn_select, NULL);
+
+    server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd < 0) {
+        goto fail;
+    }
+    int opt = 1;
+    setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t addr_len = sizeof(addr);
+    if (bind(server->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(server->listen_fd, 8) != 0 ||
+        getsockname(server->listen_fd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        goto fail;
+    }
+    server->port = ntohs(addr.sin_port);
+
+    if (pthread_mutex_init(&server->mutex, NULL) != 0) {
+        goto fail;
+    }
+    if (pthread_create(&server->accept_thread, NULL, h2_silencing_accept_main, server) != 0) {
+        pthread_mutex_destroy(&server->mutex);
+        goto fail;
+    }
+    return 0;
+
+fail:
+    if (server->listen_fd >= 0) {
+        close(server->listen_fd);
+    }
+    if (server->ctx != NULL) {
+        SSL_CTX_free(server->ctx);
+    }
+    return -1;
+}
+
+static void h2_silencing_server_stop(h2_silencing_server_t *server) {
+    server->stop = 1;
+    pthread_join(server->accept_thread, NULL);
+    for (int i = 0; i < server->conn_count; i++) {
+        shutdown(server->conn_fds[i], SHUT_RDWR);
+        pthread_join(server->conn_threads[i], NULL);
+        close(server->conn_fds[i]);
+    }
+    close(server->listen_fd);
+    SSL_CTX_free(server->ctx);
+    pthread_mutex_destroy(&server->mutex);
+}
+
+/*
+ * Test: an h2 connection that stops answering must not take every later
+ * query down with it. Production hit this when a router reboot flushed the
+ * NAT table: all pooled connections went silent, libcurl kept multiplexing
+ * every request (bootstrap-IP attempts included) onto them, and the proxy
+ * SERVFAILed until a SIGHUP, while the kernel would have needed a quarter of
+ * an hour of retransmits to notice. One pool slot keeps reuse deterministic:
+ * each query lands on a connection that has already answered once and gone
+ * quiet, so each one has to be rescued inside its own budget.
+ */
+static void test_upstream_doh_h2_recovers_from_silent_connection(void **state) {
+    (void)state;
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+
+    h2_silencing_server_t server;
+    assert_int_equal(h2_silencing_server_start(&server, cert_path, key_path), 0);
+
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    char url[256];
+    snprintf(url, sizeof(url), "https://localhost:%d/dns-query", server.port);
+    const char *urls[] = {url};
+
+    upstream_client_t client;
+    upstream_config_t cfg = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 3,
+        .unhealthy_backoff_ms = 1000,
+    };
+    assert_int_equal(upstream_client_init(&client, urls, 1, &cfg), PROXY_OK);
+
+    const int queries = 4;
+    for (int q = 0; q < queries; q++) {
+        struct timespec t_start;
+        struct timespec t_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+        uint8_t *response = NULL;
+        size_t response_len = 0;
+        int rc = upstream_resolve(
+            &client,
+            DNS_QUERY_WWW_EXAMPLE_COM_A,
+            DNS_QUERY_WWW_EXAMPLE_COM_A_LEN,
+            &response,
+            &response_len);
+
+        clock_gettime(CLOCK_MONOTONIC, &t_end);
+        long elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000L +
+                          (t_end.tv_nsec - t_start.tv_nsec) / 1000000L;
+
+        assert_int_equal(rc, 0);
+        assert_int_equal(response_len, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN);
+        assert_memory_equal(response, DNS_RESPONSE_WWW_EXAMPLE_COM_A, response_len);
+        assert_true(elapsed_ms < cfg.timeout_ms);
+        free(response);
+    }
+
+    upstream_runtime_stats_t stats;
+    assert_int_equal(upstream_get_runtime_stats(&client, &stats), 0);
+    assert_int_equal((int)stats.doh_http2_responses_total, queries);
+    /* The first query opens the connection; every later one finds it silent
+     * and has to be moved to a fresh one. */
+    assert_int_equal((int)stats.doh_connection_recycles_total, queries - 1);
+    assert_int_equal(client.servers[0].health.healthy, 1);
+
+    upstream_client_destroy(&client);
+
+    pthread_mutex_lock(&server.mutex);
+    unsigned answered = server.answered;
+    unsigned swallowed = server.swallowed;
+    unsigned connections = server.connections;
+    pthread_mutex_unlock(&server.mutex);
+    assert_int_equal((int)answered, queries);
+    assert_int_equal((int)swallowed, queries - 1);
+    assert_int_equal((int)connections, queries);
+
+    h2_silencing_server_stop(&server);
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
     unsetenv("CURL_CA_BUNDLE");
 }
 
@@ -4108,6 +4478,7 @@ int main(void) {
         cmocka_unit_test(test_upstream_transport_doh_unreachable),
         cmocka_unit_test(test_upstream_transport_doh_slow_response_within_budget),
         cmocka_unit_test(test_upstream_stage2_bootstrap_rescues_stalled_stage1),
+        cmocka_unit_test(test_upstream_doh_h2_recovers_from_silent_connection),
         cmocka_unit_test(test_dns_server_udp_queries_run_concurrently),
         cmocka_unit_test(test_upstream_transport_doh_http1_runtime_stats),
 #endif

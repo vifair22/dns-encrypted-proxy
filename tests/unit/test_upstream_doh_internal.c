@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 #include "upstream.h"
 #include "dns_message.h"
@@ -1385,6 +1387,111 @@ static void test_doh_reconnect_recycles_pool_handles(void **state) {
     upstream_doh_client_destroy(client);
 }
 
+/*
+ * A request that went out and was never answered may have gone down a dead
+ * connection, so the slot's handle (and with it every connection it pooled)
+ * is replaced before the retry, and again if the retry is swallowed too.
+ */
+static void test_doh_unanswered_request_redials_slot(void **state) {
+    (void)state;
+    reset_stubs();
+
+    upstream_config_t config = {
+        .timeout_ms = 2500,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_doh_client_t *client = NULL;
+    assert_int_equal(upstream_doh_client_init(&client, &config), PROXY_OK);
+    CURL *original = client->pool_handles[0];
+
+    upstream_server_t server = make_resolve_server();
+    uint8_t query[2] = {0x12, 0x34};
+    const uint8_t body[] = {0x12, 0x34, 0x81, 0x80};
+    g_emit_body = 1;
+    g_body_ptr = body;
+    g_body_len = sizeof(body);
+    g_curl_primary_ip = "203.0.113.10";
+
+    /* Swallowed, then answered on the fresh connection. */
+    g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[1] = CURLE_OK;
+    g_curl_perform_seq_len = 2;
+    uint8_t *resp = NULL;
+    size_t resp_len = 0;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_int_equal((int)upstream_doh_client_connection_recycles_total(client), 1);
+    CURL *after_first = client->pool_handles[0];
+    assert_ptr_not_equal(after_first, original);
+
+    /* An answer on the first try leaves the connection alone. */
+    g_curl_perform_seq_len = 0;
+    g_curl_perform_seq_idx = 0;
+    g_curl_perform_rc = CURLE_OK;
+    resp = NULL;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_int_equal((int)upstream_doh_client_connection_recycles_total(client), 1);
+    assert_ptr_equal(client->pool_handles[0], after_first);
+
+    /* Both swallowed: the retry's connection is dropped as well, so the next
+     * query does not inherit it. */
+    g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[1] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_seq_len = 2;
+    g_curl_perform_seq_idx = 0;
+    resp = NULL;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), -1);
+    assert_int_equal((int)upstream_doh_client_connection_recycles_total(client), 3);
+    assert_int_equal(server.stage.last_failure_slow_response, 1);
+
+    /* Out of memory for a fresh handle: carry on with the old one. */
+    CURL *before_oom = client->pool_handles[0];
+    g_curl_easy_init_fail_at = g_curl_easy_init_calls + 1;
+    g_curl_perform_rc_seq[0] = CURLE_OPERATION_TIMEDOUT;
+    g_curl_perform_rc_seq[1] = CURLE_OK;
+    g_curl_perform_seq_len = 2;
+    g_curl_perform_seq_idx = 0;
+    resp = NULL;
+    assert_int_equal(upstream_doh_resolve(client, &server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
+    free(resp);
+    assert_ptr_equal(client->pool_handles[0], before_oom);
+    assert_int_equal((int)upstream_doh_client_connection_recycles_total(client), 3);
+
+    assert_int_equal((int)upstream_doh_client_connection_recycles_total(NULL), 0);
+    upstream_doh_client_destroy(client);
+}
+
+static void test_doh_sockopt_bounds_unacked_data(void **state) {
+    (void)state;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert_true(fd >= 0);
+
+    unsigned int value = 0;
+    socklen_t len = sizeof(value);
+
+    /* Only outgoing connections are touched. */
+    assert_int_equal(doh_sockopt_callback(NULL, fd, CURLSOCKTYPE_ACCEPT), CURL_SOCKOPT_OK);
+    assert_int_equal(getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &len), 0);
+    assert_int_equal(value, 0);
+
+    assert_int_equal(doh_sockopt_callback(NULL, fd, CURLSOCKTYPE_IPCXN), CURL_SOCKOPT_OK);
+    len = sizeof(value);
+    assert_int_equal(getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &len), 0);
+    assert_int_equal(value, DOH_TCP_USER_TIMEOUT_MS);
+
+    close(fd);
+
+    /* A UDP (h3) socket rejects the option; the callback must not fail the
+     * connection over it. */
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert_true(fd >= 0);
+    assert_int_equal(doh_sockopt_callback(NULL, fd, CURLSOCKTYPE_IPCXN), CURL_SOCKOPT_OK);
+    close(fd);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_write_callback_growth),
@@ -1412,6 +1519,8 @@ int main(void) {
         cmocka_unit_test(test_doh_transport_failure_is_health_attributable),
         cmocka_unit_test(test_doh_h3_to_h1_pin_gated_below_threshold),
         cmocka_unit_test(test_doh_reconnect_recycles_pool_handles),
+        cmocka_unit_test(test_doh_unanswered_request_redials_slot),
+        cmocka_unit_test(test_doh_sockopt_bounds_unacked_data),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

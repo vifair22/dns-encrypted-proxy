@@ -9,6 +9,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +40,24 @@
  * share gives the attempt most likely to answer the bulk of the budget. */
 #define DOH_FALLBACK_RESERVE_MS 300
 #define DOH_TRANSPORT_SUPPRESS_MS 5000ULL
+/* How long the kernel may leave sent data unacknowledged before it fails the
+ * connection. Without it a connection whose NAT mapping vanished (router
+ * reboot, modem or CGNAT reset) is only abandoned after tcp_retries2, a
+ * quarter of an hour, because nothing ever sends back a RST. Ten seconds is
+ * far beyond any real upstream RTT and well inside the time an operator
+ * would notice an outage. */
+#define DOH_TCP_USER_TIMEOUT_MS 10000u
+/* Keepalive on idle pooled connections, so a dead one is found and dropped
+ * before a query is sent down it. TCP_USER_TIMEOUT also bounds the probes:
+ * an idle blackholed connection fails about 40 s after its last traffic. */
+#define DOH_TCP_KEEPIDLE_S 30L
+#define DOH_TCP_KEEPINTVL_S 10L
+/* _POSIX_C_SOURCE hides TCP_USER_TIMEOUT in both glibc and musl headers. An
+ * #ifdef would compile the option out without a word, so name the Linux
+ * value directly. */
+#if defined(__linux__) && !defined(TCP_USER_TIMEOUT)
+#define TCP_USER_TIMEOUT 18
+#endif
 #define DOH_UPGRADE_BACKOFF_BASE_MS (10ULL * 60ULL * 1000ULL)
 #define DOH_UPGRADE_BACKOFF_MAX_MS (6ULL * 60ULL * 60ULL * 1000ULL)
 /* Number of consecutive h3 attempt failures required before a pin out of h3
@@ -279,6 +299,7 @@ struct upstream_doh_client {
      * shrinks every other attempt's slice. */
     int http3_supported;
     atomic_uint_fast64_t pool_wait_timeouts_total;
+    atomic_uint_fast64_t connection_recycles_total;
     atomic_uint_fast64_t http3_responses_total;
     atomic_uint_fast64_t http2_responses_total;
     atomic_uint_fast64_t http1_responses_total;
@@ -491,26 +512,56 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
  * the pool lock. If a fresh handle cannot be made the old one is used and
  * left stale so the next checkout tries again.
  */
+/*
+ * Swap the handle in a slot the caller holds for a fresh one. A curl easy
+ * handle owns its connection cache, so closing the handle is what closes its
+ * connections; the easy interface has no way to evict a single one. Returns
+ * 0 on success, or -1 with the old handle left in place.
+ */
+static int pool_replace_handle(upstream_doh_client_t *client, int slot, unsigned generation) {
+    CURL *fresh = curl_easy_init();
+    if (fresh == NULL) {
+        return -1;
+    }
+    curl_easy_cleanup(client->pool_handles[slot]);
+    client->pool_handles[slot] = fresh;
+    client->pool_generation[slot] = generation;
+    return 0;
+}
+
 static int pool_take_slot_locked(upstream_doh_client_t *client, int i, CURL **handle_out, int *slot_out) {
     client->pool_in_use[i] = 1;
     unsigned want = __atomic_load_n(&client->generation, __ATOMIC_ACQUIRE);
     int stale = client->pool_generation[i] != want;
     pthread_mutex_unlock(&client->pool_mutex);
 
-    if (stale) {
-        CURL *fresh = curl_easy_init();
-        if (fresh != NULL) {
-            curl_easy_cleanup(client->pool_handles[i]);
-            client->pool_handles[i] = fresh;
-            client->pool_generation[i] = want;
-        } else {
-            LOGF_WARN("DoH reconnect: curl_easy_init failed for pool slot %d; reusing old handle", i);
-        }
+    if (stale && pool_replace_handle(client, i, want) != 0) {
+        LOGF_WARN("DoH reconnect: curl_easy_init failed for pool slot %d; reusing old handle", i);
     }
 
     *handle_out = client->pool_handles[i];
     *slot_out = i;
     return 0;
+}
+
+/*
+ * Drop the connections of a held slot after a request on them went out and
+ * no answer came back. Over HTTP/2 libcurl keeps a connection when one of its
+ * streams times out and multiplexes the next request onto it, so a
+ * connection that died silently (NAT state flushed, no RST ever coming back)
+ * swallows every later query on this handle, bootstrap-IP attempts included,
+ * until the kernel gives up. A genuinely slow upstream loses only one
+ * handshake to this. The handle may also hold healthy connections to the
+ * other upstreams; they are redialled on their next use.
+ */
+static CURL *doh_recycle_slot(upstream_doh_client_t *client, int slot, const upstream_server_t *server) {
+    if (pool_replace_handle(client, slot, client->pool_generation[slot]) != 0) {
+        LOGF_WARN("DoH could not redial after an unanswered request: host=%s (out of memory)", server->host);
+        return client->pool_handles[slot];
+    }
+    atomic_fetch_add(&client->connection_recycles_total, 1);
+    LOGF_INFO("DoH connection redialled after an unanswered request: host=%s", server->host);
+    return client->pool_handles[slot];
 }
 
 void upstream_doh_client_request_reconnect(upstream_doh_client_t *client) {
@@ -582,6 +633,21 @@ static void pool_release(upstream_doh_client_t *client, int slot) {
     pthread_mutex_unlock(&client->pool_mutex);
 }
 
+static int doh_sockopt_callback(void *clientp, curl_socket_t fd, curlsocktype purpose) {
+    (void)clientp;
+    if (purpose != CURLSOCKTYPE_IPCXN) {
+        return CURL_SOCKOPT_OK;
+    }
+#ifdef TCP_USER_TIMEOUT
+    /* h3 sockets are UDP and reject the option; nothing to do for them. */
+    unsigned int user_timeout_ms = DOH_TCP_USER_TIMEOUT_MS;
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms));
+#else
+    (void)fd;
+#endif
+    return CURL_SOCKOPT_OK;
+}
+
 static int doh_post_with_handle(
     upstream_doh_client_t *client,
     CURL *curl,
@@ -622,6 +688,9 @@ static int doh_post_with_handle(
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, DOH_TCP_KEEPIDLE_S);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, DOH_TCP_KEEPINTVL_S);
+    curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, doh_sockopt_callback);
     /* Test hooks are opt-in and only alter transport selection/verification. */
     if (doh_force_http1()) {
         curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
@@ -1037,7 +1106,10 @@ int upstream_doh_resolve(
                  * slower than this attempt's slice. Laddering down tiers or
                  * switching routes re-asks the same slow question with even
                  * less time, so stop the ladder and give the remaining
-                 * budget to one retry on the same tier below. */
+                 * budget to one retry on the same tier below. The retry
+                 * goes out on a fresh connection: the silence may as well
+                 * be a dead connection as a slow upstream. */
+                curl = doh_recycle_slot(client, slot, server);
                 slow_response = 1;
                 slow_tier = tier;
                 slow_use_override_v4 = use_override_v4;
@@ -1086,7 +1158,9 @@ int upstream_doh_resolve(
                 }
                 final_failure_class = attempt_class;
                 server->stage.last_failure_class = (int)final_failure_class;
-                if (!(attempt_err.curl_rc == CURLE_OPERATION_TIMEDOUT && attempt_err.request_sent)) {
+                if (attempt_err.curl_rc == CURLE_OPERATION_TIMEDOUT && attempt_err.request_sent) {
+                    (void)doh_recycle_slot(client, slot, server);
+                } else {
                     server->stage.last_failure_slow_response = 0;
                 }
             }
@@ -1252,4 +1326,11 @@ int upstream_doh_client_get_pool_stats(
     }
 
     return 0;
+}
+
+uint64_t upstream_doh_client_connection_recycles_total(upstream_doh_client_t *client) {
+    if (client == NULL) {
+        return 0;
+    }
+    return (uint64_t)atomic_load(&client->connection_recycles_total);
 }
