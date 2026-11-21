@@ -203,6 +203,10 @@ typedef struct {
     /* Attempts abandoned because no pool handle came free inside the query's
      * own deadline: local congestion, not an upstream fault. */
     uint64_t doh_pool_wait_timeouts_total;
+    /* Pool handles replaced after a request on their connection went
+     * unanswered, so the next query dials fresh instead of queueing on a
+     * connection that may be dead. */
+    uint64_t doh_connection_recycles_total;
     uint64_t doh_downgrade_h3_to_h2_total;
     uint64_t doh_downgrade_h3_to_h1_total;
     uint64_t doh_downgrade_h2_to_h1_total;

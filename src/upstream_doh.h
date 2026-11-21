@@ -31,5 +31,8 @@ int upstream_doh_client_get_pool_stats(
     uint64_t *http1_total_out,
     uint64_t *http_other_total_out,
     uint64_t *pool_wait_timeouts_out);
+/* Pool handles replaced because a request on their connection went
+ * unanswered; see doh_recycle_slot. */
+uint64_t upstream_doh_client_connection_recycles_total(upstream_doh_client_t *client);
 
 #endif /* UPSTREAM_DOH_H */

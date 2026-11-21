@@ -777,6 +777,9 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             "# HELP dns_encrypted_proxy_doh_pool_wait_timeouts_total DoH attempts abandoned because no pool handle came free inside the query deadline.\n"
             "# TYPE dns_encrypted_proxy_doh_pool_wait_timeouts_total counter\n"
             "dns_encrypted_proxy_doh_pool_wait_timeouts_total %llu\n"
+            "# HELP dns_encrypted_proxy_doh_connection_recycles_total DoH connections dropped and redialled after a request on them went unanswered.\n"
+            "# TYPE dns_encrypted_proxy_doh_connection_recycles_total counter\n"
+            "dns_encrypted_proxy_doh_connection_recycles_total %llu\n"
             "# HELP dns_encrypted_proxy_upstream_stage1_cache_total Upstream stage1 resolver cache counters.\n"
             "# TYPE dns_encrypted_proxy_upstream_stage1_cache_total counter\n"
             "dns_encrypted_proxy_upstream_stage1_cache_total{result=\"hit\"} %llu\n"
@@ -794,6 +797,7 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)runtime_stats.doh_upgrade_probe_success_total,
             (unsigned long long)runtime_stats.doh_upgrade_probe_failure_total,
             (unsigned long long)runtime_stats.doh_pool_wait_timeouts_total,
+            (unsigned long long)runtime_stats.doh_connection_recycles_total,
             (unsigned long long)runtime_stats.stage1_cache_hits,
             (unsigned long long)runtime_stats.stage1_cache_misses,
             (unsigned long long)runtime_stats.stage1_cache_refreshes,
