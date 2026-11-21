@@ -125,6 +125,26 @@ static int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/*
+ * Name the identity the server certificate must prove. OpenSSL 4 split the
+ * old SSL_set1_host into a DNS-name and an IP-address call; older releases
+ * only have the combined one, and it tells the two apart itself. Callers
+ * must treat failure as fatal: without a reference identity OpenSSL still
+ * verifies the chain but accepts any name on it.
+ */
+static int dot_set_peer_identity(SSL *ssl, const char *host) {
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+    struct in_addr addr4;
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET, host, &addr4) == 1 || inet_pton(AF_INET6, host, &addr6) == 1) {
+        return SSL_set1_ipaddr(ssl, host) == 1 ? 0 : -1;
+    }
+    return SSL_set1_dnsname(ssl, host) == 1 ? 0 : -1;
+#else
+    return SSL_set1_host(ssl, host) == 1 ? 0 : -1;
+#endif
+}
+
 static int connect_with_timeout(const char *host, int port, int timeout_ms) {
     struct addrinfo hints = {0};
     hints.ai_family = AF_UNSPEC;
@@ -308,8 +328,16 @@ static int establish_tls_connection(
     // NOLINTNEXTLINE(clang-diagnostic-cast-qual)
     SSL_set_tlsext_host_name(conn->ssl, host);
     
-    /* Set hostname for verification */
-    SSL_set1_host(conn->ssl, host);
+    if (dot_set_peer_identity(conn->ssl, host) != 0) {
+        if (reason_out != NULL) {
+            *reason_out = "ssl_new_failed";
+        }
+        SSL_free(conn->ssl);
+        conn->ssl = NULL;
+        close(conn->fd);
+        conn->fd = -1;
+        return -1;
+    }
     
     SSL_set_fd(conn->ssl, conn->fd);
     

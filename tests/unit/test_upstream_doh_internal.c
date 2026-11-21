@@ -6,6 +6,12 @@
 #include <setjmp.h>
 #include <cmocka.h>
 
+/* cmocka 2 deprecates assert_in_range in favour of typed variants that
+ * cmocka 1.1 (Alpine, Debian trixie) does not have yet. */
+#ifndef assert_int_in_range
+#define assert_int_in_range assert_in_range
+#endif
+
 #include <curl/curl.h>
 #include <pthread.h>
 
@@ -887,7 +893,7 @@ static void test_doh_ladder_collapses_without_http3(void **state) {
     assert_int_equal(g_curl_http_version_setopt_value, doh_http_version_for_tier(DOH_HTTP_TIER_H2));
     assert_int_equal((int)server.stage.doh_forced_http_tier, (int)DOH_HTTP_TIER_H2);
     /* Two ladder steps (h2, h1) means one reserve withheld, not two. */
-    assert_in_range(g_curl_timeout_ms_setopt_value, 2500 - DOH_FALLBACK_RESERVE_MS - 20, 2500 - DOH_FALLBACK_RESERVE_MS);
+    assert_int_in_range(g_curl_timeout_ms_setopt_value, 2500 - DOH_FALLBACK_RESERVE_MS - 20, 2500 - DOH_FALLBACK_RESERVE_MS);
 
     /* A libcurl that does speak h3 keeps the full ladder. */
     upstream_doh_client_destroy(client);
@@ -905,7 +911,7 @@ static void test_doh_ladder_collapses_without_http3(void **state) {
     assert_int_equal(upstream_doh_resolve(client, &h3_server, 2500, UPSTREAM_ATTEMPT_NONE, query, sizeof(query), &resp, &resp_len), 0);
     free(resp);
     assert_int_equal(g_curl_http_version_setopt_value, doh_http_version_for_tier(DOH_HTTP_TIER_H3));
-    assert_in_range(g_curl_timeout_ms_setopt_value, 2500 - 2 * DOH_FALLBACK_RESERVE_MS - 20, 2500 - 2 * DOH_FALLBACK_RESERVE_MS);
+    assert_int_in_range(g_curl_timeout_ms_setopt_value, 2500 - 2 * DOH_FALLBACK_RESERVE_MS - 20, 2500 - 2 * DOH_FALLBACK_RESERVE_MS);
 
     upstream_doh_client_destroy(client);
 }
@@ -1153,21 +1159,21 @@ static void test_next_attempt_timeout_floor(void **state) {
      * attempt running now with half, not with a 277 ms slice that no cold
      * recursive resolution can answer inside. */
     int t = next_attempt_timeout_ms(now_ms() + 2500, 9);
-    assert_in_range(t, 1230, 1250);
+    assert_int_in_range(t, 1230, 1250);
 
     /* A short ladder gives the current attempt everything but the reserve
      * held for the one step behind it. */
     t = next_attempt_timeout_ms(now_ms() + 2500, 2);
-    assert_in_range(t, 2180, 2200);
+    assert_int_in_range(t, 2180, 2200);
 
     /* A single remaining attempt gets the whole remaining budget. */
     t = next_attempt_timeout_ms(now_ms() + 2500, 1);
-    assert_in_range(t, 2400, 2500);
+    assert_int_in_range(t, 2400, 2500);
 
     /* The floor still lifts a slice that the reserve would push below one
      * cold-recursion round trip. */
     t = next_attempt_timeout_ms(now_ms() + 900, 3);
-    assert_in_range(t, DOH_MIN_ATTEMPT_TIMEOUT_MS - 20, DOH_MIN_ATTEMPT_TIMEOUT_MS);
+    assert_int_in_range(t, DOH_MIN_ATTEMPT_TIMEOUT_MS - 20, DOH_MIN_ATTEMPT_TIMEOUT_MS);
 
     /* Expired deadline refuses further attempts. */
     assert_int_equal(next_attempt_timeout_ms(now_ms(), 3), -1);

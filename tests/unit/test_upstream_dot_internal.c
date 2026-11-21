@@ -62,6 +62,11 @@ static int g_ssl_connect_rc = 1;
 static int g_ssl_get_fd = 42;
 static int g_ssl_shutdown_calls = 0;
 static int g_ssl_free_calls = 0;
+/* Which identity call the code under test made, so the OpenSSL 4 split
+ * between DNS names and IP literals can be checked. */
+static char g_ssl_identity_kind[8];
+static char g_ssl_identity_value[64];
+static int g_ssl_identity_fail = 0;
 
 static int g_ssl_read_script[8];
 static int g_ssl_read_script_len = 0;
@@ -105,6 +110,9 @@ static void reset_stubs(void) {
     g_ssl_get_fd = 42;
     g_ssl_shutdown_calls = 0;
     g_ssl_free_calls = 0;
+    g_ssl_identity_kind[0] = '\0';
+    g_ssl_identity_value[0] = '\0';
+    g_ssl_identity_fail = 0;
 
     g_ssl_read_script_len = 0;
     g_ssl_read_script_idx = 0;
@@ -297,11 +305,28 @@ static int dot_test_SSL_set_tlsext_host_name(SSL *ssl, const char *name) {
     return 1;
 }
 
+static int dot_test_record_identity(const char *kind, const char *value) {
+    snprintf(g_ssl_identity_kind, sizeof(g_ssl_identity_kind), "%s", kind);
+    snprintf(g_ssl_identity_value, sizeof(g_ssl_identity_value), "%s", value);
+    return g_ssl_identity_fail ? 0 : 1;
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+static int dot_test_SSL_set1_dnsname(SSL *ssl, const char *name) {
+    (void)ssl;
+    return dot_test_record_identity("dns", name);
+}
+
+static int dot_test_SSL_set1_ipaddr(SSL *ssl, const char *addr) {
+    (void)ssl;
+    return dot_test_record_identity("ip", addr);
+}
+#else
 static int dot_test_SSL_set1_host(SSL *ssl, const char *hostname) {
     (void)ssl;
-    (void)hostname;
-    return 1;
+    return dot_test_record_identity("host", hostname);
 }
+#endif
 
 static int dot_test_SSL_set_fd(SSL *ssl, int fd) {
     (void)ssl;
@@ -390,7 +415,12 @@ void logger_logf(const char *func, const char *level, const char *fmt, ...) {
 #define SSL_free dot_test_SSL_free
 #define SSL_shutdown dot_test_SSL_shutdown
 #define SSL_set_tlsext_host_name dot_test_SSL_set_tlsext_host_name
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+#define SSL_set1_dnsname dot_test_SSL_set1_dnsname
+#define SSL_set1_ipaddr dot_test_SSL_set1_ipaddr
+#else
 #define SSL_set1_host dot_test_SSL_set1_host
+#endif
 #define SSL_set_fd dot_test_SSL_set_fd
 #define SSL_connect dot_test_SSL_connect
 #define SSL_get_fd dot_test_SSL_get_fd
@@ -413,6 +443,8 @@ void logger_logf(const char *func, const char *level, const char *fmt, ...) {
 #undef SSL_connect
 #undef SSL_set_fd
 #undef SSL_set1_host
+#undef SSL_set1_dnsname
+#undef SSL_set1_ipaddr
 #undef SSL_set_tlsext_host_name
 #undef SSL_shutdown
 #undef SSL_free
@@ -578,6 +610,58 @@ static void test_establish_tls_connection_paths(void **state) {
     close_connection(NULL);
 }
 
+/*
+ * The certificate must be checked against the configured name. If OpenSSL
+ * cannot take the name, the chain would still verify but any hostname on it
+ * would pass, so the connection has to be refused instead.
+ */
+static void test_dot_peer_identity_is_required(void **state) {
+    (void)state;
+    upstream_dot_client_t client;
+    memset(&client, 0, sizeof(client));
+    client.ssl_ctx = (SSL_CTX *)(uintptr_t)0x101;
+    dot_connection_t conn;
+
+    reset_stubs();
+    memset(&conn, 0, sizeof(conn));
+    conn.fd = -1;
+    assert_int_equal(establish_tls_connection(&client, &conn, "dns.example", 853, 10, 0, 0, NULL), 0);
+    assert_string_equal(g_ssl_identity_value, "dns.example");
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+    assert_string_equal(g_ssl_identity_kind, "dns");
+#else
+    assert_string_equal(g_ssl_identity_kind, "host");
+#endif
+    close_connection(&conn);
+
+    const char *literals[] = {"127.0.0.1", "2001:db8::1"};
+    for (size_t i = 0; i < sizeof(literals) / sizeof(literals[0]); i++) {
+        reset_stubs();
+        memset(&conn, 0, sizeof(conn));
+        conn.fd = -1;
+        assert_int_equal(establish_tls_connection(&client, &conn, literals[i], 853, 10, 0, 0, NULL), 0);
+        assert_string_equal(g_ssl_identity_value, literals[i]);
+#if OPENSSL_VERSION_NUMBER >= 0x40000000L
+        assert_string_equal(g_ssl_identity_kind, "ip");
+#else
+        assert_string_equal(g_ssl_identity_kind, "host");
+#endif
+        close_connection(&conn);
+    }
+
+    reset_stubs();
+    memset(&conn, 0, sizeof(conn));
+    conn.fd = -1;
+    g_ssl_identity_fail = 1;
+    const char *reason = NULL;
+    assert_int_equal(establish_tls_connection(&client, &conn, "dns.example", 853, 10, 0, 0, &reason), -1);
+    assert_string_equal(reason, "ssl_new_failed");
+    assert_null(conn.ssl);
+    assert_int_equal(conn.fd, -1);
+    assert_int_equal(g_ssl_free_calls, 1);
+    assert_int_equal(g_close_calls, 1);
+}
+
 static void test_dot_resolve_success_and_failures(void **state) {
     (void)state;
     reset_stubs();
@@ -724,6 +808,7 @@ int main(void) {
         cmocka_unit_test(test_ssl_io_helpers),
         cmocka_unit_test(test_dot_client_init_failure_paths),
         cmocka_unit_test(test_establish_tls_connection_paths),
+        cmocka_unit_test(test_dot_peer_identity_is_required),
         cmocka_unit_test(test_dot_resolve_success_and_failures),
     };
 
