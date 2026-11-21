@@ -260,6 +260,7 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_upstream_doh_attempt_failures_total` | counter | `upstream`, `tier`, `class` | Per-attempt failures by protocol tier and failure class. |
 | `dns_encrypted_proxy_upstream_doh_slow_retries_total` | counter | `upstream`, `result` | Full-remaining-budget retries after a timed-out attempt whose request reached the upstream (slow answer, not broken transport). `result` is attempt / success. |
 | `dns_encrypted_proxy_doh_pool_wait_timeouts_total` | counter | none | Attempts abandoned because no handle in the DoH pool came free inside the query's own deadline. Local congestion, not an upstream fault: nothing is sent and the server's health is untouched. A nonzero rate means `upstream_pool_size` is too small for the offered load, or upstream latency is holding handles too long. |
+| `dns_encrypted_proxy_doh_connection_recycles_total` | counter | none | DoH pool handles replaced after a request on their connection went out and no answer came back (see 6.5). A few per day is a slow upstream costing one extra handshake. A burst across every handle means the path dropped connections without closing them, typically a NAT reset upstream. |
 
 ### 5.5 Bootstrap stages
 
@@ -437,6 +438,40 @@ passes as it observes, each cheap.
 A `SIGHUP` that arrives before the upstream client exists (early in startup)
 is ignored rather than terminating the process.
 
+### 6.5 Connections that die silently
+
+A pooled connection can die without either end closing it. The usual cause
+is NAT state flushed somewhere on the path: a router or modem reboot, or a
+carrier-grade NAT reset. Packets on the old connection are dropped from then
+on, and no RST ever comes back. The kernel only gives up on such a
+connection after `tcp_retries2` worth of retransmits, about a quarter of an
+hour. Over HTTP/2, libcurl keeps a connection when one of its streams times
+out and puts the next request on it, so a single dead connection would
+swallow every query its handle carries for that whole time, bootstrap-IP
+attempts included.
+
+The proxy treats an unanswered request as possible evidence of a dead
+connection:
+
+- When a DoH request was sent and its attempt timed out, the slot's curl
+  handle is replaced before the slow-response retry. The retry and every
+  later query on that slot dial a fresh connection. A genuinely slow upstream
+  loses one TLS handshake to this. Replacing the handle also closes its
+  healthy connections to other upstreams, which are redialled on next use.
+  Each replacement increments `doh_connection_recycles_total` and logs
+  `DoH connection redialled after an unanswered request` at INFO.
+- DoH sockets carry `TCP_USER_TIMEOUT` of 10 s, so the kernel fails a
+  connection whose sent data goes unacknowledged that long. Keepalive starts
+  probing after 30 s idle, every 10 s, so an idle pooled connection that has
+  died is dropped within about 40 s, before a query is sent down it.
+- DoT closes its connection on any read timeout and needs neither. DoQ opens
+  a connection per query.
+
+After a NAT reset each pool slot therefore costs one query attempt slice and
+recovers within that query's own budget, without a `SIGHUP`. `SIGHUP` is
+still the right call when the host knows the route changed (6.4): it redials
+everything at once instead of one slot at a time.
+
 ---
 
 ## 7. Troubleshooting
@@ -448,7 +483,14 @@ is ignored rather than terminating the process.
 3. Check `dns_encrypted_proxy_upstream_server_consecutive_failures`. Non-zero means the upstream is rejecting / TLS failing.
 4. Bump `log_level` to `DEBUG` and look for `Upstream stage event:` lines — they're verbose but explicit about which transport stage failed and why.
 5. `Upstream stage event: ... action=skipped reason=budget_exhausted` on every failure means queries are arriving at the transport with no time left, not that the upstream is broken. Check `dns_encrypted_proxy_doh_pool_wait_timeouts_total` and `dns_encrypted_proxy_upstream_dispatch_queue_wait_milliseconds_max` for the congestion, and raise `upstream_pool_size` or `upstream_timeout_ms`.
-6. A containerised proxy whose own `resolv.conf` points at a downstream resolver that forwards back to the proxy has no working stage 1 by construction. Give the container a resolver outside that loop (`--dns`) rather than relying on the bootstrap ladder to unwind it on every cold start.
+6. Every DoH attempt logging `reason=timeout ... sent=1`, while a direct
+   `curl` to the provider from the same network namespace answers at once,
+   is the silent-dead-connection pattern (6.5). Since 0.2.1 the proxy recovers
+   from this by itself within one query per pool slot, and
+   `doh_connection_recycles_total` jumps. On older versions send `SIGHUP`.
+   `ss -tnoi state established` showing upstream sockets with a large
+   `Send-Q` and a high `backoff` confirms it.
+7. A containerised proxy whose own `resolv.conf` points at a downstream resolver that forwards back to the proxy has no working stage 1 by construction. Give the container a resolver outside that loop (`--dns`) rather than relying on the bootstrap ladder to unwind it on every cold start.
 
 ### 7.2 "DoH is slow / timing out"
 

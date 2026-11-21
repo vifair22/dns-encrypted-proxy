@@ -211,6 +211,11 @@ int upstream_doh_client_get_pool_stats(
     return 0;
 }
 
+uint64_t upstream_doh_client_connection_recycles_total(upstream_doh_client_t *client) {
+    (void)client;
+    return 6;
+}
+
 proxy_status_t upstream_dot_client_init(upstream_dot_client_t **client, const upstream_config_t *config) {
     (void)config;
     if (g_dot_init_rc != 0) {

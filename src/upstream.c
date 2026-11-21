@@ -1252,6 +1252,8 @@ int upstream_get_runtime_stats(upstream_client_t *client, upstream_runtime_stats
             &stats_out->doh_http1_responses_total,
             &stats_out->doh_http_other_responses_total,
             &stats_out->doh_pool_wait_timeouts_total);
+        stats_out->doh_connection_recycles_total =
+            upstream_doh_client_connection_recycles_total(client->doh_client);
     }
 
     for (int i = 0; i < client->server_count; i++) {
