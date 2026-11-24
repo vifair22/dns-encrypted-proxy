@@ -18,6 +18,7 @@
 #include "upstream_doq.h"
 #include "iterative_resolver.h"
 #include "logger.h"
+#include "test_report_collector.h"
 
 static int g_mutex_init_fail = 0;
 static uint64_t g_now_ms = 0;
@@ -977,6 +978,98 @@ static void test_apply_reconnect_resets_path_penalties(void **state) {
     upstream_client_destroy(&client);
 }
 
+
+/* Health transitions become upstream events on the report socket. */
+static void test_health_transitions_are_reported(void **state) {
+    (void)state;
+    reset_stubs();
+    upstream_config_t cfg = {
+        .timeout_ms = 50,
+        .pool_size = 1,
+        .max_failures_before_unhealthy = 2,
+        .unhealthy_backoff_ms = 1000,
+    };
+    upstream_server_t s;
+    memset(&s, 0, sizeof(s));
+    s.health.healthy = 1;
+    snprintf(s.host, sizeof(s.host), "dns.example");
+
+    test_collector_t c;
+    test_collector_open(&c, 1);
+    char buf[REPORT_MAX_DATAGRAM];
+
+    /* The transport's own note wins over the failure class. */
+    s.stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TIMEOUT;
+    report_note_attempt_failure("timeout", "curl=28,http=0,sent=1");
+    upstream_server_record_failure(&s, &cfg);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"upstream\":\"dns.example\",\"event\":\"failure\",\"reason\":\"timeout\",\"detail\":\"curl=28,http=0,sent=1\""));
+    assert_false(test_collector_pending(&c));
+
+    /* Without a note the class names the reason; the second failure also
+     * flips the server unhealthy. */
+    s.stage.last_failure_class = UPSTREAM_FAILURE_CLASS_TLS;
+    upstream_server_record_failure(&s, &cfg);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"event\":\"failure\",\"reason\":\"tls\",\"detail\":null"));
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"event\":\"unhealthy\",\"reason\":\"tls\",\"detail\":\"consecutive_failures=2\""));
+
+    /* A slow answer is reported but carries no health penalty. */
+    s.stage.last_failure_slow_response = 1;
+    upstream_server_record_failure(&s, &cfg);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"reason\":\"slow_response\""));
+    assert_false(test_collector_pending(&c));
+    s.stage.last_failure_slow_response = 0;
+
+    /* Nothing was asked of the server: no event. */
+    s.stage.last_failure_class = UPSTREAM_FAILURE_CLASS_UNKNOWN;
+    upstream_server_record_failure(&s, &cfg);
+    assert_false(test_collector_pending(&c));
+
+    /* Recovery, and a stale note does not leak into a later failure. */
+    report_note_attempt_failure("stale", "stale");
+    upstream_server_record_success(&s);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"event\":\"recovered\",\"reason\":null"));
+    upstream_server_record_success(&s);
+    assert_false(test_collector_pending(&c));
+
+    const char *names[] = {"dns", "network", "transport", "timeout", "unknown"};
+    const int classes[] = {
+        UPSTREAM_FAILURE_CLASS_DNS, UPSTREAM_FAILURE_CLASS_NETWORK, UPSTREAM_FAILURE_CLASS_TRANSPORT,
+        UPSTREAM_FAILURE_CLASS_TIMEOUT, 99,
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        assert_string_equal(failure_class_name(classes[i]), names[i]);
+    }
+
+    test_collector_close(&c);
+}
+
+
+static void test_reconnect_reports_a_redial_per_server(void **state) {
+    (void)state;
+    reset_stubs();
+    const char *urls[] = {PRIMARY_TEST_URL, PRIMARY_TEST_URL};
+    upstream_config_t config = {.timeout_ms = 50, .pool_size = 1, .max_failures_before_unhealthy = 1, .unhealthy_backoff_ms = 1000};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 2, &config), PROXY_OK);
+
+    test_collector_t c;
+    test_collector_open(&c, 1);
+    char buf[REPORT_MAX_DATAGRAM];
+    upstream_client_apply_reconnect(&client);
+    for (int i = 0; i < 2; i++) {
+        test_collector_expect(&c, buf, sizeof(buf));
+        assert_non_null(strstr(buf, "\"event\":\"redial\",\"reason\":\"reconnect_requested\""));
+    }
+    assert_false(test_collector_pending(&c));
+    test_collector_close(&c);
+    upstream_client_destroy(&client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_upstream_resolve_last_resort_unhealthy),
@@ -988,6 +1081,8 @@ int main(void) {
         cmocka_unit_test(test_stage2_survives_a_stage1_that_spends_its_budget),
         cmocka_unit_test(test_upstream_guard_and_limit_edges),
         cmocka_unit_test(test_record_failure_slow_response_not_health_attributed),
+        cmocka_unit_test(test_health_transitions_are_reported),
+        cmocka_unit_test(test_reconnect_reports_a_redial_per_server),
         cmocka_unit_test(test_upstream_ready_state),
         cmocka_unit_test(test_apply_reconnect_resets_path_penalties),
     };

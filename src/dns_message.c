@@ -1,5 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "dns_message.h"
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <limits.h>
 #include <string.h>
 
@@ -11,6 +15,7 @@
 #define DNS_UDP_MAX_SAFE_PAYLOAD 4096
 #define DNS_EDNS_OPT_COOKIE 10
 #define DNS_EDNS_OPT_PADDING 12
+#define DNS_EDNS_OPT_CLIENT_SUBNET 8
 
 static uint16_t read_u16(const uint8_t *ptr) {
     return (uint16_t)((ptr[0] << 8) | ptr[1]);
@@ -875,5 +880,114 @@ int dns_validate_response_for_query(const uint8_t *query, size_t query_len, cons
         return -1;
     }
 
+    return 0;
+}
+
+/* The address in an ECS option is truncated to its source prefix, so it is
+ * zero-padded back to full width before it is formatted. Only the first
+ * option counts; RFC 7871 7.1 forbids more than one. */
+static int dns_format_client_subnet(const uint8_t *data, uint16_t len, char *addr_out, size_t addr_out_len) {
+    if (len < 4) {
+        return -1;
+    }
+    uint16_t family = read_u16(data);
+    uint8_t source_prefix = data[2];
+    size_t addr_len = len - 4u;
+    uint8_t addr[16];
+    memset(addr, 0, sizeof(addr));
+
+    int af = 0;
+    size_t width = 0;
+    if (family == 1) {
+        af = AF_INET;
+        width = 4;
+    } else if (family == 2) {
+        af = AF_INET6;
+        width = 16;
+    } else {
+        return -1;
+    }
+    if (source_prefix > width * 8u || addr_len > width || addr_len != ((size_t)source_prefix + 7u) / 8u) {
+        return -1;
+    }
+    memcpy(addr, data + 4, addr_len);
+
+    if (addr_out == NULL) {
+        return 0;
+    }
+    if (inet_ntop(af, addr, addr_out, (socklen_t)addr_out_len) == NULL) {
+        return -1;
+    }
+    return 0;
+}
+
+int dns_query_take_client_subnet(uint8_t *query, size_t *query_len, char *addr_out, size_t addr_out_len) {
+    if (query == NULL || query_len == NULL || *query_len < DNS_HEADER_SIZE) {
+        return -1;
+    }
+    if (addr_out != NULL && addr_out_len > 0) {
+        addr_out[0] = '\0';
+    }
+
+    size_t len = *query_len;
+    uint16_t qdcount = read_u16(query + 4);
+    uint16_t ancount = read_u16(query + 6);
+    uint16_t nscount = read_u16(query + 8);
+    uint16_t arcount = read_u16(query + 10);
+
+    size_t offset = DNS_HEADER_SIZE;
+    for (uint16_t i = 0; i < qdcount; i++) {
+        if (dns_skip_name(query, len, &offset) != 0 || offset + 4 > len) {
+            return -1;
+        }
+        offset += 4;
+    }
+
+    uint32_t rr_count = (uint32_t)ancount + nscount + arcount;
+    for (uint32_t i = 0; i < rr_count; i++) {
+        if (dns_skip_name(query, len, &offset) != 0 || offset + 10 > len) {
+            return -1;
+        }
+        uint16_t type = read_u16(query + offset);
+        size_t rdlength_pos = offset + 8;
+        uint16_t rdlength = read_u16(query + rdlength_pos);
+        size_t rdata = offset + 10;
+        if (rdata + rdlength > len) {
+            return -1;
+        }
+        if (type != DNS_TYPE_OPT || i < (uint32_t)ancount + nscount) {
+            offset = rdata + rdlength;
+            continue;
+        }
+
+        size_t opt = rdata;
+        size_t opt_end = rdata + rdlength;
+        while (opt < opt_end) {
+            if (opt + 4 > opt_end) {
+                return -1;
+            }
+            uint16_t code = read_u16(query + opt);
+            uint16_t opt_len = read_u16(query + opt + 2);
+            size_t total = 4u + opt_len;
+            if (opt + total > opt_end) {
+                return -1;
+            }
+            if (code == DNS_EDNS_OPT_CLIENT_SUBNET) {
+                /* A malformed ECS option is still removed: it must not reach
+                 * the upstream or the cache key either way. Only its address
+                 * is withheld. */
+                if (dns_format_client_subnet(query + opt + 4, opt_len, addr_out, addr_out_len) != 0 &&
+                    addr_out != NULL && addr_out_len > 0) {
+                    addr_out[0] = '\0';
+                }
+                memmove(query + opt, query + opt + total, len - (opt + total));
+                write_u16(query + rdlength_pos, (uint16_t)(rdlength - total));
+                *query_len = len - total;
+                return 1;
+            }
+            opt += total;
+        }
+        return 0;
+    }
     return 0;
 }

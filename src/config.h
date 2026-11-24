@@ -15,6 +15,8 @@
  * exhaustion if a config typo asks for something absurd. */
 #define UDP_WORKERS_MAX 64
 #define UDP_QUEUE_CAPACITY_MAX 4096
+#define REPORT_SOCKET_PATH_MAX 108
+#define MAX_REPORT_TRUSTED_ECS_SOURCES 8
 
 typedef struct {
     char name[256];
@@ -54,10 +56,24 @@ typedef struct {
     char bootstrap_resolvers[MAX_BOOTSTRAP_RESOLVERS][64];
     hosts_a_override_t hosts_a_overrides[MAX_HOSTS_A_OVERRIDES];
     int hosts_a_override_count;
+    /* AF_UNIX datagram path for per-query and upstream event reports.
+     * Empty turns reporting off. */
+    char report_socket[REPORT_SOCKET_PATH_MAX];
+    /* Set while parsing when report_socket was too long for sun_path. */
+    int report_socket_too_long;
+    /* Peers whose EDNS Client Subnet is taken as the real client address in
+     * reports, network byte order. Anyone else gets the peer address, so a
+     * LAN client cannot put a forged address into the report. */
+    uint32_t report_trusted_ecs_sources[MAX_REPORT_TRUSTED_ECS_SOURCES];
+    int report_trusted_ecs_source_count;
+    /* Set while parsing when report_trusted_ecs_sources held something that
+     * is not an IPv4 address; config_load turns it into an error. */
+    int report_trusted_ecs_sources_invalid;
 } proxy_config_t;
 
 proxy_status_t config_load(proxy_config_t *config, const char *explicit_path);
 void config_print(const proxy_config_t *config, FILE *out);
+int config_report_trusts_ecs_from(const proxy_config_t *config, uint32_t peer_addr_v4_be);
 int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32_t *addr_v4_be_out);
 
 #endif

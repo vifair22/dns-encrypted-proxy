@@ -3,9 +3,11 @@
 #include "upstream_dispatch.h"
 
 #include "logger.h"
+#include "report.h"
 #include "upstream_bootstrap.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -787,6 +789,15 @@ static void *completion_thread_main(void *arg) {
             uint64_t now = now_ms();
             if (job->deadline_ms > now && job->attempts < (uint32_t)fac->provider_count) {
                 atomic_fetch_add(&fac->requeued_total, 1);
+                if (member_idx >= 0 && member_idx < fac->member_count && report_enabled()) {
+                    char detail[32];
+                    (void)snprintf(detail, sizeof(detail), "attempt=%u", (unsigned int)job->attempts);
+                    report_upstream(
+                        fac->upstream->servers[fac->members[member_idx].provider_index].host,
+                        "failover",
+                        "query_failed",
+                        detail);
+                }
                 pthread_mutex_lock(&fac->queue_mutex);
                 queue_push(&fac->submit_head, &fac->submit_tail, job);
                 pthread_cond_broadcast(&fac->queue_cond);
@@ -1039,7 +1050,11 @@ static int resolve_with_job_deadline(
     size_t query_len,
     uint64_t deadline_ms,
     uint8_t **response_out,
-    size_t *response_len_out) {
+    size_t *response_len_out,
+    int *provider_index_out) {
+    if (provider_index_out != NULL) {
+        *provider_index_out = -1;
+    }
     if (facilitator == NULL || query == NULL || query_len == 0 || response_out == NULL || response_len_out == NULL) {
         return -1;
     }
@@ -1104,6 +1119,9 @@ static int resolve_with_job_deadline(
     pthread_mutex_unlock(&job->mutex);
 
     int rc = job->result;
+    if (provider_index_out != NULL && job->history_len > 0) {
+        *provider_index_out = job->provider_history[job->history_len - 1];
+    }
     if (rc == 0) {
         *response_out = job->response;
         *response_len_out = job->response_len;
@@ -1125,7 +1143,19 @@ int upstream_facilitator_resolve_with_deadline(
     uint64_t deadline_ms,
     uint8_t **response_out,
     size_t *response_len_out) {
-    return resolve_with_job_deadline(facilitator, query, query_len, deadline_ms, response_out, response_len_out);
+    return resolve_with_job_deadline(facilitator, query, query_len, deadline_ms, response_out, response_len_out, NULL);
+}
+
+int upstream_facilitator_resolve_reporting(
+    upstream_facilitator_t *facilitator,
+    const uint8_t *query,
+    size_t query_len,
+    uint64_t deadline_ms,
+    uint8_t **response_out,
+    size_t *response_len_out,
+    int *provider_index_out) {
+    return resolve_with_job_deadline(
+        facilitator, query, query_len, deadline_ms, response_out, response_len_out, provider_index_out);
 }
 
 int upstream_facilitator_resolve(
@@ -1134,7 +1164,7 @@ int upstream_facilitator_resolve(
     size_t query_len,
     uint8_t **response_out,
     size_t *response_len_out) {
-    return resolve_with_job_deadline(facilitator, query, query_len, 0, response_out, response_len_out);
+    return resolve_with_job_deadline(facilitator, query, query_len, 0, response_out, response_len_out, NULL);
 }
 
 int upstream_facilitator_get_stats(

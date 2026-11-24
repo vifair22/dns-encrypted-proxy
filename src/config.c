@@ -204,6 +204,42 @@ static void split_bootstrap_resolvers(proxy_config_t *config, const char *value)
     }
 }
 
+static void split_report_trusted_ecs_sources(proxy_config_t *config, const char *value) {
+    char buffer[MAX_REPORT_TRUSTED_ECS_SOURCES * 32];
+    if (strlen(value) >= sizeof(buffer)) {
+        config->report_trusted_ecs_sources_invalid = 1;
+        return;
+    }
+    memcpy(buffer, value, strlen(value) + 1);
+
+    config->report_trusted_ecs_source_count = 0;
+    config->report_trusted_ecs_sources_invalid = 0;
+    char *token = strtok(buffer, ",");
+    while (token != NULL) {
+        trim_in_place(token);
+        if (*token != '\0') {
+            struct in_addr addr;
+            if (inet_pton(AF_INET, token, &addr) != 1 ||
+                config->report_trusted_ecs_source_count >= MAX_REPORT_TRUSTED_ECS_SOURCES) {
+                config->report_trusted_ecs_sources_invalid = 1;
+                return;
+            }
+            config->report_trusted_ecs_sources[config->report_trusted_ecs_source_count++] = addr.s_addr;
+        }
+        token = strtok(NULL, ",");
+    }
+}
+
+static void set_report_socket(proxy_config_t *config, const char *value) {
+    if (strlen(value) >= sizeof(config->report_socket)) {
+        config->report_socket[0] = '\0';
+        config->report_socket_too_long = 1;
+        return;
+    }
+    (void)snprintf(config->report_socket, sizeof(config->report_socket), "%s", value);
+    config->report_socket_too_long = 0;
+}
+
 /* bootstrap resolvers are plain IPv4 DNS resolver addresses */
 
 static void trim_in_place(char *s) {
@@ -411,6 +447,16 @@ static void apply_key_value(proxy_config_t *config, const char *key, const char 
 
     if (strcmp(key, "hosts_a") == 0) {
         split_hosts_a_overrides(config, value);
+        return;
+    }
+
+    if (strcmp(key, "report_socket") == 0) {
+        set_report_socket(config, value);
+        return;
+    }
+
+    if (strcmp(key, "report_trusted_ecs_sources") == 0) {
+        split_report_trusted_ecs_sources(config, value);
     }
 }
 
@@ -571,6 +617,16 @@ static void apply_env_overrides(proxy_config_t *config) {
     if (value != NULL && *value != '\0') {
         split_bootstrap_resolvers(config, value);
     }
+
+    value = getenv("REPORT_SOCKET");
+    if (value != NULL && *value != '\0') {
+        set_report_socket(config, value);
+    }
+
+    value = getenv("REPORT_TRUSTED_ECS_SOURCES");
+    if (value != NULL && *value != '\0') {
+        split_report_trusted_ecs_sources(config, value);
+    }
 }
 
 static void set_defaults(proxy_config_t *config) {
@@ -617,6 +673,10 @@ static void set_defaults(proxy_config_t *config) {
     strncpy(config->bootstrap_resolvers[1], "1.1.1.1", sizeof(config->bootstrap_resolvers[1]) - 1);
     config->bootstrap_resolver_count = 2;
     hosts_clear(config);
+    struct in_addr loopback;
+    (void)inet_pton(AF_INET, "127.0.0.1", &loopback);
+    config->report_trusted_ecs_sources[0] = loopback.s_addr;
+    config->report_trusted_ecs_source_count = 1;
 }
 
 static void load_config_file(proxy_config_t *config, const char *path) {
@@ -738,6 +798,18 @@ proxy_status_t config_load(proxy_config_t *config, const char *explicit_path) {
                          config->metrics_enabled);
     }
 
+    if (config->report_socket_too_long) {
+        return set_error(PROXY_ERR_CONFIG,
+                         "report_socket must be a path shorter than %zu bytes",
+                         sizeof(config->report_socket) - 1);
+    }
+
+    if (config->report_trusted_ecs_sources_invalid) {
+        return set_error(PROXY_ERR_CONFIG,
+                         "report_trusted_ecs_sources must be a comma-separated list of at most %d IPv4 addresses",
+                         MAX_REPORT_TRUSTED_ECS_SOURCES);
+    }
+
     return PROXY_OK;
 }
 
@@ -765,6 +837,17 @@ void config_print(const proxy_config_t *config, FILE *out) {
     fprintf(out, "  metrics_port=%d\n", config->metrics_port);
     fprintf(out, "  metrics_addr=%s\n", config->metrics_addr);
     fprintf(out, "  log_level=%s\n", config->log_level);
+    fprintf(out, "  report_socket=%s\n", config->report_socket);
+    fprintf(out, "  report_trusted_ecs_sources=");
+    for (int i = 0; i < config->report_trusted_ecs_source_count; i++) {
+        char text[INET_ADDRSTRLEN];
+        struct in_addr addr;
+        addr.s_addr = config->report_trusted_ecs_sources[i];
+        if (inet_ntop(AF_INET, &addr, text, sizeof(text)) != NULL) {
+            fprintf(out, "%s%s", i == 0 ? "" : ",", text);
+        }
+    }
+    fprintf(out, "\n");
     fprintf(out, "  bootstrap_resolvers=");
     for (int i = 0; i < config->bootstrap_resolver_count; i++) {
         fprintf(out, "%s%s", config->bootstrap_resolvers[i], (i + 1 == config->bootstrap_resolver_count) ? "" : ",");
@@ -817,5 +900,17 @@ int config_lookup_hosts_a(const proxy_config_t *config, const char *name, uint32
         }
     }
 
+    return 0;
+}
+
+int config_report_trusts_ecs_from(const proxy_config_t *config, uint32_t peer_addr_v4_be) {
+    if (config == NULL) {
+        return 0;
+    }
+    for (int i = 0; i < config->report_trusted_ecs_source_count; i++) {
+        if (config->report_trusted_ecs_sources[i] == peer_addr_v4_be) {
+            return 1;
+        }
+    }
     return 0;
 }

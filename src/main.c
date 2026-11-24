@@ -4,6 +4,7 @@
 #include "dns_server.h"
 #include "logger.h"
 #include "metrics.h"
+#include "report.h"
 #include "sd_notify.h"
 #include "version.h"
 
@@ -107,12 +108,22 @@ int main(int argc, char **argv) {
     sigaction(SIGHUP, &sa_hup, NULL);
 
     LOGF_INFO("dns-encrypted-proxy %s starting", PROXY_VERSION_FULL);
+    /* Fatal only when the socket cannot be created at all. A collector that
+     * is not listening yet is normal: events are dropped until it is. */
+    if (config.report_socket[0] != '\0') {
+        if (report_open(config.report_socket) != PROXY_OK) {
+            LOGF_ERROR("Failed to set up the report socket: %s", proxy_error_message());
+            return 1;
+        }
+        LOGF_INFO("Sending query and upstream reports to %s", config.report_socket);
+    }
     LOGF_INFO("Loaded configuration from %s", config.config_path);
     LOGF_INFO("Starting DNS listener on %s:%d (UDP+TCP)", config.listen_addr, config.listen_port);
 
     proxy_server_t server;
     if (proxy_server_init(&server, &config, &g_stop) != PROXY_OK) {
         LOGF_ERROR("Failed to initialize server: %s", proxy_error_message());
+        report_close();
         return 1;
     }
 
@@ -123,6 +134,7 @@ int main(int argc, char **argv) {
             LOGF_ERROR("Failed to start metrics server on %s:%d: %s", config.metrics_addr, config.metrics_port, proxy_error_message());
             g_reconnect_target = NULL;
             proxy_server_destroy(&server);
+            report_close();
             return 1;
         }
         LOGF_INFO("Metrics endpoint listening on %s:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_addr, config.metrics_port);
@@ -133,6 +145,7 @@ int main(int argc, char **argv) {
     g_reconnect_target = NULL;
     metrics_server_stop();
     proxy_server_destroy(&server);
+    report_close();
     sd_notify_close();
 
     if (rc != PROXY_OK) {
