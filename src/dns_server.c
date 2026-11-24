@@ -4,6 +4,7 @@
 
 #include "dns_message.h"
 #include "logger.h"
+#include "report.h"
 #include "sd_notify.h"
 #include "upstream_bootstrap.h"
 
@@ -32,10 +33,23 @@ typedef struct {
     int fd;
 } socket_loop_ctx_t;
 
+/* Who sent a query, for the report record. */
+typedef struct {
+    int present;
+    struct sockaddr_in addr;
+} query_peer_t;
+
+/* Where an answer came from, for the report record. */
+typedef struct {
+    report_source_t source;
+    int provider_index;
+} query_outcome_t;
+
 typedef struct {
     proxy_server_t *server;
     int client_fd;
     int query_count;
+    query_peer_t peer;
 } tcp_client_ctx_t;
 
 static uint64_t monotonic_now_ms(void) {
@@ -745,10 +759,19 @@ static int servfail_ede_code(const upstream_client_t *upstream) {
     return saw_failure ? DNS_EDE_NETWORK_ERROR : -1;
 }
 
-static int process_query(proxy_server_t *server, const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
-    if (server == NULL || query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL) {
+static int resolve_query(
+    proxy_server_t *server,
+    const uint8_t *query,
+    size_t query_len,
+    uint8_t **response_out,
+    size_t *response_len_out,
+    query_outcome_t *outcome) {
+    if (server == NULL || query == NULL || query_len < 12 || response_out == NULL || response_len_out == NULL ||
+        outcome == NULL) {
         return -1;
     }
+    outcome->source = REPORT_SOURCE_LOCAL;
+    outcome->provider_index = -1;
 
     *response_out = NULL;
     *response_len_out = 0;
@@ -795,6 +818,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
 
     if (dns_cache_lookup(&server->cache, key, key_len, request_id, response_out, response_len_out)) {
         atomic_fetch_add(&server->metrics.cache_hits, 1);
+        outcome->source = REPORT_SOURCE_CACHE;
         return 0;
     }
 
@@ -805,6 +829,7 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
         dns_cache_lookup(&server->failure_cache, key, key_len, request_id, response_out, response_len_out)) {
         atomic_fetch_add(&server->metrics.failure_cache_hits, 1);
         atomic_fetch_add(&server->metrics.servfail_sent, 1);
+        outcome->source = REPORT_SOURCE_FAILURE_CACHE;
         return 0;
     }
     atomic_fetch_add(&server->metrics.cache_misses, 1);
@@ -815,13 +840,15 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
     }
     uint64_t request_deadline_ms = request_start_ms + (uint64_t)upstream_budget_ms;
 
-    if (upstream_facilitator_resolve_with_deadline(
+    outcome->source = REPORT_SOURCE_UPSTREAM;
+    if (upstream_facilitator_resolve_reporting(
             &server->upstream_facilitator,
             query,
             query_len,
             request_deadline_ms,
             response_out,
-            response_len_out)
+            response_len_out,
+            &outcome->provider_index)
         == 0) {
         atomic_fetch_add(&server->metrics.upstream_success, 1);
         /* Upstream response ID is rewritten to client request ID at edge. */
@@ -866,6 +893,87 @@ static int process_query(proxy_server_t *server, const uint8_t *query, size_t qu
             (uint32_t)server->config.failure_cache_ttl_seconds);
     }
     return 0;
+}
+
+static void report_query_outcome(
+    const proxy_server_t *server,
+    const query_peer_t *peer,
+    const char *ecs_addr,
+    const uint8_t *query,
+    size_t query_len,
+    const uint8_t *response,
+    size_t response_len,
+    const query_outcome_t *outcome,
+    double latency_ms) {
+    char client[INET6_ADDRSTRLEN];
+    client[0] = '\0';
+    if (peer != NULL && peer->present) {
+        if (ecs_addr[0] != '\0' && config_report_trusts_ecs_from(&server->config, peer->addr.sin_addr.s_addr)) {
+            (void)snprintf(client, sizeof(client), "%s", ecs_addr);
+        } else if (inet_ntop(AF_INET, &peer->addr.sin_addr, client, sizeof(client)) == NULL) {
+            client[0] = '\0';
+        }
+    }
+
+    char qname[256];
+    size_t question_end = 0;
+    uint16_t qtype = 0;
+    int have_question =
+        dns_extract_single_question_name_addr(query, query_len, qname, sizeof(qname), &question_end, &qtype) == 0;
+
+    report_query_t record;
+    memset(&record, 0, sizeof(record));
+    record.client = client[0] != '\0' ? client : NULL;
+    record.qname = have_question ? qname : NULL;
+    record.qtype = qtype;
+    record.has_qtype = have_question;
+    record.rcode = (response != NULL && response_len >= 4) ? (uint8_t)(response[3] & 0x0Fu) : 2u;
+    record.source = outcome->source;
+    record.latency_ms = latency_ms;
+    if (outcome->source == REPORT_SOURCE_UPSTREAM && outcome->provider_index >= 0 &&
+        outcome->provider_index < server->upstream.server_count) {
+        const upstream_server_t *upstream = &server->upstream.servers[outcome->provider_index];
+        record.upstream = upstream->host;
+        record.proto = upstream_type_name(upstream->type);
+    }
+    report_query(&record);
+}
+
+/*
+ * Every query enters here. The EDNS Client Subnet option is removed before
+ * anything else sees the query: left in, it splits the cache per client and
+ * hands each client's LAN address to the upstream resolvers. Its address is
+ * kept only for the report, and only from a trusted peer.
+ */
+static int process_query_from(
+    proxy_server_t *server,
+    const query_peer_t *peer,
+    uint8_t *query,
+    size_t *query_len,
+    uint8_t **response_out,
+    size_t *response_len_out) {
+    if (server == NULL || query == NULL || query_len == NULL) {
+        return -1;
+    }
+    struct timespec started;
+    clock_gettime(CLOCK_MONOTONIC, &started);
+
+    char ecs_addr[INET6_ADDRSTRLEN];
+    ecs_addr[0] = '\0';
+    if (*query_len >= 12) {
+        (void)dns_query_take_client_subnet(query, query_len, ecs_addr, sizeof(ecs_addr));
+    }
+
+    query_outcome_t outcome = {.source = REPORT_SOURCE_LOCAL, .provider_index = -1};
+    int rc = resolve_query(server, query, *query_len, response_out, response_len_out, &outcome);
+    if (rc == 0 && report_enabled()) {
+        struct timespec finished;
+        clock_gettime(CLOCK_MONOTONIC, &finished);
+        double latency_ms = (double)(finished.tv_sec - started.tv_sec) * 1000.0 +
+                            (double)(finished.tv_nsec - started.tv_nsec) / 1e6;
+        report_query_outcome(server, peer, ecs_addr, query, *query_len, *response_out, *response_len_out, &outcome, latency_ms);
+    }
+    return rc;
 }
 
 static int create_udp_socket(const proxy_config_t *config) {
@@ -935,14 +1043,18 @@ static int create_tcp_socket(const proxy_config_t *config) {
 static void handle_udp_query(
     proxy_server_t *server,
     int fd,
-    const uint8_t *query,
+    uint8_t *query,
     size_t query_len,
     const struct sockaddr_in *client_addr,
     socklen_t client_len) {
     uint8_t *response = NULL;
     size_t response_len = 0;
 
-    if (process_query(server, query, query_len, &response, &response_len) != 0) {
+    query_peer_t peer = {.present = client_addr != NULL};
+    if (client_addr != NULL) {
+        peer.addr = *client_addr;
+    }
+    if (process_query_from(server, &peer, query, &query_len, &response, &response_len) != 0) {
         RECORD_INTERNAL_ERROR(server, "process_query_failed", "udp_query_len=%zu", query_len);
         return;
     }
@@ -1369,7 +1481,8 @@ static void *tcp_client_loop(void *arg) {
 
         uint8_t *response = NULL;
         size_t response_len = 0;
-        if (process_query(server, query, message_len, &response, &response_len) != 0) {
+        size_t query_len = message_len;
+        if (process_query_from(server, &ctx->peer, query, &query_len, &response, &response_len) != 0) {
             RECORD_INTERNAL_ERROR(server, "process_query_failed", "tcp_query_len=%u", (unsigned int)message_len);
             free(query);
             break;
@@ -1451,7 +1564,10 @@ static void *tcp_accept_loop(void *arg) {
             continue;
         }
 
-        int client_fd = accept(fd, NULL, NULL);
+        struct sockaddr_in peer_addr;
+        socklen_t peer_len = sizeof(peer_addr);
+        memset(&peer_addr, 0, sizeof(peer_addr));
+        int client_fd = accept(fd, (struct sockaddr *)&peer_addr, &peer_len);
         if (client_fd < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1474,6 +1590,8 @@ static void *tcp_accept_loop(void *arg) {
         client_ctx->server = server;
         client_ctx->client_fd = client_fd;
         client_ctx->query_count = 0;
+        client_ctx->peer.present = peer_len >= (socklen_t)sizeof(peer_addr) && peer_addr.sin_family == AF_INET;
+        client_ctx->peer.addr = peer_addr;
 
         pthread_t thread;
         if (pthread_create(&thread, NULL, tcp_client_loop, client_ctx) != 0) {

@@ -3,6 +3,7 @@
 #include "upstream.h"
 #include "upstream_bootstrap.h"
 #include "logger.h"
+#include "report.h"
 
 #if UPSTREAM_DOH_ENABLED
 #include "upstream_doh.h"
@@ -44,18 +45,6 @@ static uint64_t now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-static const char *upstream_type_name(upstream_type_t type) {
-    switch (type) {
-        case UPSTREAM_TYPE_DOH:
-            return "doh";
-        case UPSTREAM_TYPE_DOT:
-            return "dot";
-        case UPSTREAM_TYPE_DOQ:
-            return "doq";
-        default:
-            return "unknown";
-    }
-}
 
 /* clang-tidy can't see through __atomic_fetch_add to know `counter` is
  * mutated; suppress the false-positive const suggestion. */
@@ -267,6 +256,33 @@ int upstream_server_should_skip(const upstream_server_t *server, const upstream_
     return 1;
 }
 
+static const char *failure_class_name(int failure_class) {
+    switch (failure_class) {
+        case UPSTREAM_FAILURE_CLASS_DNS: return "dns";
+        case UPSTREAM_FAILURE_CLASS_NETWORK: return "network";
+        case UPSTREAM_FAILURE_CLASS_TRANSPORT: return "transport";
+        case UPSTREAM_FAILURE_CLASS_TIMEOUT: return "timeout";
+        case UPSTREAM_FAILURE_CLASS_TLS: return "tls";
+        default: return "unknown";
+    }
+}
+
+/* One failure event per query that failed on this server, carrying the last
+ * attempt's own reason when the transport left one. */
+static void report_server_failure(const upstream_server_t *server) {
+    char reason[48];
+    char detail[96];
+    report_take_attempt_failure(reason, sizeof(reason), detail, sizeof(detail));
+    if (!report_enabled()) {
+        return;
+    }
+    if (reason[0] == '\0') {
+        (void)snprintf(reason, sizeof(reason), "%s",
+                       server->stage.last_failure_slow_response ? "slow_response" : failure_class_name(server->stage.last_failure_class));
+    }
+    report_upstream(server->host, "failure", reason, detail[0] != '\0' ? detail : NULL);
+}
+
 void upstream_server_record_success(upstream_server_t *server) {
     if (server == NULL) {
         return;
@@ -280,7 +296,9 @@ void upstream_server_record_success(upstream_server_t *server) {
     server->health.last_success_time = now_ms();
     server->health.total_queries++;
 
+    report_take_attempt_failure(NULL, 0, NULL, 0);
     if (was_unhealthy) {
+        report_upstream(server->host, "recovered", NULL, NULL);
         LOGF_INFO(
             "Upstream recovered: host=%s type=%s total_failures=%llu",
             server->host,
@@ -306,6 +324,8 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
      * pathological domain polled on a timer would otherwise flip a healthy
      * upstream unhealthy and starve unrelated queries. Keep the failure
      * bookkeeping, skip the health penalty. */
+    report_server_failure(server);
+
     if (server->stage.last_failure_slow_response) {
         server->health.last_failure_time = now_ms();
         server->health.total_queries++;
@@ -325,6 +345,11 @@ void upstream_server_record_failure(upstream_server_t *server, const upstream_co
     }
 
     if (was_healthy && !server->health.healthy) {
+        if (report_enabled()) {
+            char detail[48];
+            (void)snprintf(detail, sizeof(detail), "consecutive_failures=%u", server->health.consecutive_failures);
+            report_upstream(server->host, "unhealthy", failure_class_name(server->stage.last_failure_class), detail);
+        }
         LOGF_WARN(
             "Upstream marked unhealthy: host=%s type=%s consecutive_failures=%u backoff_ms=%d",
             server->host,
@@ -461,6 +486,7 @@ void upstream_client_apply_reconnect(upstream_client_t *client) {
 
     for (int i = 0; i < client->server_count; i++) {
         upstream_server_t *server = &client->servers[i];
+        report_upstream(server->host, "redial", "reconnect_requested", NULL);
         server->health.healthy = 1;
         server->health.consecutive_failures = 0;
         server->stage.transport_retry_suppress_until_ms = 0;

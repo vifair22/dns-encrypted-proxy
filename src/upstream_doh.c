@@ -4,6 +4,7 @@
 #include "upstream_doh.h"
 #include "dns_message.h"
 #include "logger.h"
+#include "report.h"
 
 #include <curl/curl.h>
 
@@ -253,6 +254,9 @@ static void log_doh_attempt_failure_impl(
     }
 
     const char *reason = doh_failure_reason(err->curl_rc, err->http_status, err->response_len);
+    char note[96];
+    (void)snprintf(note, sizeof(note), "curl=%d,http=%ld,sent=%d", (int)err->curl_rc, err->http_status, err->request_sent);
+    report_note_attempt_failure(reason, note);
     logger_logf(
         caller_func,
         "WARN",
@@ -560,6 +564,7 @@ static CURL *doh_recycle_slot(upstream_doh_client_t *client, int slot, const ups
         return client->pool_handles[slot];
     }
     atomic_fetch_add(&client->connection_recycles_total, 1);
+    report_upstream(server->host, "redial", "unanswered", NULL);
     LOGF_INFO("DoH connection redialled after an unanswered request: host=%s", server->host);
     return client->pool_handles[slot];
 }
@@ -1128,6 +1133,11 @@ int upstream_doh_resolve(
         int retry_timeout_ms = next_attempt_timeout_ms(deadline_ms, 1);
         if (retry_timeout_ms > 0) {
             __atomic_add_fetch(&server->stage.doh_slow_retry_attempt_total, 1, __ATOMIC_RELAXED);
+            if (report_enabled()) {
+                char detail[32];
+                (void)snprintf(detail, sizeof(detail), "timeout_ms=%d", retry_timeout_ms);
+                report_upstream(server->host, "retry", "unanswered", detail);
+            }
             result = doh_post_with_handle(
                 client,
                 curl,

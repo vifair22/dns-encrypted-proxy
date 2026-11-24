@@ -44,6 +44,11 @@ static int g_stub_failure_cache_store_calls = 0;
 /* Milliseconds the stubbed upstream spends before failing, used to drive a
  * query past its own deadline. */
 static int g_stub_upstream_burns_budget_ms = 0;
+/* Provider the facilitator stub reports as having answered. */
+static int g_stub_provider_index = -1;
+/* Client subnet the strip stub reports, or NULL for none. */
+static const char *g_stub_ecs_addr = NULL;
+static int g_stub_ecs_strip_calls = 0;
 static int g_stub_cacheable = 0;
 static int g_stub_ttl_ok = 0;
 static uint32_t g_stub_min_ttl = 0;
@@ -133,6 +138,9 @@ static void reset_stubs(void) {
     g_stub_failure_cache_lookup_resp_len = 0;
     g_stub_failure_cache_store_calls = 0;
     g_stub_upstream_burns_budget_ms = 0;
+    g_stub_provider_index = -1;
+    g_stub_ecs_addr = NULL;
+    g_stub_ecs_strip_calls = 0;
     g_stub_cacheable = 0;
     g_stub_ttl_ok = 0;
     g_stub_min_ttl = 0;
@@ -490,6 +498,43 @@ int upstream_facilitator_resolve_with_deadline(
     return upstream_facilitator_resolve(facilitator, query, query_len, response_out, response_len_out);
 }
 
+int upstream_facilitator_resolve_reporting(
+    upstream_facilitator_t *facilitator,
+    const uint8_t *query,
+    size_t query_len,
+    uint64_t deadline_ms,
+    uint8_t **response_out,
+    size_t *response_len_out,
+    int *provider_index_out) {
+    if (provider_index_out != NULL) {
+        *provider_index_out = g_stub_provider_index;
+    }
+    return upstream_facilitator_resolve_with_deadline(
+        facilitator, query, query_len, deadline_ms, response_out, response_len_out);
+}
+
+int dns_query_take_client_subnet(uint8_t *query, size_t *query_len, char *addr_out, size_t addr_out_len) {
+    (void)query;
+    (void)query_len;
+    g_stub_ecs_strip_calls++;
+    if (g_stub_ecs_addr == NULL) {
+        return 0;
+    }
+    if (addr_out != NULL && addr_out_len > 0) {
+        (void)snprintf(addr_out, addr_out_len, "%s", g_stub_ecs_addr);
+    }
+    return 1;
+}
+
+int config_report_trusts_ecs_from(const proxy_config_t *config, uint32_t peer_addr_v4_be) {
+    for (int i = 0; config != NULL && i < config->report_trusted_ecs_source_count; i++) {
+        if (config->report_trusted_ecs_sources[i] == peer_addr_v4_be) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void metrics_init(proxy_metrics_t *m) {
     if (m != NULL) {
         memset(m, 0, sizeof(*m));
@@ -590,6 +635,10 @@ int dns_validate_response_for_query(const uint8_t *query, size_t query_len, cons
     return 0;
 }
 
+/* Ahead of the socket wrappers below, so the collector talks to the real
+ * kernel. */
+#include "test_report_collector.h"
+
 #define poll dns_server_wrap_poll
 #define recvfrom dns_server_wrap_recvfrom
 #define sendto dns_server_wrap_sendto
@@ -604,6 +653,23 @@ int dns_validate_response_for_query(const uint8_t *query, size_t query_len, cons
 #define pthread_detach dns_server_wrap_pthread_detach
 #define calloc dns_server_wrap_calloc
 #include "../../src/dns_server.c"
+
+/* The old entry point, kept for these tests: a read-only query with no peer
+ * address, copied so the client-subnet strip has somewhere to write. */
+static int process_query(proxy_server_t *server, const uint8_t *query, size_t query_len, uint8_t **response_out, size_t *response_len_out) {
+    if (query == NULL || query_len == 0) {
+        return process_query_from(server, NULL, NULL, NULL, response_out, response_len_out);
+    }
+    uint8_t *copy = malloc(query_len);
+    if (copy == NULL) {
+        return -1;
+    }
+    memcpy(copy, query, query_len);
+    size_t len = query_len;
+    int rc = process_query_from(server, NULL, copy, &len, response_out, response_len_out);
+    free(copy);
+    return rc;
+}
 #undef calloc
 #undef malloc
 #undef pthread_detach
@@ -1972,6 +2038,119 @@ static void test_hosts_override_edns_and_parser_edges(void **state) {
     free(out);
 }
 
+
+static void set_peer(query_peer_t *peer, const char *addr) {
+    memset(peer, 0, sizeof(*peer));
+    peer->present = 1;
+    peer->addr.sin_family = AF_INET;
+    assert_int_equal(inet_pton(AF_INET, addr, &peer->addr.sin_addr), 1);
+}
+
+static int run_reported_query(proxy_server_t *server, const query_peer_t *peer) {
+    uint8_t query[64];
+    memcpy(query, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN);
+    size_t len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    int rc = process_query_from(server, peer, query, &len, &out, &out_len);
+    free(out);
+    return rc;
+}
+
+/* proxy_server_t is large; on the heap for the same 64 KB stack budget as
+ * the failure-cache tests above. */
+static void test_process_query_reports_each_answer(void **state) {
+    (void)state;
+    reset_stubs();
+    proxy_server_t *server = calloc(1, sizeof(*server));
+    assert_non_null(server);
+    server->config.upstream_timeout_ms = 1000;
+    server->config.report_trusted_ecs_sources[0] = htonl(INADDR_LOOPBACK);
+    server->config.report_trusted_ecs_source_count = 1;
+    server->upstream.server_count = 1;
+    server->upstream.servers[0].type = UPSTREAM_TYPE_DOT;
+    snprintf(server->upstream.servers[0].host, sizeof(server->upstream.servers[0].host), "dns.example");
+    g_stub_key_ok = 1;
+    g_stub_key_len = 8;
+
+    test_collector_t c;
+    test_collector_open(&c, 1);
+    char buf[REPORT_MAX_DATAGRAM];
+    query_peer_t peer;
+
+    /* Upstream answer for a trusted peer carrying ECS: the ECS address is
+     * the client, and the strip ran before anything else. */
+    g_stub_upstream_rc = 0;
+    g_stub_upstream_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_upstream_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    g_stub_provider_index = 0;
+    g_stub_ecs_addr = "192.168.1.50";
+    set_peer(&peer, "127.0.0.1");
+    assert_int_equal(run_reported_query(server, &peer), 0);
+    assert_int_equal(g_stub_ecs_strip_calls, 1);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"client\":\"192.168.1.50\""));
+    assert_non_null(strstr(buf, "\"qname\":\"www.example.com\",\"qtype\":\"A\",\"rcode\":\"NOERROR\""));
+    assert_non_null(strstr(buf, "\"upstream\":\"dns.example\",\"proto\":\"dot\",\"source\":\"upstream\""));
+    assert_non_null(strstr(buf, "\"cached\":false"));
+
+    /* The same ECS from an untrusted peer: the peer address is reported. */
+    set_peer(&peer, "172.20.8.9");
+    assert_int_equal(run_reported_query(server, &peer), 0);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"client\":\"172.20.8.9\""));
+
+    /* Trusted peer without ECS: the peer address. */
+    g_stub_ecs_addr = NULL;
+    set_peer(&peer, "127.0.0.1");
+    assert_int_equal(run_reported_query(server, &peer), 0);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"client\":\"127.0.0.1\""));
+
+    /* No peer at all, and a provider index the stub cannot resolve. */
+    g_stub_provider_index = 5;
+    assert_int_equal(run_reported_query(server, NULL), 0);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"client\":null"));
+    assert_non_null(strstr(buf, "\"upstream\":null,\"proto\":null,\"source\":\"upstream\""));
+
+    /* Upstream failure: SERVFAIL, still attributed to the provider tried. */
+    g_stub_upstream_rc = -1;
+    g_stub_provider_index = 0;
+    assert_int_equal(run_reported_query(server, &peer), 0);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"rcode\":\"SERVFAIL\",\"upstream\":\"dns.example\""));
+
+    /* Cache hit. */
+    g_stub_cache_lookup_hit = 1;
+    g_stub_cache_lookup_resp = DNS_RESPONSE_WWW_EXAMPLE_COM_A;
+    g_stub_cache_lookup_resp_len = DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN;
+    assert_int_equal(run_reported_query(server, &peer), 0);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"source\":\"cache\",\"latency_ms\":"));
+    assert_non_null(strstr(buf, "\"cached\":true"));
+    g_stub_cache_lookup_hit = 0;
+
+    /* Unkeyable query: a local SERVFAIL. */
+    g_stub_key_ok = 0;
+    assert_int_equal(run_reported_query(server, &peer), 0);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"source\":\"local\""));
+
+    /* A failed resolve writes no record. */
+    uint8_t short_query[4] = {0};
+    size_t short_len = sizeof(short_query);
+    uint8_t *out = NULL;
+    size_t out_len = 0;
+    assert_int_equal(process_query_from(server, &peer, short_query, &short_len, &out, &out_len), -1);
+    assert_int_equal(process_query_from(NULL, &peer, short_query, &short_len, &out, &out_len), -1);
+    assert_int_equal(process_query_from(server, &peer, NULL, &short_len, &out, &out_len), -1);
+    assert_false(test_collector_pending(&c));
+
+    test_collector_close(&c);
+    free(server);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_dns_wire_helpers_branches),
@@ -1980,6 +2159,7 @@ int main(void) {
         cmocka_unit_test(test_process_query_branches),
         cmocka_unit_test(test_udp_worker_pool_lifecycle_and_backpressure),
         cmocka_unit_test(test_process_query_failure_cache),
+        cmocka_unit_test(test_process_query_reports_each_answer),
         cmocka_unit_test(test_process_query_does_not_cache_budget_exhaustion),
         cmocka_unit_test(test_build_servfail_ede),
         cmocka_unit_test(test_hosts_override_aaaa_nodata),

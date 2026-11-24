@@ -2,6 +2,8 @@
 
 #include "metrics.h"
 
+#include "report.h"
+
 #include <arpa/inet.h>
 #include <poll.h>
 #include <pthread.h>
@@ -696,6 +698,21 @@ static int build_metrics_body(const proxy_metrics_t *m, char *out, size_t out_si
             (unsigned long long)atomic_load(&m->responses_rcode[3]),
             (unsigned long long)atomic_load(&m->responses_rcode[5]),
             (unsigned long long)rcode_other) != 0) {
+        return -1;
+    }
+
+    if (appendf(
+            out,
+            out_size,
+            &offset,
+            "# HELP dns_encrypted_proxy_report_events_sent_total Query and upstream events delivered to the report socket.\n"
+            "# TYPE dns_encrypted_proxy_report_events_sent_total counter\n"
+            "dns_encrypted_proxy_report_events_sent_total %llu\n"
+            "# HELP dns_encrypted_proxy_report_events_dropped_total Events dropped because the report socket was absent, full or the event too large.\n"
+            "# TYPE dns_encrypted_proxy_report_events_dropped_total counter\n"
+            "dns_encrypted_proxy_report_events_dropped_total %llu\n",
+            (unsigned long long)report_sent_total(),
+            (unsigned long long)report_dropped_total()) != 0) {
         return -1;
     }
 

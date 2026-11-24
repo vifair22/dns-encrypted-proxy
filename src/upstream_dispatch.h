@@ -172,6 +172,16 @@ int upstream_facilitator_resolve_with_deadline(
     uint64_t deadline_ms,
     uint8_t **response_out,
     size_t *response_len_out);
+/* As upstream_facilitator_resolve_with_deadline, and also reports the
+ * provider that handled the last attempt, or -1 when none was tried. */
+int upstream_facilitator_resolve_reporting(
+    upstream_facilitator_t *facilitator,
+    const uint8_t *query,
+    size_t query_len,
+    uint64_t deadline_ms,
+    uint8_t **response_out,
+    size_t *response_len_out,
+    int *provider_index_out);
 int upstream_facilitator_get_stats(
     upstream_facilitator_t *facilitator,
     upstream_facilitator_stats_t *stats_out);

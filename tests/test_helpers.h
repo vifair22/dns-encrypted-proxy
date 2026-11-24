@@ -67,6 +67,8 @@ static inline void clear_config_env_vars(void) {
     unsetenv("LOG_LEVEL");
     unsetenv("HOSTS_A");
     unsetenv("BOOTSTRAP_RESOLVERS");
+    unsetenv("REPORT_SOCKET");
+    unsetenv("REPORT_TRUSTED_ECS_SOURCES");
     unsetenv("DNS_ENCRYPTED_PROXY_CONFIG");
 }
 

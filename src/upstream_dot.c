@@ -4,6 +4,7 @@
 #include "upstream_dot.h"
 #include "dns_message.h"
 #include "logger.h"
+#include "report.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -97,6 +98,7 @@ static void log_dot_attempt_failure_impl(
         format_ipv4(override_addr_v4_be, ip_text, sizeof(ip_text));
     }
     const char *reason = dot_normalize_reason(detail_reason);
+    report_note_attempt_failure(reason, detail_reason);
     logger_logf(
         caller_func,
         "WARN",
