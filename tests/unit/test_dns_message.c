@@ -462,6 +462,166 @@ static void test_different_qtypes_different_keys(void **state) {
     assert_true(key_a_len != key_aaaa_len || memcmp(key_a, key_aaaa, key_a_len) != 0);
 }
 
+
+/*
+ * EDNS Client Subnet handling. ecs_query builds www.example.com A with an
+ * OPT record holding `options` verbatim.
+ */
+static size_t ecs_query(uint8_t *out, size_t cap, const uint8_t *options, size_t options_len) {
+    size_t len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    assert_true(len + 11 + options_len <= cap);
+    memcpy(out, DNS_QUERY_WWW_EXAMPLE_COM_A, len);
+    out[10] = 0;
+    out[11] = 1; /* ARCOUNT */
+    const uint8_t opt_header[] = {0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00};
+    memcpy(out + len, opt_header, sizeof(opt_header));
+    len += sizeof(opt_header);
+    out[len++] = (uint8_t)(options_len >> 8);
+    out[len++] = (uint8_t)(options_len & 0xFF);
+    memcpy(out + len, options, options_len);
+    return len + options_len;
+}
+
+static void test_client_subnet_v4_is_reported_and_removed(void **state) {
+    (void)state;
+    const uint8_t ecs[] = {0x00, 0x08, 0x00, 0x08, 0x00, 0x01, 32, 0, 192, 168, 1, 50};
+    uint8_t query[128];
+    size_t len = ecs_query(query, sizeof(query), ecs, sizeof(ecs));
+    uint8_t expected[128];
+    size_t expected_len = ecs_query(expected, sizeof(expected), NULL, 0);
+
+    char addr[64];
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 1);
+    assert_string_equal(addr, "192.168.1.50");
+    assert_int_equal(len, expected_len);
+    assert_memory_equal(query, expected, expected_len);
+
+    /* Stripped, the query keys the same as one that never carried ECS. */
+    uint8_t key_a[512];
+    uint8_t key_b[512];
+    size_t key_a_len = 0;
+    size_t key_b_len = 0;
+    assert_int_equal(dns_extract_question_key(query, len, key_a, sizeof(key_a), &key_a_len), 0);
+    assert_int_equal(dns_extract_question_key(expected, expected_len, key_b, sizeof(key_b), &key_b_len), 0);
+    assert_int_equal(key_a_len, key_b_len);
+    assert_memory_equal(key_a, key_b, key_a_len);
+
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 0);
+    assert_string_equal(addr, "");
+}
+
+static void test_client_subnet_v6_prefix_is_zero_padded(void **state) {
+    (void)state;
+    /* /56 carries seven address bytes. */
+    const uint8_t ecs[] = {0x00, 0x08, 0x00, 0x0B, 0x00, 0x02, 56, 0, 0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0x56};
+    uint8_t query[128];
+    size_t len = ecs_query(query, sizeof(query), ecs, sizeof(ecs));
+    char addr[64];
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 1);
+    assert_string_equal(addr, "2001:db8:1234:5600::");
+}
+
+static void test_client_subnet_among_other_options(void **state) {
+    (void)state;
+    const uint8_t options[] = {
+        0x00, 0x0A, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,       /* COOKIE */
+        0x00, 0x08, 0x00, 0x07, 0x00, 0x01, 24, 0, 10, 1, 2,  /* ECS /24 */
+        0x00, 0x0C, 0x00, 0x02, 0, 0,                         /* PADDING */
+    };
+    const uint8_t remaining[] = {
+        0x00, 0x0A, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+        0x00, 0x0C, 0x00, 0x02, 0, 0,
+    };
+    uint8_t query[160];
+    size_t len = ecs_query(query, sizeof(query), options, sizeof(options));
+    uint8_t expected[160];
+    size_t expected_len = ecs_query(expected, sizeof(expected), remaining, sizeof(remaining));
+
+    char addr[64];
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 1);
+    assert_string_equal(addr, "10.1.2.0");
+    assert_int_equal(len, expected_len);
+    assert_memory_equal(query, expected, expected_len);
+}
+
+static void test_client_subnet_malformed_option_is_still_removed(void **state) {
+    (void)state;
+    const uint8_t bad_family[] = {0x00, 0x08, 0x00, 0x05, 0x00, 0x09, 8, 0, 10};
+    const uint8_t prefix_mismatch[] = {0x00, 0x08, 0x00, 0x05, 0x00, 0x01, 32, 0, 10};
+    const uint8_t too_short[] = {0x00, 0x08, 0x00, 0x02, 0x00, 0x01};
+    const uint8_t prefix_too_long[] = {0x00, 0x08, 0x00, 0x09, 0x00, 0x01, 40, 0, 1, 2, 3, 4, 5};
+    const uint8_t *cases[] = {bad_family, prefix_mismatch, too_short, prefix_too_long};
+    const size_t lens[] = {sizeof(bad_family), sizeof(prefix_mismatch), sizeof(too_short), sizeof(prefix_too_long)};
+    uint8_t expected[128];
+    size_t expected_len = ecs_query(expected, sizeof(expected), NULL, 0);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t query[128];
+        size_t len = ecs_query(query, sizeof(query), cases[i], lens[i]);
+        char addr[64] = "stale";
+        assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 1);
+        assert_string_equal(addr, "");
+        assert_int_equal(len, expected_len);
+    }
+
+    /* Without an output buffer the option is removed all the same. */
+    uint8_t query[128];
+    size_t len = ecs_query(query, sizeof(query), bad_family, sizeof(bad_family));
+    assert_int_equal(dns_query_take_client_subnet(query, &len, NULL, 0), 1);
+    const uint8_t good[] = {0x00, 0x08, 0x00, 0x08, 0x00, 0x01, 32, 0, 192, 168, 1, 50};
+    len = ecs_query(query, sizeof(query), good, sizeof(good));
+    assert_int_equal(dns_query_take_client_subnet(query, &len, NULL, 0), 1);
+    assert_int_equal(len, expected_len);
+}
+
+static void test_client_subnet_absent_or_malformed_query(void **state) {
+    (void)state;
+    char addr[64];
+    uint8_t query[128];
+
+    /* No OPT at all. */
+    memcpy(query, DNS_QUERY_WWW_EXAMPLE_COM_A, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN);
+    size_t len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 0);
+    assert_int_equal(len, DNS_QUERY_WWW_EXAMPLE_COM_A_LEN);
+
+    /* OPT with a cookie only. */
+    const uint8_t cookie[] = {0x00, 0x0A, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8};
+    len = ecs_query(query, sizeof(query), cookie, sizeof(cookie));
+    size_t before = len;
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 0);
+    assert_int_equal(len, before);
+
+    /* Option length runs past the OPT record. */
+    const uint8_t overrun[] = {0x00, 0x08, 0x00, 0x40, 0x00, 0x01};
+    len = ecs_query(query, sizeof(query), overrun, sizeof(overrun));
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), -1);
+
+    /* A trailing partial option header. */
+    const uint8_t partial[] = {0x00, 0x08, 0x00};
+    len = ecs_query(query, sizeof(query), partial, sizeof(partial));
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), -1);
+
+    /* OPT rdlength past the end of the message. */
+    len = ecs_query(query, sizeof(query), cookie, sizeof(cookie));
+    len -= 4;
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), -1);
+
+    /* Truncated question and missing arguments. */
+    len = 14;
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), -1);
+    len = 4;
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), -1);
+    assert_int_equal(dns_query_take_client_subnet(NULL, &len, addr, sizeof(addr)), -1);
+    assert_int_equal(dns_query_take_client_subnet(query, NULL, addr, sizeof(addr)), -1);
+
+    /* An OPT-typed record in the answer section is not the query's OPT. */
+    len = ecs_query(query, sizeof(query), cookie, sizeof(cookie));
+    query[7] = 1;  /* ANCOUNT */
+    query[11] = 0; /* ARCOUNT */
+    assert_int_equal(dns_query_take_client_subnet(query, &len, addr, sizeof(addr)), 0);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_extract_question_key_basic),
@@ -487,6 +647,11 @@ int main(void) {
         cmocka_unit_test(test_validate_response_mismatched),
         cmocka_unit_test(test_validate_response_invalid),
         cmocka_unit_test(test_different_qtypes_different_keys),
+        cmocka_unit_test(test_client_subnet_v4_is_reported_and_removed),
+        cmocka_unit_test(test_client_subnet_v6_prefix_is_zero_padded),
+        cmocka_unit_test(test_client_subnet_among_other_options),
+        cmocka_unit_test(test_client_subnet_malformed_option_is_still_removed),
+        cmocka_unit_test(test_client_subnet_absent_or_malformed_query),
     };
     
     return cmocka_run_group_tests(tests, NULL, NULL);

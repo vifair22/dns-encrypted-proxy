@@ -43,6 +43,7 @@
 #include "upstream_bootstrap.h"
 #include "test_helpers.h"
 #include "test_fixtures.h"
+#include "test_report_collector.h"
 
 static int upstream_resolve(
     upstream_client_t *client,
@@ -4455,6 +4456,119 @@ static void test_dns_server_udp_edns_no_truncation(void **state) {
 }
 #endif
 
+
+#if UPSTREAM_DOH_ENABLED
+/* www.example.com A carrying an ECS /32 option for `last_octet` in
+ * 192.168.1.0/24, as dnsmasq's add-subnet=32 would send it. */
+static size_t build_ecs_query(uint8_t *out, size_t cap, uint8_t last_octet) {
+    size_t len = DNS_QUERY_WWW_EXAMPLE_COM_A_LEN;
+    const uint8_t opt[] = {
+        0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C,
+        0x00, 0x08, 0x00, 0x08, 0x00, 0x01, 32, 0, 192, 168, 1, last_octet,
+    };
+    assert_true(len + sizeof(opt) <= cap);
+    memcpy(out, DNS_QUERY_WWW_EXAMPLE_COM_A, len);
+    out[11] = 1;
+    memcpy(out + len, opt, sizeof(opt));
+    return len + sizeof(opt);
+}
+
+/*
+ * The router's collector contract, end to end through the real binary: one
+ * JSON record per query on report_socket, the client taken from ECS sent by a
+ * trusted peer, and ECS kept out of the cache key so a second client's
+ * identical question is a cache hit.
+ */
+static void test_main_reports_queries_to_collector(void **state) {
+    (void)state;
+    if (system("python3 -V >/dev/null 2>&1") != 0) {
+        skip();
+    }
+
+    char cert_path[256];
+    char key_path[256];
+    assert_int_equal(resolve_test_cert_paths(cert_path, sizeof(cert_path), key_path, sizeof(key_path)), 0);
+    python_doh_server_t doh_server;
+    assert_int_equal(
+        start_python_doh_server(
+            &doh_server, cert_path, key_path, DNS_RESPONSE_WWW_EXAMPLE_COM_A, DNS_RESPONSE_WWW_EXAMPLE_COM_A_LEN, 0),
+        0);
+    setenv("CURL_CA_BUNDLE", cert_path, 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1", "1", 1);
+    setenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS", "1", 1);
+
+    test_collector_t collector;
+    test_collector_open(&collector, 0);
+
+    int listen_port = reserve_unused_port();
+    assert_true(listen_port > 0);
+    char cfg_text[1024];
+    int n = snprintf(
+        cfg_text,
+        sizeof(cfg_text),
+        "listen_addr=127.0.0.1\n"
+        "listen_port=%d\n"
+        "upstream_timeout_ms=2000\n"
+        "upstream_pool_size=1\n"
+        "upstreams=https://localhost:%d/dns-query\n"
+        "metrics_enabled=0\n"
+        "report_socket=%s\n",
+        listen_port,
+        doh_server.port,
+        collector.path);
+    assert_true(n > 0 && (size_t)n < sizeof(cfg_text));
+    char *cfg_path = create_temp_file(cfg_text);
+    assert_non_null(cfg_path);
+
+    pid_t pid = spawn_main_with_config(cfg_path);
+    assert_true(pid > 0);
+    struct timespec startup_wait = {.tv_sec = 0, .tv_nsec = 300 * 1000 * 1000};
+    nanosleep(&startup_wait, NULL);
+
+    uint8_t query[128];
+    uint8_t resp[1500];
+    size_t resp_len = 0;
+    char record[REPORT_MAX_DATAGRAM];
+
+    size_t query_len = build_ecs_query(query, sizeof(query), 50);
+    assert_int_equal(send_udp_query_and_recv(listen_port, query, query_len, resp, &resp_len), 0);
+    assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
+    assert_non_null(strstr(record, "\"type\":\"dns.query\""));
+    assert_non_null(strstr(record, "\"client\":\"192.168.1.50\""));
+    assert_non_null(strstr(record, "\"qname\":\"www.example.com\",\"qtype\":\"A\",\"rcode\":\"NOERROR\""));
+    assert_non_null(strstr(record, "\"upstream\":\"localhost\",\"proto\":\"doh\",\"source\":\"upstream\""));
+
+    query_len = build_ecs_query(query, sizeof(query), 51);
+    assert_int_equal(send_udp_query_and_recv(listen_port, query, query_len, resp, &resp_len), 0);
+    assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
+    assert_non_null(strstr(record, "\"client\":\"192.168.1.51\""));
+    assert_non_null(strstr(record, "\"upstream\":null,\"proto\":null,\"source\":\"cache\""));
+
+    /* TCP with the same OPT record but no ECS: the peer address, and the
+     * same cache entry, since a stripped query keys like this one. */
+    query_len = build_ecs_query(query, sizeof(query), 50);
+    query_len -= 12;
+    query[query_len - 1] = 0; /* OPT rdlength 0 */
+    assert_int_equal(send_tcp_query_and_recv(listen_port, query, query_len, resp, &resp_len), 0);
+    assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
+    assert_non_null(strstr(record, "\"client\":\"127.0.0.1\""));
+    assert_non_null(strstr(record, "\"source\":\"cache\""));
+
+    assert_int_equal(kill(pid, SIGTERM), 0);
+    int status = 0;
+    assert_int_equal(waitpid_with_timeout(pid, &status, 3000), 0);
+    assert_true(WIFEXITED(status));
+    assert_int_equal(WEXITSTATUS(status), 0);
+
+    remove_temp_file(cfg_path);
+    test_collector_close(&collector);
+    stop_python_doh_server(&doh_server);
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_INSECURE_TLS");
+    unsetenv("DNS_ENCRYPTED_PROXY_TEST_FORCE_HTTP1");
+    unsetenv("CURL_CA_BUNDLE");
+}
+#endif
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -4531,6 +4645,7 @@ int main(void) {
         cmocka_unit_test(test_dns_server_tcp_idle_timeout_close),
 #if UPSTREAM_DOH_ENABLED
         cmocka_unit_test(test_dns_server_udp_edns_no_truncation),
+        cmocka_unit_test(test_main_reports_queries_to_collector),
 #endif
     };
 #else
