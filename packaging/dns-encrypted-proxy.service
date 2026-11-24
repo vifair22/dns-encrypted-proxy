@@ -44,9 +44,9 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 UMask=0077
-# AF_UNIX carries the sd_notify datagram; AF_NETLINK is what getaddrinfo
-# uses for AI_ADDRCONFIG; AF_INET6 because the system resolver may return
-# v6 candidates even though the proxy dials v4.
+# AF_UNIX carries the sd_notify datagram and the report_socket records;
+# AF_NETLINK is what getaddrinfo uses for AI_ADDRCONFIG; AF_INET6 because the
+# system resolver may return v6 candidates even though the proxy dials v4.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]

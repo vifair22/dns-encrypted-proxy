@@ -97,7 +97,14 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 | `metrics_enabled` | `1` | bool | `METRICS_ENABLED` | `0` disables the metrics server. |
 | `metrics_port` | `9090` | port | `METRICS_PORT` | HTTP endpoint, separate from DNS port. |
 | `metrics_addr` | `0.0.0.0` | IPv4 | `METRICS_ADDR` | Bind address for the metrics listener. It has no auth, so on a multi-homed host (a router) bind it to an internal address. Rejected at config load if it is not an IPv4 literal. |
-| `log_level` | `INFO` | DEBUG/INFO/WARN/ERROR | `LOG_LEVEL` | Lower is more verbose. |
+| `log_level` | `INFO` | DEBUG/INFO/WARN/ERROR | `LOG_LEVEL` | Lower is more verbose. Log lines carry ANSI colour only when the stream is a terminal; under systemd, a pipe or a file they are plain. Set `NO_COLOR` to a non-empty value to turn colour off on a terminal too. |
+
+### 3.5 Event reports
+
+| Key | Default | Unit | Env override | Notes |
+|---|---|---|---|---|
+| `report_socket` | (empty) | path | `REPORT_SOCKET` | AF_UNIX datagram socket that receives one JSON record per query and per upstream event (see 6.6). Empty turns reporting off. At most 107 bytes. |
+| `report_trusted_ecs_sources` | `127.0.0.1` | comma-separated IPv4 | `REPORT_TRUSTED_ECS_SOURCES` | Peers whose EDNS Client Subnet address is reported as the client. List the forwarder that adds ECS (dnsmasq `add-subnet`). Any other peer is reported by its own address. At most 8 entries. |
 
 ---
 
@@ -106,14 +113,15 @@ Every key has an env-var override (uppercased, see column 4 below). Env vars win
 ### 4.1 Query lifecycle
 
 1. Client sends a DNS query over UDP or TCP. TCP connections get a thread each; UDP datagrams are read by a single reader thread and handed to the `udp_workers` pool, so one query that spends its whole budget cannot stall the ones behind it.
-2. The proxy parses the question section and computes a canonical key (lowercased name + qtype + qclass + EDNS-relevant flags).
-3. **`hosts_a` shortcut.** If the question is a single `A IN` record matching a local hosts override, return a synthesized response with TTL 60. No upstream traffic.
-4. **Cache lookup.** On hit, the cached response is returned with TTLs aged down by elapsed time.
-5. **Upstream dispatch.** On miss, a job is enqueued in the dispatch facilitator with the per-query deadline (`upstream_timeout_ms`).
-6. **Worker execution.** A member worker picks up the job, performs the encrypted-DNS round trip, and pushes the result to the completed queue.
-7. **Completion.** The completion thread updates member state (success / failure / drain), retries on the next provider if appropriate (subject to budget and attempts), and finalizes the job.
-8. **Response shaping.** ID is rewritten to match the client's. UDP responses larger than the negotiated payload limit are returned with `TC=1` so the client retries over TCP.
-9. **Cache store.** Cacheable responses (NOERROR with answers, NXDOMAIN, NODATA per RFC 2308) are stored with TTL = `min(answer TTLs)` floored and capped.
+2. **EDNS Client Subnet is removed** from the query before anything else reads it, whatever the peer. Left in, it would split the cache per client and send each client's address to the upstream resolvers. The address is kept only for the event report (6.6).
+3. The proxy parses the question section and computes a canonical key (lowercased name + qtype + qclass + EDNS-relevant flags).
+4. **`hosts_a` shortcut.** If the question is a single `A IN` record matching a local hosts override, return a synthesized response with TTL 60. No upstream traffic.
+5. **Cache lookup.** On hit, the cached response is returned with TTLs aged down by elapsed time.
+6. **Upstream dispatch.** On miss, a job is enqueued in the dispatch facilitator with the per-query deadline (`upstream_timeout_ms`).
+7. **Worker execution.** A member worker picks up the job, performs the encrypted-DNS round trip, and pushes the result to the completed queue.
+8. **Completion.** The completion thread updates member state (success / failure / drain), retries on the next provider if appropriate (subject to budget and attempts), and finalizes the job.
+9. **Response shaping.** ID is rewritten to match the client's. UDP responses larger than the negotiated payload limit are returned with `TC=1` so the client retries over TCP.
+10. **Cache store.** Cacheable responses (NOERROR with answers, NXDOMAIN, NODATA per RFC 2308) are stored with TTL = `min(answer TTLs)` floored and capped.
 
 ### 4.2 Three-stage upstream bootstrap
 
@@ -297,6 +305,8 @@ Endpoint: `GET /metrics` on `metrics_port`. Prometheus text format `0.0.4`. Heal
 | `dns_encrypted_proxy_process_memory_rss_bytes` | gauge | From /proc/self/status. |
 | `dns_encrypted_proxy_uptime_seconds` | counter | Since `proxy_server_init`. |
 | `dns_encrypted_proxy_internal_errors_total` | counter | Sum of internal error events (one row per `reason` label). |
+| `dns_encrypted_proxy_report_events_sent_total` | counter | Records delivered to `report_socket`. |
+| `dns_encrypted_proxy_report_events_dropped_total` | counter | Records dropped because the collector was absent or its queue was full, or the record exceeded 4096 bytes. Stays at 0 while reporting is off. |
 
 ---
 
@@ -472,6 +482,57 @@ recovers within that query's own budget, without a `SIGHUP`. `SIGHUP` is
 still the right call when the host knows the route changed (6.4): it redials
 everything at once instead of one slot at a time.
 
+### 6.6 Event reports
+
+With `report_socket` set, the proxy sends a JSON object to that path for every
+answered query and for every notable upstream event. Each object is one
+`AF_UNIX` datagram of at most 4096 bytes. Sends never block: when the
+collector is not listening, has gone away, or has a full queue, the record is
+dropped and counted in `dns_encrypted_proxy_report_events_dropped_total`. A
+collector that restarts and recreates its socket receives the next record with
+no action from the proxy. The proxy creates the sending socket at startup and
+exits if it cannot; the collector does not have to exist yet.
+
+Query record:
+
+```json
+{"type":"dns.query","ts":1795540000.123,"client":"172.20.8.5","qname":"example.com","qtype":"A","rcode":"NOERROR","upstream":"dns.google","proto":"doh","source":"upstream","latency_ms":12.345,"cached":false}
+```
+
+| Field | Notes |
+|---|---|
+| `ts` | Seconds since the epoch, millisecond precision. |
+| `client` | The EDNS Client Subnet address when the peer is listed in `report_trusted_ecs_sources`, otherwise the peer address. |
+| `qname` | Lowercased, without the trailing dot; `.` for the root. Bytes outside printable ASCII are escaped as `\u00XX`. `null` when the query has no single parsable question. |
+| `qtype` | Mnemonic (`A`, `AAAA`, `HTTPS`, ...), or `TYPEnnn` (RFC 3597) for others. |
+| `rcode` | Mnemonic, or `RCODEnn`. |
+| `source` | `upstream`, `cache`, `failure_cache` (a SERVFAIL replayed from the RFC 2308 failure cache) or `local` (a `hosts_a` answer, or a SERVFAIL for a query that could not be parsed). |
+| `upstream`, `proto` | Host and transport (`doh`, `dot`, `doq`) of the last upstream tried. `null` unless `source` is `upstream`. A SERVFAIL after an upstream failure names the upstream that failed. |
+| `latency_ms` | Time spent inside the proxy for this query, from receipt to answer. |
+| `cached` | `true` for `cache` and `failure_cache`. |
+
+Upstream record:
+
+```json
+{"type":"dns.upstream","ts":1795540000.456,"upstream":"dns.google","event":"failure","reason":"timeout","detail":"curl=28,http=0,sent=1"}
+```
+
+| `event` | Sent when | `reason` / `detail` |
+|---|---|---|
+| `failure` | A query failed on this upstream, once per query and upstream. | The transport's reason (`timeout`, `tls_handshake_failed`, `transport_connect_failed`, ...), else the failure class, or `slow_response` when the upstream was reached but did not answer in time. `detail` is the transport's diagnostics, for DoH `curl=N,http=N,sent=0/1`. |
+| `retry` | A DoH request went unanswered and is being resent on a fresh connection, once per query. | `unanswered`; `detail` is the retry's `timeout_ms`. |
+| `redial` | Pooled connections were dropped and will be redialled. | `unanswered` for one DoH slot after an unanswered request (6.5); `reconnect_requested` for every upstream after `SIGHUP` (6.4). |
+| `failover` | A query that failed on this upstream was handed to the next one. | `query_failed`; `detail` is `attempt=N`. |
+| `unhealthy` | The upstream crossed its consecutive-failure threshold. | The failure class; `detail` is `consecutive_failures=N`. |
+| `recovered` | An unhealthy upstream answered again. | Both `null`. |
+
+Slow responses produce `failure` records but never `unhealthy`, matching the
+health accounting in 4.3.
+
+EDNS Client Subnet is stripped from every query regardless of this setting
+(4.1), so a forwarder that adds it for reporting changes neither the cache hit
+rate nor what reaches the upstream.
+
 ---
 
 ## 7. Troubleshooting
@@ -548,6 +609,7 @@ This is the same script CI runs — it builds all 7 DoH/DoT/DoQ combinations and
 | `src/metrics.c` | Prometheus exposition + `/healthz` / `/readyz`. |
 | `src/sd_notify.c` / `.h` | systemd readiness notification over `$NOTIFY_SOCKET`. |
 | `src/logger.c` | Thin wrapper over the c-log dependency. |
+| `src/report.c` / `.h` | Event reports to `report_socket`: JSON encoding and the non-blocking sender. |
 
 Dependencies that have to be present at build time:
 

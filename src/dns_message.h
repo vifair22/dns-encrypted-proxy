@@ -10,6 +10,11 @@ size_t dns_udp_payload_limit_for_query(const uint8_t *query, size_t query_len);
 uint32_t dns_response_min_ttl(const uint8_t *message, size_t message_len, int *ok_out);
 int dns_adjust_response_ttls(uint8_t *message, size_t message_len, uint32_t age_seconds);
 int dns_response_is_cacheable(const uint8_t *response, size_t response_len);
+/* Removes the EDNS Client Subnet option (RFC 7871) from a query in place and
+ * shortens *query_len to match. When addr_out is not NULL the subnet address
+ * is written there in text form. Returns 1 when an option was removed, 0 when
+ * the query carries none, and -1 when the query is malformed. */
+int dns_query_take_client_subnet(uint8_t *query, size_t *query_len, char *addr_out, size_t addr_out_len);
 int dns_validate_response_for_query(const uint8_t *query, size_t query_len, const uint8_t *response, size_t response_len);
 
 #endif

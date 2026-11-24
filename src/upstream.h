@@ -20,6 +20,19 @@ typedef enum {
     UPSTREAM_TYPE_DOQ   /* DNS-over-QUIC (quic://) */
 } upstream_type_t;
 
+static inline const char *upstream_type_name(upstream_type_t type) {
+    switch (type) {
+        case UPSTREAM_TYPE_DOH:
+            return "doh";
+        case UPSTREAM_TYPE_DOT:
+            return "dot";
+        case UPSTREAM_TYPE_DOQ:
+            return "doq";
+        default:
+            return "unknown";
+    }
+}
+
 /*
  * Health status for a single upstream server
  */

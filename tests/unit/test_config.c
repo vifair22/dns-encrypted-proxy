@@ -594,9 +594,96 @@ static void test_config_bootstrap_resolvers_parse_and_override(void **state) {
     clear_config_env_vars();
 }
 
+
+static uint32_t ipv4_be(const char *text) {
+    struct in_addr addr;
+    assert_int_equal(inet_pton(AF_INET, text, &addr), 1);
+    return addr.s_addr;
+}
+
+static void test_config_report_defaults(void **state) {
+    (void)state;
+    clear_config_env_vars();
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, "/nonexistent/dns-encrypted-proxy.conf"), PROXY_OK);
+    assert_string_equal(config.report_socket, "");
+    assert_int_equal(config.report_trusted_ecs_source_count, 1);
+    assert_true(config_report_trusts_ecs_from(&config, ipv4_be("127.0.0.1")));
+    assert_false(config_report_trusts_ecs_from(&config, ipv4_be("172.20.8.5")));
+    assert_false(config_report_trusts_ecs_from(NULL, ipv4_be("127.0.0.1")));
+}
+
+static void test_config_report_file_and_env(void **state) {
+    (void)state;
+    clear_config_env_vars();
+    char *temp_file = create_temp_file(
+        "report_socket=/run/rtr-report/ingest.sock\n"
+        "report_trusted_ecs_sources = 127.0.0.1, 10.0.0.53 ,\n");
+    assert_non_null(temp_file);
+
+    proxy_config_t config;
+    assert_int_equal(config_load(&config, temp_file), PROXY_OK);
+    assert_string_equal(config.report_socket, "/run/rtr-report/ingest.sock");
+    assert_int_equal(config.report_trusted_ecs_source_count, 2);
+    assert_true(config_report_trusts_ecs_from(&config, ipv4_be("10.0.0.53")));
+
+    setenv("REPORT_SOCKET", "/tmp/other.sock", 1);
+    setenv("REPORT_TRUSTED_ECS_SOURCES", "192.168.1.1", 1);
+    assert_int_equal(config_load(&config, temp_file), PROXY_OK);
+    assert_string_equal(config.report_socket, "/tmp/other.sock");
+    assert_int_equal(config.report_trusted_ecs_source_count, 1);
+    assert_false(config_report_trusts_ecs_from(&config, ipv4_be("127.0.0.1")));
+    assert_true(config_report_trusts_ecs_from(&config, ipv4_be("192.168.1.1")));
+
+    FILE *devnull = fopen("/dev/null", "w");
+    assert_non_null(devnull);
+    config_print(&config, devnull);
+    fclose(devnull);
+
+    clear_config_env_vars();
+    remove_temp_file(temp_file);
+}
+
+static void test_config_report_rejects_bad_values(void **state) {
+    (void)state;
+    clear_config_env_vars();
+    proxy_config_t config;
+
+    char long_path[200];
+    memset(long_path, 'a', sizeof(long_path) - 1);
+    long_path[0] = '/';
+    long_path[sizeof(long_path) - 1] = '\0';
+    setenv("REPORT_SOCKET", long_path, 1);
+    assert_int_equal(config_load(&config, "/nonexistent"), PROXY_ERR_CONFIG);
+    assert_non_null(strstr(proxy_error_message(), "report_socket"));
+    unsetenv("REPORT_SOCKET");
+
+    const char *bad_lists[] = {
+        "127.0.0.1,not-an-address",
+        "::1",
+        "1.1.1.1,1.1.1.2,1.1.1.3,1.1.1.4,1.1.1.5,1.1.1.6,1.1.1.7,1.1.1.8,1.1.1.9",
+    };
+    for (size_t i = 0; i < sizeof(bad_lists) / sizeof(bad_lists[0]); i++) {
+        setenv("REPORT_TRUSTED_ECS_SOURCES", bad_lists[i], 1);
+        assert_int_equal(config_load(&config, "/nonexistent"), PROXY_ERR_CONFIG);
+        assert_non_null(strstr(proxy_error_message(), "report_trusted_ecs_sources"));
+    }
+
+    char huge[400];
+    memset(huge, '1', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = '\0';
+    setenv("REPORT_TRUSTED_ECS_SOURCES", huge, 1);
+    assert_int_equal(config_load(&config, "/nonexistent"), PROXY_ERR_CONFIG);
+
+    clear_config_env_vars();
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_config_defaults),
+        cmocka_unit_test(test_config_report_defaults),
+        cmocka_unit_test(test_config_report_file_and_env),
+        cmocka_unit_test(test_config_report_rejects_bad_values),
         cmocka_unit_test(test_config_file_parse),
         cmocka_unit_test(test_config_env_override),
         cmocka_unit_test(test_config_failure_cache_ttl_clamp),

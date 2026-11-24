@@ -146,7 +146,8 @@ Main config keys:
 - `hosts_a` (comma-separated `name=IPv4` or `name:IPv4` overrides for local A answers)
 - `tcp_idle_timeout_ms`, `tcp_max_clients`, `tcp_max_queries_per_conn`
 - `metrics_enabled`, `metrics_port`, `metrics_addr` (IPv4 bind address for the metrics listener, default `0.0.0.0`)
-- `log_level` (`DEBUG`, `INFO`, `WARN`, `ERROR`)
+- `log_level` (`DEBUG`, `INFO`, `WARN`, `ERROR`). Log lines are coloured only on a terminal; set `NO_COLOR` to turn that off too.
+- `report_socket`, `report_trusted_ecs_sources` (per-query and upstream event records to a local collector; see Manual 6.6)
 
 Environment override support includes:
 
@@ -159,6 +160,7 @@ Environment override support includes:
 - `TCP_IDLE_TIMEOUT_MS`, `TCP_MAX_CLIENTS`, `TCP_MAX_QUERIES_PER_CONN`
 - `METRICS_ENABLED`, `METRICS_PORT`, `METRICS_ADDR`
 - `LOG_LEVEL`
+- `REPORT_SOCKET`, `REPORT_TRUSTED_ECS_SOURCES`
 
 `hosts_a` behavior:
 
