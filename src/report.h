@@ -23,6 +23,11 @@
  * dropped rather than truncated, since a cut-off object is not valid JSON. */
 #define REPORT_MAX_DATAGRAM 4096
 
+/* Sent as "v" on every record. Bump it only for a change an existing
+ * collector would misread, such as a field changing meaning or type; new
+ * fields and events keep the version. */
+#define REPORT_RECORD_VERSION 1
+
 typedef enum {
     REPORT_SOURCE_UPSTREAM = 0,
     REPORT_SOURCE_CACHE,
