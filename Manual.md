@@ -431,7 +431,9 @@ What one `SIGHUP` does:
      DoQ opens a QUIC connection per query and has nothing pooled.
    - per-server penalties earned on the old path are cleared: health
      backoff, transport retry suppression, the stage2 bootstrap cooldown and
-     any DoH HTTP-version pin (re-learned on the new path).
+     any DoH HTTP-version pin (re-learned on the new path). With
+     `report_socket` set, each upstream gets a `redial` record, followed by
+     a `recovered` record if it was unhealthy (6.6).
    - members in cooldown or failed retry immediately; ready members re-verify
      their route in place on the normal slot stagger and keep serving
      meanwhile.
@@ -519,12 +521,13 @@ Upstream record:
 
 | `event` | Sent when | `reason` / `detail` |
 |---|---|---|
+| `started` | The proxy started, once per configured upstream, just before it starts listening. Every upstream begins in rotation and healthy, so discard any state kept from an earlier run. | `reason` is `null`; `detail` is `proto=doh`, `proto=dot` or `proto=doq`. |
 | `failure` | A query failed on this upstream, once per query and upstream. | The transport's reason (`timeout`, `tls_handshake_failed`, `transport_connect_failed`, ...), else the failure class, or `slow_response` when the upstream was reached but did not answer in time. `detail` is the transport's diagnostics, for DoH `curl=N,http=N,sent=0/1`. |
 | `retry` | A DoH request went unanswered and is being resent on a fresh connection, once per query. | `unanswered`; `detail` is the retry's `timeout_ms`. |
 | `redial` | Pooled connections were dropped and will be redialled. | `unanswered` for one DoH slot after an unanswered request (6.5); `reconnect_requested` for every upstream after `SIGHUP` (6.4). |
 | `failover` | A query that failed on this upstream was handed to the next one. | `query_failed`; `detail` is `attempt=N`. |
 | `unhealthy` | The upstream crossed its consecutive-failure threshold. | The failure class; `detail` is `consecutive_failures=N`. |
-| `recovered` | An unhealthy upstream answered again. | Both `null`. |
+| `recovered` | An unhealthy upstream answered again, or `SIGHUP` put it back into rotation. | `null` when it answered; `reconnect_requested` after `SIGHUP`, sent after that upstream's `redial`. `detail` is `null`. |
 
 Slow responses produce `failure` records but never `unhealthy`, matching the
 health accounting in 4.3.

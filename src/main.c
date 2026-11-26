@@ -140,6 +140,7 @@ int main(int argc, char **argv) {
         LOGF_INFO("Metrics endpoint listening on %s:%d/metrics (health: /healthz, ready: /readyz)", config.metrics_addr, config.metrics_port);
     }
 
+    upstream_client_report_started(&server.upstream);
     proxy_status_t rc = proxy_server_run(&server);
 
     g_reconnect_target = NULL;
