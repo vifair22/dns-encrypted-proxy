@@ -4530,6 +4530,10 @@ static void test_main_reports_queries_to_collector(void **state) {
     size_t resp_len = 0;
     char record[REPORT_MAX_DATAGRAM];
 
+    assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
+    assert_non_null(strstr(record, "\"type\":\"dns.upstream\""));
+    assert_non_null(strstr(record, "\"upstream\":\"localhost\",\"event\":\"started\",\"reason\":null,\"detail\":\"proto=doh\""));
+
     size_t query_len = build_ecs_query(query, sizeof(query), 50);
     assert_int_equal(send_udp_query_and_recv(listen_port, query, query_len, resp, &resp_len), 0);
     assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
