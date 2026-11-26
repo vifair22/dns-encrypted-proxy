@@ -352,4 +352,11 @@ unsigned upstream_client_reconnect_generation(const upstream_client_t *client);
  */
 void upstream_client_apply_reconnect(upstream_client_t *client);
 
+/*
+ * Send a "started" report for every configured upstream. A new process
+ * holds no health history, so this tells the collector to drop whatever
+ * state it kept from the previous run, such as an upstream left unhealthy.
+ */
+void upstream_client_report_started(const upstream_client_t *client);
+
 #endif /* UPSTREAM_H */

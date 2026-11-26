@@ -1070,6 +1070,66 @@ static void test_reconnect_reports_a_redial_per_server(void **state) {
     upstream_client_destroy(&client);
 }
 
+static void test_reconnect_reports_recovered_only_for_unhealthy(void **state) {
+    (void)state;
+    reset_stubs();
+    const char *urls[] = {PRIMARY_TEST_URL, PRIMARY_TEST_URL};
+    upstream_config_t config = {.timeout_ms = 50, .pool_size = 1, .max_failures_before_unhealthy = 1, .unhealthy_backoff_ms = 1000};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 2, &config), PROXY_OK);
+    client.servers[1].health.healthy = 0;
+    client.servers[1].health.consecutive_failures = 3;
+
+    test_collector_t c;
+    test_collector_open(&c, 1);
+    char buf[REPORT_MAX_DATAGRAM];
+    upstream_client_apply_reconnect(&client);
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"event\":\"redial\""));
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"event\":\"redial\""));
+    test_collector_expect(&c, buf, sizeof(buf));
+    assert_non_null(strstr(buf, "\"event\":\"recovered\",\"reason\":\"reconnect_requested\",\"detail\":null"));
+    assert_false(test_collector_pending(&c));
+    assert_true(client.servers[1].health.healthy);
+
+    /* Nothing was unhealthy the second time, so only redials. */
+    upstream_client_apply_reconnect(&client);
+    for (int i = 0; i < 2; i++) {
+        test_collector_expect(&c, buf, sizeof(buf));
+        assert_non_null(strstr(buf, "\"event\":\"redial\""));
+    }
+    assert_false(test_collector_pending(&c));
+    test_collector_close(&c);
+    upstream_client_destroy(&client);
+}
+
+static void test_started_is_reported_per_upstream(void **state) {
+    (void)state;
+    reset_stubs();
+    const char *urls[] = {PRIMARY_TEST_URL, PRIMARY_TEST_URL};
+    upstream_config_t config = {.timeout_ms = 50, .pool_size = 1, .max_failures_before_unhealthy = 1, .unhealthy_backoff_ms = 1000};
+    upstream_client_t client;
+    assert_int_equal(upstream_client_init(&client, urls, 2, &config), PROXY_OK);
+
+    /* No sink, no records and no crash. */
+    upstream_client_report_started(&client);
+    upstream_client_report_started(NULL);
+
+    test_collector_t c;
+    test_collector_open(&c, 1);
+    char buf[REPORT_MAX_DATAGRAM];
+    upstream_client_report_started(&client);
+    for (int i = 0; i < 2; i++) {
+        test_collector_expect(&c, buf, sizeof(buf));
+        assert_non_null(strstr(buf, "\"type\":\"dns.upstream\""));
+        assert_non_null(strstr(buf, "\"event\":\"started\",\"reason\":null,\"detail\":\"proto="));
+    }
+    assert_false(test_collector_pending(&c));
+    test_collector_close(&c);
+    upstream_client_destroy(&client);
+}
+
 int main(void) {
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_upstream_resolve_last_resort_unhealthy),
@@ -1083,6 +1143,8 @@ int main(void) {
         cmocka_unit_test(test_record_failure_slow_response_not_health_attributed),
         cmocka_unit_test(test_health_transitions_are_reported),
         cmocka_unit_test(test_reconnect_reports_a_redial_per_server),
+        cmocka_unit_test(test_reconnect_reports_recovered_only_for_unhealthy),
+        cmocka_unit_test(test_started_is_reported_per_upstream),
         cmocka_unit_test(test_upstream_ready_state),
         cmocka_unit_test(test_apply_reconnect_resets_path_penalties),
     };

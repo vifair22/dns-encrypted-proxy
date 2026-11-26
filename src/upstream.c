@@ -463,6 +463,18 @@ unsigned upstream_client_reconnect_generation(const upstream_client_t *client) {
     return __atomic_load_n(&client->reconnect_generation, __ATOMIC_ACQUIRE);
 }
 
+void upstream_client_report_started(const upstream_client_t *client) {
+    if (client == NULL || !report_enabled()) {
+        return;
+    }
+    for (int i = 0; i < client->server_count; i++) {
+        const upstream_server_t *server = &client->servers[i];
+        char detail[32];
+        (void)snprintf(detail, sizeof(detail), "proto=%s", upstream_type_name(server->type));
+        report_upstream(server->host, "started", NULL, detail);
+    }
+}
+
 void upstream_client_apply_reconnect(upstream_client_t *client) {
     if (client == NULL) {
         return;
@@ -487,6 +499,15 @@ void upstream_client_apply_reconnect(upstream_client_t *client) {
     for (int i = 0; i < client->server_count; i++) {
         upstream_server_t *server = &client->servers[i];
         report_upstream(server->host, "redial", "reconnect_requested", NULL);
+        /* The reset below puts an unhealthy server back into rotation, so
+         * its next success would find nothing to recover from. */
+        if (!server->health.healthy) {
+            report_upstream(server->host, "recovered", "reconnect_requested", NULL);
+            LOGF_INFO(
+                "Upstream recovered: host=%s type=%s reason=reconnect_requested",
+                server->host,
+                upstream_type_name(server->type));
+        }
         server->health.healthy = 1;
         server->health.consecutive_failures = 0;
         server->stage.transport_retry_suppress_until_ms = 0;
