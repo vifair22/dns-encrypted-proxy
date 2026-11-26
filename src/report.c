@@ -264,7 +264,7 @@ int report_format_query(char *buf, size_t capacity, double ts, const report_quer
     char qtype_scratch[16];
     char rcode_scratch[16];
 
-    out_fmt(&out, "{\"type\":\"dns.query\",\"ts\":%.3f", ts);
+    out_fmt(&out, "{\"type\":\"dns.query\",\"v\":%d,\"ts\":%.3f", REPORT_RECORD_VERSION, ts);
     out_key(&out, "client");
     out_json_string(&out, query->client);
     out_key(&out, "qname");
@@ -303,7 +303,7 @@ int report_format_upstream(
         return -1;
     }
     json_out_t out = {.buf = buf, .cap = capacity, .len = 0, .overflow = 0};
-    out_fmt(&out, "{\"type\":\"dns.upstream\",\"ts\":%.3f", ts);
+    out_fmt(&out, "{\"type\":\"dns.upstream\",\"v\":%d,\"ts\":%.3f", REPORT_RECORD_VERSION, ts);
     out_key(&out, "upstream");
     out_json_string(&out, upstream);
     out_key(&out, "event");

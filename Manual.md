@@ -498,11 +498,12 @@ exits if it cannot; the collector does not have to exist yet.
 Query record:
 
 ```json
-{"type":"dns.query","ts":1795540000.123,"client":"172.20.8.5","qname":"example.com","qtype":"A","rcode":"NOERROR","upstream":"dns.google","proto":"doh","source":"upstream","latency_ms":12.345,"cached":false}
+{"type":"dns.query","v":1,"ts":1795540000.123,"client":"172.20.8.5","qname":"example.com","qtype":"A","rcode":"NOERROR","upstream":"dns.google","proto":"doh","source":"upstream","latency_ms":12.345,"cached":false}
 ```
 
 | Field | Notes |
 |---|---|
+| `v` | Record format version, the integer `1`. It is on every record, query and upstream alike. It changes only when an existing field changes meaning or type; new fields and events keep it. |
 | `ts` | Seconds since the epoch, millisecond precision. |
 | `client` | The EDNS Client Subnet address when the peer is listed in `report_trusted_ecs_sources`, otherwise the peer address. |
 | `qname` | Lowercased, without the trailing dot; `.` for the root. Bytes outside printable ASCII are escaped as `\u00XX`. `null` when the query has no single parsable question. |
@@ -516,7 +517,7 @@ Query record:
 Upstream record:
 
 ```json
-{"type":"dns.upstream","ts":1795540000.456,"upstream":"dns.google","event":"failure","reason":"timeout","detail":"curl=28,http=0,sent=1"}
+{"type":"dns.upstream","v":1,"ts":1795540000.456,"upstream":"dns.google","event":"failure","reason":"timeout","detail":"curl=28,http=0,sent=1"}
 ```
 
 | `event` | Sent when | `reason` / `detail` |

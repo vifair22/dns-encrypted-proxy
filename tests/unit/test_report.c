@@ -36,7 +36,7 @@ static void test_format_query_upstream_answer(void **state) {
     assert_true(n > 0);
     assert_string_equal(
         buf,
-        "{\"type\":\"dns.query\",\"ts\":1795540000.123,\"client\":\"172.20.8.5\",\"qname\":\"example.com\","
+        "{\"type\":\"dns.query\",\"v\":1,\"ts\":1795540000.123,\"client\":\"172.20.8.5\",\"qname\":\"example.com\","
         "\"qtype\":\"A\",\"rcode\":\"NOERROR\",\"upstream\":\"dns.google\",\"proto\":\"doh\","
         "\"source\":\"upstream\",\"latency_ms\":12.250,\"cached\":false}");
     assert_int_equal((size_t)n, strlen(buf));
@@ -60,7 +60,7 @@ static void test_format_query_cache_hit_has_no_upstream(void **state) {
     assert_true(report_format_query(buf, sizeof(buf), 1.0, &q) > 0);
     assert_string_equal(
         buf,
-        "{\"type\":\"dns.query\",\"ts\":1.000,\"client\":null,\"qname\":\".\",\"qtype\":\"NS\","
+        "{\"type\":\"dns.query\",\"v\":1,\"ts\":1.000,\"client\":null,\"qname\":\".\",\"qtype\":\"NS\","
         "\"rcode\":\"NXDOMAIN\",\"upstream\":null,\"proto\":null,\"source\":\"cache\","
         "\"latency_ms\":0.000,\"cached\":true}");
 }
@@ -119,7 +119,7 @@ static void test_format_upstream_event(void **state) {
     assert_true(report_format_upstream(buf, sizeof(buf), 2.5, "dns.google", "failure", "timeout", "curl=28,http=0") > 0);
     assert_string_equal(
         buf,
-        "{\"type\":\"dns.upstream\",\"ts\":2.500,\"upstream\":\"dns.google\",\"event\":\"failure\","
+        "{\"type\":\"dns.upstream\",\"v\":1,\"ts\":2.500,\"upstream\":\"dns.google\",\"event\":\"failure\","
         "\"reason\":\"timeout\",\"detail\":\"curl=28,http=0\"}");
     assert_true(report_format_upstream(buf, sizeof(buf), 2.5, "dns.google", "recovered", NULL, NULL) > 0);
     assert_non_null(strstr(buf, "\"reason\":null,\"detail\":null}"));
@@ -189,7 +189,7 @@ static void test_events_reach_the_collector(void **state) {
 
     char buf[REPORT_MAX_DATAGRAM];
     assert_true(test_collector_recv(&c, buf, sizeof(buf), 1000) > 0);
-    assert_non_null(strstr(buf, "\"type\":\"dns.query\""));
+    assert_non_null(strstr(buf, "\"type\":\"dns.query\",\"v\":1,"));
     assert_non_null(strstr(buf, "\"client\":\"10.0.0.2\""));
     assert_non_null(strstr(buf, "\"qtype\":\"AAAA\""));
     assert_non_null(strstr(buf, "\"proto\":\"dot\""));

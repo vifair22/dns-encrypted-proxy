@@ -3401,6 +3401,20 @@ static void test_dns_server_tcp_servfail_path(void **state) {
 /*
  * Test: main exits with non-zero when configuration validation fails
  */
+/* The spawned proxy must only ever talk to a local, dead upstream. An
+ * unknown key would leave it on the built-in public defaults, and then its
+ * shutdown waits on real DNS. */
+#if UPSTREAM_DOH_ENABLED
+#define TEST_MAIN_UPSTREAM_LINE "upstreams=https://127.0.0.1:%d/dns-query\n"
+#define TEST_MAIN_FIXED_UPSTREAM_LINE "upstreams=https://127.0.0.1:6553/dns-query\n"
+#elif UPSTREAM_DOT_ENABLED
+#define TEST_MAIN_UPSTREAM_LINE "upstreams=tls://127.0.0.1:%d\n"
+#define TEST_MAIN_FIXED_UPSTREAM_LINE "upstreams=tls://127.0.0.1:6553\n"
+#else
+#define TEST_MAIN_UPSTREAM_LINE "upstreams=quic://127.0.0.1:%d\n"
+#define TEST_MAIN_FIXED_UPSTREAM_LINE "upstreams=quic://127.0.0.1:6553\n"
+#endif
+
 static void test_main_invalid_config_exits_nonzero(void **state) {
     (void)state;
 
@@ -3410,7 +3424,7 @@ static void test_main_invalid_config_exits_nonzero(void **state) {
         "upstream_timeout_ms=500\n"
         "upstream_pool_size=2\n"
         "cache_capacity=128\n"
-        "upstream_url=https://cloudflare-dns.com/dns-query\n"
+        TEST_MAIN_FIXED_UPSTREAM_LINE
         "metrics_enabled=1\n"
         "metrics_port=9090\n";
 
@@ -3471,7 +3485,7 @@ static void test_main_sd_notify_ready_and_stopping(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
-        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        TEST_MAIN_UPSTREAM_LINE
         "metrics_enabled=1\n"
         "metrics_addr=127.0.0.1\n"
         "metrics_port=%d\n",
@@ -3576,7 +3590,7 @@ static void test_main_sighup_reconnects_and_keeps_running(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
-        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        TEST_MAIN_UPSTREAM_LINE
         "metrics_enabled=1\n"
         "metrics_addr=127.0.0.1\n"
         "metrics_port=%d\n",
@@ -3637,7 +3651,7 @@ static void test_main_start_and_signal_shutdown(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
-        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        TEST_MAIN_UPSTREAM_LINE
         "metrics_enabled=1\n"
         "metrics_port=%d\n",
         listen_port,
@@ -3699,7 +3713,7 @@ static void test_main_metrics_bind_failure_exits_nonzero(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
-        "upstream_url=https://127.0.0.1:%d/dns-query\n"
+        TEST_MAIN_UPSTREAM_LINE
         "metrics_enabled=1\n"
         "metrics_port=%d\n",
         listen_port,
@@ -3775,13 +3789,7 @@ static void test_main_runtime_bind_failure_exits_nonzero(void **state) {
         "upstream_timeout_ms=150\n"
         "upstream_pool_size=1\n"
         "cache_capacity=128\n"
-#if UPSTREAM_DOH_ENABLED
-        "upstream_url=https://127.0.0.1:6553/dns-query\n"
-#elif UPSTREAM_DOT_ENABLED
-        "upstream_url=tls://127.0.0.1:6553\n"
-#else
-        "upstream_url=quic://127.0.0.1:6553\n"
-#endif
+        TEST_MAIN_FIXED_UPSTREAM_LINE
         "metrics_enabled=0\n"
         "metrics_port=9090\n";
     (void)dead_upstream;
@@ -4531,13 +4539,13 @@ static void test_main_reports_queries_to_collector(void **state) {
     char record[REPORT_MAX_DATAGRAM];
 
     assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
-    assert_non_null(strstr(record, "\"type\":\"dns.upstream\""));
+    assert_non_null(strstr(record, "\"type\":\"dns.upstream\",\"v\":1,"));
     assert_non_null(strstr(record, "\"upstream\":\"localhost\",\"event\":\"started\",\"reason\":null,\"detail\":\"proto=doh\""));
 
     size_t query_len = build_ecs_query(query, sizeof(query), 50);
     assert_int_equal(send_udp_query_and_recv(listen_port, query, query_len, resp, &resp_len), 0);
     assert_true(test_collector_recv(&collector, record, sizeof(record), 3000) > 0);
-    assert_non_null(strstr(record, "\"type\":\"dns.query\""));
+    assert_non_null(strstr(record, "\"type\":\"dns.query\",\"v\":1,"));
     assert_non_null(strstr(record, "\"client\":\"192.168.1.50\""));
     assert_non_null(strstr(record, "\"qname\":\"www.example.com\",\"qtype\":\"A\",\"rcode\":\"NOERROR\""));
     assert_non_null(strstr(record, "\"upstream\":\"localhost\",\"proto\":\"doh\",\"source\":\"upstream\""));
